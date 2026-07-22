@@ -1,0 +1,121 @@
+﻿<template>
+  <a-config-provider :theme="themeConfig">
+    <div class="app-shell">
+      <header class="topbar">
+        <button class="collapse-button" type="button" aria-label="鏀惰捣渚ф爮" @click="sidebarCollapsed = !sidebarCollapsed">
+          {{ sidebarCollapsed ? '鈽? : '鈼? }}
+        </button>
+        <div class="topbar-title">鏃呰鍔╂墜 <span>AI 鐢熸垚鍐呭鍙兘瀛樺湪璇樊</span></div>
+        <button v-if="!authUser" class="login-button" type="button" @click="loginVisible = true">鐧诲綍</button>
+        <button v-else class="user-button" type="button" @click="logout">{{ authUser.name }} 路 閫€鍑?/button>
+      </header>
+
+      <aside class="sidebar" :class="{ collapsed: sidebarCollapsed }">
+        <div class="brand"><span class="brand-mark">鉁?/span><span v-if="!sidebarCollapsed">琛屾梾</span></div>
+        <button class="new-chat" type="button" @click="startNewChat"><span>鉁?/span><span v-if="!sidebarCollapsed">鏂板璇?/span><kbd v-if="!sidebarCollapsed">Ctrl K</kbd></button>
+        <nav class="nav-links">
+          <button type="button" @click="startNewChat"><span>锛?/span><span v-if="!sidebarCollapsed">鏂拌绋?/span></button>
+          <button type="button"><span>鈾?/span><span v-if="!sidebarCollapsed">鐏垫劅鏀惰棌</span></button>
+        </nav>
+        <div v-if="!sidebarCollapsed" class="history-label">鍘嗗彶瀵硅瘽</div>
+        <div class="history-list">
+          <button v-for="item in conversations" :key="item.id" class="history-item" :class="{ active: item.id === activeConversation }" type="button" @click="selectConversation(item.id)">
+            <span class="history-dot">鈼?/span><span v-if="!sidebarCollapsed" class="history-title">{{ item.title }}</span>
+          </button>
+        </div>
+        <div class="sidebar-bottom">
+          <button type="button"><span>鈸?/span><span v-if="!sidebarCollapsed">鍏充簬琛屾梾</span></button>
+        </div>
+      </aside>
+
+      <main class="main-content" :class="{ expanded: sidebarCollapsed }">
+        <router-view :key="activeConversation" />
+      </main>
+
+      <a-modal v-model:open="loginVisible" :footer="null" centered :width="420" class="login-modal">
+        <div class="login-panel">
+          <div class="login-icon">鉁?/div>
+          <h2>鐧诲綍琛屾梾</h2>
+          <p>鐧诲綍鍚庡悓姝ヤ綘鐨勫璇濅笌鏃呰璁″垝</p>
+          <button class="oauth-button wechat" type="button" @click="startOAuth('wechat')"><span>鈼?/span> 浣跨敤寰俊鐧诲綍</button>
+          <button class="oauth-button github" type="button" @click="startOAuth('github')"><span>鈼?/span> 浣跨敤 GitHub 鐧诲綍</button>
+          <div class="login-note">鐧诲綍鍗宠〃绀轰綘鍚屾剰銆婄敤鎴峰崗璁€嬪拰銆婇殣绉佹斂绛栥€?/div>
+        </div>
+      </a-modal>
+    </div>
+  </a-config-provider>
+</template>
+
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { message } from 'ant-design-vue'
+import { beginOAuth, getCurrentUser, clearSession, saveSession } from '@/services/api'
+
+const sidebarCollapsed = ref(false)
+const loginVisible = ref(false)
+const activeConversation = ref('welcome')
+const conversations = ref([
+  { id: 'welcome', title: '鍛ㄦ湯鍘绘澀宸炴€庝箞鐜╋紵' },
+  { id: 'beijing', title: '鍖椾含涓夋棩鏂囧寲涔嬫梾' },
+  { id: 'yunnan', title: '浜戝崡鎱㈡梾琛岃矾绾? },
+])
+const authUser = ref<{ name: string } | null>(null)
+const themeConfig = { token: { colorPrimary: '#16181d', borderRadius: 12, fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif' } }
+
+onMounted(() => {
+  const params = new URLSearchParams(window.location.search)
+  const token = params.get('access_token')
+  const userName = params.get('user')
+  if (token && userName) {
+    saveSession(token, { name: userName })
+    window.history.replaceState({}, '', window.location.pathname)
+  }
+  authUser.value = getCurrentUser()
+  if (params.get('oauth_error')) message.error('鐧诲綍澶辫触锛岃绋嶅悗閲嶈瘯')
+})
+
+const startNewChat = () => { activeConversation.value = `new-${Date.now()}` }
+const selectConversation = (id: string) => { activeConversation.value = id }
+const startOAuth = (provider: 'wechat' | 'github') => {
+  const url = beginOAuth(provider)
+  if (url) window.location.href = url
+  else message.info(`${provider === 'wechat' ? '寰俊' : 'GitHub'}鐧诲綍灏氭湭閰嶇疆锛岃鑱旂郴绠＄悊鍛榒)
+}
+const logout = () => { clearSession(); authUser.value = null; message.success('宸查€€鍑虹櫥褰?) }
+</script>
+
+<style>
+:root { color: #202124; background: #fff; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button { font: inherit; }
+.app-shell { min-height: 100vh; background: #fff; }
+.topbar { position: fixed; inset: 0 0 auto 0; height: 64px; z-index: 10; display: flex; align-items: center; border-bottom: 1px solid #f0f0f0; background: rgba(255,255,255,.94); backdrop-filter: blur(14px); }
+.collapse-button { width: 64px; height: 64px; border: 0; background: transparent; font-size: 20px; cursor: pointer; color: #27292d; }
+.topbar-title { position: absolute; left: 50%; transform: translateX(-50%); font-weight: 600; font-size: 15px; color: #25272b; white-space: nowrap; }
+.topbar-title span { margin-left: 10px; font-weight: 400; font-size: 11px; color: #c5c7ca; }
+.login-button, .user-button { margin-left: auto; margin-right: 18px; padding: 9px 22px; border: 0; border-radius: 12px; background: #202124; color: #fff; cursor: pointer; font-size: 14px; }
+.user-button { background: #f4f4f5; color: #303238; }
+.sidebar { position: fixed; z-index: 9; top: 0; bottom: 0; left: 0; width: 220px; padding: 20px 14px 14px; display: flex; flex-direction: column; border-right: 1px solid #f0f0f0; background: #fbfbfc; transition: width .2s ease; }
+.sidebar.collapsed { width: 64px; padding-inline: 8px; }
+.brand { height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 10px; font-weight: 700; font-size: 18px; }
+.brand-mark { color: #f29bba; font-size: 23px; }
+.new-chat, .nav-links button, .sidebar-bottom button, .history-item { width: 100%; display: flex; align-items: center; gap: 12px; border: 0; border-radius: 12px; background: transparent; color: #34363b; cursor: pointer; text-align: left; }
+.new-chat { height: 44px; padding: 0 13px; margin: 16px 0 10px; background: #fff; box-shadow: 0 4px 15px rgba(30,30,30,.06); font-weight: 600; }
+kbd { margin-left: auto; color: #a5a7aa; font-size: 11px; font-weight: 400; }
+.nav-links button, .sidebar-bottom button { height: 42px; padding: 0 13px; font-size: 14px; }
+.nav-links button:hover, .sidebar-bottom button:hover, .history-item:hover, .history-item.active { background: #f0f0f1; }
+.history-label { margin: 32px 12px 11px; color: #b0b2b5; font-size: 13px; }
+.history-list { display: flex; flex-direction: column; gap: 3px; }
+.history-item { min-height: 40px; padding: 0 12px; font-size: 13px; }
+.history-dot { color: #b5b7bb; font-size: 16px; }
+.history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-bottom { margin-top: auto; border-top: 1px solid #eee; padding-top: 10px; }
+.main-content { min-height: 100vh; margin-left: 220px; padding-top: 64px; transition: margin-left .2s ease; }
+.main-content.expanded { margin-left: 64px; }
+.login-panel { text-align: center; padding: 8px 14px 4px; }
+.login-icon { width: 54px; height: 54px; margin: 0 auto 14px; display: grid; place-items: center; border-radius: 18px; color: #fff; font-size: 25px; background: linear-gradient(135deg, #f1a4bf, #f183a5); }
+.login-panel h2 { margin: 0; font-size: 22px; }.login-panel p { margin: 8px 0 24px; color: #96989c; font-size: 13px; }
+.oauth-button { width: 100%; height: 46px; margin-bottom: 12px; border: 1px solid #e8e8e9; border-radius: 12px; background: #fff; cursor: pointer; font-weight: 600; }.oauth-button span { margin-right: 8px; font-size: 18px; }.oauth-button:hover { background: #f8f8f8; }.wechat span { color: #29b765; }.github span { color: #1f2328; }.login-note { margin-top: 14px; color: #b0b1b5; font-size: 11px; }
+@media (max-width: 700px) { .sidebar { width: 64px; padding-inline: 8px; }.sidebar > *:not(.brand):not(.sidebar-bottom) span:not(.history-dot) { display: none; }.main-content { margin-left: 64px; }.topbar-title span { display: none; }.topbar-title { font-size: 14px; } .login-button, .user-button { margin-right: 10px; padding-inline: 15px; } }
+</style>

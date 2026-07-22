@@ -1,0 +1,19 @@
+# Environment and secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+backend/venv/
+
+# Node
+**/node_modules/
+**/dist/
+**/.vite/
+
+# Logs and local artifacts
+**/*.log
+**/.DS_Store
+test/*.png
