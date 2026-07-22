@@ -2,7 +2,7 @@
 
 运行前提：
     1. 前端运行在 http://localhost:5173
-    2. 后端运行在 http://localhost:8001
+    2. 后端运行在 http://localhost:8000
     3. 已安装 Playwright 浏览器依赖：python -m playwright install
 
 示例：

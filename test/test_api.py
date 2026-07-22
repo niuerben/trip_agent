@@ -184,7 +184,7 @@ def check_postgres() -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="检查旅行规划项目各 API 是否可用")
-    parser.add_argument("--base-url", default="http://localhost:8001")
+    parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--skip-trip", action="store_true", help="跳过会实际调用模型/高德的旅行规划接口")
     args = parser.parse_args()
 

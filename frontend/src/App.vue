@@ -1,7 +1,7 @@
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <div class="topbar-title"><span class="topbar-logo" aria-hidden="true">✈️</span> 行旅 · AI 旅行助手</div>
+      <div class="topbar-title">行旅天下</div>
       <button v-if="!authUser" class="login-button" type="button" @click="loginVisible = true">登录</button>
       <button v-else class="user-button" type="button" @click="logout">{{ authUser.name }} · 退出</button>
     </header>
@@ -27,7 +27,7 @@
         <div v-if="!conversations.length" class="history-empty">暂无对话</div>
       </div>
       <div class="sidebar-bottom">
-        <button v-if="!authUser" type="button"><span>ⓘ</span> 关于行旅</button>
+        <button v-if="!authUser" type="button"><span>ⓘ</span> 关于行旅天下</button>
         <button v-else class="user-profile" type="button" @click="logout">
           <img v-if="authUser.avatar" class="user-avatar" :src="authUser.avatar" alt="用户头像" />
           <span v-else class="user-avatar user-avatar-fallback">{{ userInitial }}</span>
@@ -39,7 +39,7 @@
     <main class="main-content">
       <router-view />
     </main>
-    <a-modal v-model:open="loginVisible" :title="isRegistering ? '注册行旅' : '登录行旅'" :footer="null" centered :width="420">
+    <a-modal v-model:open="loginVisible" :title="isRegistering ? '注册行旅天下' : '登录行旅天下'" :footer="null" centered :width="420">
       <a-form :model="loginForm" layout="vertical" @finish="handleAuthSubmit">
         <p v-if="!isRegistering" class="login-description">没有账户？<button class="switch-auth" type="button" @click="isRegistering = true">注册</button></p>
         <p v-else class="login-description">注册后即可同步你的对话与旅行计划</p>
