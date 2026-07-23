@@ -1,5 +1,57 @@
 <template>
   <div class="result-page">
+    <div class="result-workspace">
+      <aside class="conversation-panel">
+        <div class="conversation-panel-header">
+          <div>
+            <p class="eyebrow">AI 助手</p>
+            <h2>行程讨论</h2>
+          </div>
+          <span class="conversation-status">● 在线</span>
+        </div>
+        <div class="conversation-messages" aria-live="polite">
+          <div class="assistant-message">
+            <strong>行旅助手</strong>
+            <p>{{ plan ? `已为你整理${plan.city}的旅行计划，可以继续告诉我想调整的内容。` : '填写旅行信息后，我会帮你安排景点、餐饮、交通和住宿。' }}</p>
+          </div>
+          <div
+            v-for="message in chatMessages"
+            :key="message.id"
+            :class="message.role === 'user' ? 'user-message' : 'assistant-message'"
+          >
+            <template v-if="message.role === 'assistant'">
+              <strong>行旅助手</strong>
+              <p>{{ message.content }}</p>
+            </template>
+            <template v-else>{{ message.content }}</template>
+          </div>
+          <div v-if="chatSending" class="assistant-message">
+            <strong>行旅助手</strong>
+            <p>正在思考…</p>
+          </div>
+        </div>
+        <form class="conversation-composer" @submit.prevent="sendMessage">
+          <textarea
+            v-model="chatInput"
+            rows="3"
+            placeholder="告诉我想怎么调整行程"
+            aria-label="行程对话输入框"
+          />
+          <button type="submit" :disabled="!chatInput.trim() || chatSending">发送</button>
+        </form>
+      </aside>
+
+      <section ref="manualPanel" class="manual-panel">
+        <div class="manual-toolbar">
+          <div>
+            <p class="eyebrow">旅行手册</p>
+            <h2>行程安排</h2>
+          </div>
+          <button class="pdf-button" type="button" :disabled="pdfExporting" @click="downloadPdf">
+            {{ pdfExporting ? '正在生成 PDF…' : '⇩ 下载 PDF' }}
+          </button>
+        </div>
+
     <template v-if="plan">
       <header class="result-header">
         <div>
@@ -78,33 +130,177 @@
     <a-empty v-else description="暂未找到旅行计划">
       <a-button type="primary" @click="startNewPlan">开始规划</a-button>
     </a-empty>
+      </section>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
+import html2canvas from 'html2canvas'
+import { jsPDF } from 'jspdf'
 import { ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { TripPlan } from '@/types'
-import { enrichTripPlanImages } from '@/services/api'
+import type { TripFormData, TripPlan } from '@/types'
+import { enrichTripPlanImages, generateTripPlan, getChatHistory, sendChatMessage } from '@/services/api'
 import { clearLegacyPlan, createConversation, getConversation, getCurrentConversationId, loadLegacyPlan, setCurrentConversationId, updateConversation } from '@/services/conversations'
 
 const router = useRouter()
 const route = useRoute()
 const plan = ref<TripPlan | null>(null)
+const manualPanel = ref<HTMLElement | null>(null)
+const pdfExporting = ref(false)
+const chatInput = ref('')
+const chatSending = ref(false)
+const conversationId = ref<string | null>(null)
+const chatMessages = ref<Array<{ id: number | string; role: 'user' | 'assistant'; content: string }>>([])
+let nextMessageId = 1
 let loadVersion = 0
+
+async function sendMessage() {
+  const text = chatInput.value.trim()
+  if (!text || chatSending.value) return
+
+  chatInput.value = ''
+  chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'user', content: text })
+  chatSending.value = true
+
+  try {
+    const response = await sendChatMessage({
+      conversation_id: conversationId.value || undefined,
+      message: text,
+    })
+    if (response.messages?.length) {
+      // 后端已落库，以持久化记录为权威来源。
+      chatMessages.value = response.messages.map((message) => ({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+      }))
+    } else {
+      chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: response.reply })
+    }
+
+    if (response.intent !== 'replan' || !plan.value) return
+
+    const currentPlan = plan.value
+    chatMessages.value.push({
+      id: `local-${nextMessageId++}`,
+      role: 'assistant',
+      content: '正在根据你的要求重新安排旅行计划…',
+    })
+
+    const firstDay = currentPlan.days?.[0]
+    const replanRequest: TripFormData = {
+      city: currentPlan.city,
+      start_date: currentPlan.start_date,
+      end_date: currentPlan.end_date,
+      travel_days: currentPlan.days?.length || 1,
+      transportation: firstDay?.transportation || '公共交通',
+      accommodation: firstDay?.accommodation || '经济型酒店',
+      preferences: [],
+      free_text_input: response.change_request || text,
+      conversation_id: conversationId.value || undefined,
+      preference: response.preference,
+      current_plan: currentPlan,
+      change_request: response.change_request || text,
+    }
+    const replanned = await generateTripPlan(replanRequest)
+    if (!replanned.success || !replanned.data) {
+      throw new Error(replanned.message || '重新规划失败')
+    }
+
+    plan.value = replanned.data
+    if (conversationId.value) {
+      updateConversation(conversationId.value, replanned.data)
+      void enrichMissingImages(conversationId.value, replanned.data, loadVersion)
+    }
+  } catch {
+    chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: '抱歉，暂时无法回复，请稍后再试。' })
+  } finally {
+    chatSending.value = false
+  }
+}
+
+async function loadChatHistory(id: string, version: number) {
+  try {
+    const response = await getChatHistory(id)
+    if (version !== loadVersion) return
+    chatMessages.value = (response.messages || []).map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+    }))
+  } catch {
+    // 聊天历史加载失败不影响行程展示。
+  }
+}
+
+async function downloadPdf() {
+  if (!manualPanel.value || pdfExporting.value) return
+
+  pdfExporting.value = true
+  const capture = manualPanel.value.cloneNode(true) as HTMLElement
+  capture.querySelector('.pdf-button')?.remove()
+  capture.style.cssText = [
+    'position:fixed',
+    'left:-100000px',
+    'top:0',
+    `width:${manualPanel.value.clientWidth}px`,
+    'height:auto',
+    'max-height:none',
+    'overflow:visible',
+    'background:#fff',
+  ].join(';')
+  document.body.appendChild(capture)
+
+  try {
+    const canvas = await html2canvas(capture, {
+      backgroundColor: '#ffffff',
+      scale: 2,
+      useCORS: true,
+      logging: false,
+    })
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' })
+    const pageWidth = pdf.internal.pageSize.getWidth()
+    const pageHeight = pdf.internal.pageSize.getHeight()
+    const imageHeight = (canvas.height * pageWidth) / canvas.width
+    const imageData = canvas.toDataURL('image/png')
+    let remainingHeight = imageHeight
+    let yOffset = 0
+
+    pdf.addImage(imageData, 'PNG', 0, yOffset, pageWidth, imageHeight)
+    remainingHeight -= pageHeight
+    while (remainingHeight > 0) {
+      yOffset = remainingHeight - imageHeight
+      pdf.addPage()
+      pdf.addImage(imageData, 'PNG', 0, yOffset, pageWidth, imageHeight)
+      remainingHeight -= pageHeight
+    }
+
+    const city = plan.value?.city || '旅行'
+    pdf.save(`${city}旅行手册.pdf`)
+  } finally {
+    capture.remove()
+    pdfExporting.value = false
+  }
+}
 
 function loadConversation() {
   const version = ++loadVersion
   plan.value = null
+  conversationId.value = null
+  chatMessages.value = []
 
   try {
-    const conversationId = typeof route.query.conversation === 'string'
+    const routeConversationId = typeof route.query.conversation === 'string'
       ? route.query.conversation
       : getCurrentConversationId()
-    const conversation = getConversation(conversationId)
+    const conversation = getConversation(routeConversationId)
     if (conversation?.plan) {
       setCurrentConversationId(conversation.id)
+      conversationId.value = conversation.id
       plan.value = conversation.plan
+      void loadChatHistory(conversation.id, version)
       void enrichMissingImages(conversation.id, conversation.plan, version)
       return
     }
@@ -113,7 +309,9 @@ function loadConversation() {
     const legacyPlan = loadLegacyPlan()
     if (legacyPlan) {
       const migrated = createConversation(legacyPlan)
+      conversationId.value = migrated.id
       plan.value = legacyPlan
+      void loadChatHistory(migrated.id, version)
       router.replace({ path: '/result', query: { conversation: migrated.id } })
     }
   } catch {
@@ -159,7 +357,41 @@ function startNewPlan() {
 </script>
 
 <style scoped>
-.result-page{min-height:calc(100vh - 48px);padding:28px 36px 56px;background:#f7f8fa}.result-header{max-width:1120px;margin:0 auto 24px;display:flex;align-items:center;justify-content:space-between}.eyebrow{margin:0 0 8px;color:#2764c8;font-size:14px;font-weight:600}.result-header h1{margin:0;color:#1f2937;font-size:32px}.date-range{margin:8px 0 0;color:#8a919c}.suggestion,.summary-grid,.day-list{max-width:1120px;margin-left:auto;margin-right:auto}.suggestion{margin-bottom:20px}.summary-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}.summary-card{display:flex;align-items:center;gap:14px;padding:18px 20px;background:#fff;border-radius:14px;box-shadow:0 5px 20px rgba(31,41,55,.05)}.summary-icon{font-size:27px}.summary-card div{display:flex;flex-direction:column;gap:5px}.summary-card span:not(.summary-icon){color:#8a919c;font-size:13px}.summary-card strong{color:#26364b}.day-list h2{margin:0 0 16px;color:#1f2937}.day-card{margin-bottom:18px;border-radius:16px;box-shadow:0 5px 20px rgba(31,41,55,.05)}.day-title{display:flex;align-items:center;gap:14px;padding-bottom:16px;border-bottom:1px solid #edf0f4}.day-number{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#1760c4;color:#fff;font-size:20px;font-weight:700}.day-title h3{margin:0 0 4px;color:#26364b}.day-title p{margin:0;color:#8993a1;font-size:13px}.transport{margin-left:auto;color:#607087;font-size:13px}.day-content{display:grid;grid-template-columns:1fr 280px;gap:24px;padding-top:18px}.subsection-title{margin:0 0 14px;color:#26364b;font-size:15px}.attraction-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:22px}.attraction-card{overflow:hidden;border:1px solid #e8edf5;border-radius:12px;background:#fff;box-shadow:0 3px 12px rgba(31,41,55,.06)}.attraction-image-wrap{height:150px;position:relative;background:linear-gradient(135deg,#dbeafe,#bfdbfe)}.attraction-image{width:100%;height:100%;display:block;object-fit:cover}.image-placeholder{height:100%;display:grid;place-items:center;font-size:42px}.attraction-index{position:absolute;top:10px;left:10px;width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#1760c4;color:#fff;font-weight:700}.attraction-body{padding:12px}.attraction-body strong{color:#26364b}.attraction-body p{margin:7px 0 4px;color:#687589;font-size:13px;line-height:1.5}.attraction-body small,.timeline-item small,.hotel-card small{color:#9aa3af}.timeline{display:flex;flex-direction:column;gap:16px}.timeline-item{display:flex;gap:12px}.timeline-dot{flex:0 0 26px;font-size:18px}.timeline-item strong{color:#26364b}.timeline-item p{margin:5px 0 3px;color:#687589;font-size:13px;line-height:1.5}.hotel-card{display:flex;gap:10px;padding:15px;background:#f6f9ff;border-radius:12px;height:max-content}.hotel-card>span{font-size:22px}.hotel-card strong{color:#26364b}.hotel-card p{margin:5px 0;color:#687589;font-size:13px}@media(max-width:760px){.result-page{padding:20px 14px 40px}.result-header{align-items:flex-start;gap:16px}.result-header h1{font-size:25px}.summary-grid{grid-template-columns:1fr}.day-content{grid-template-columns:1fr}.attraction-grid{grid-template-columns:1fr}.transport{display:none}}
+.result-page{height:100%;min-height:0;padding:0;overflow:hidden;background:#f7f8fa}.result-header{max-width:1120px;margin:0 auto 24px;display:flex;align-items:center;justify-content:space-between}.eyebrow{margin:0 0 8px;color:#2764c8;font-size:14px;font-weight:600}.result-header h1{margin:0;color:#1f2937;font-size:32px}.date-range{margin:8px 0 0;color:#8a919c}.suggestion,.summary-grid,.day-list{max-width:1120px;margin-left:auto;margin-right:auto}.suggestion{margin-bottom:20px}.summary-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}.summary-card{display:flex;align-items:center;gap:14px;padding:18px 20px;background:#fff;border-radius:14px;box-shadow:0 5px 20px rgba(31,41,55,.05)}.summary-icon{font-size:27px}.summary-card div{display:flex;flex-direction:column;gap:5px}.summary-card span:not(.summary-icon){color:#8a919c;font-size:13px}.summary-card strong{color:#26364b}.day-list h2{margin:0 0 16px;color:#1f2937}.day-card{margin-bottom:18px;border-radius:16px;box-shadow:0 5px 20px rgba(31,41,55,.05)}.day-title{display:flex;align-items:center;gap:14px;padding-bottom:16px;border-bottom:1px solid #edf0f4}.day-number{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#1760c4;color:#fff;font-size:20px;font-weight:700}.day-title h3{margin:0 0 4px;color:#26364b}.day-title p{margin:0;color:#8993a1;font-size:13px}.transport{margin-left:auto;color:#607087;font-size:13px}.day-content{display:grid;grid-template-columns:1fr 280px;gap:24px;padding-top:18px}.subsection-title{margin:0 0 14px;color:#26364b;font-size:15px}.attraction-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:22px}.attraction-card{overflow:hidden;border:1px solid #e8edf5;border-radius:12px;background:#fff;box-shadow:0 3px 12px rgba(31,41,55,.06)}.attraction-image-wrap{height:150px;position:relative;background:linear-gradient(135deg,#dbeafe,#bfdbfe)}.attraction-image{width:100%;height:100%;display:block;object-fit:cover}.image-placeholder{height:100%;display:grid;place-items:center;font-size:42px}.attraction-index{position:absolute;top:10px;left:10px;width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#1760c4;color:#fff;font-weight:700}.attraction-body{padding:12px}.attraction-body strong{color:#26364b}.attraction-body p{margin:7px 0 4px;color:#687589;font-size:13px;line-height:1.5}.attraction-body small,.timeline-item small,.hotel-card small{color:#9aa3af}.timeline{display:flex;flex-direction:column;gap:16px}.timeline-item{display:flex;gap:12px}.timeline-dot{flex:0 0 26px;font-size:18px}.timeline-item strong{color:#26364b}.timeline-item p{margin:5px 0 3px;color:#687589;font-size:13px;line-height:1.5}.hotel-card{display:flex;gap:10px;padding:15px;background:#f6f9ff;border-radius:12px;height:max-content}.hotel-card>span{font-size:22px}.hotel-card strong{color:#26364b}.hotel-card p{margin:5px 0;color:#687589;font-size:13px}@media(max-width:760px){.result-page{padding:20px 14px 40px}.result-header{align-items:flex-start;gap:16px}.result-header h1{font-size:25px}.summary-grid{grid-template-columns:1fr}.day-content{grid-template-columns:1fr}.attraction-grid{grid-template-columns:1fr}.transport{display:none}}
 .weather-section{max-width:1120px;margin:32px auto 0}.weather-section h2{margin:0 0 16px;color:#1f2937}.weather-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}.weather-item{display:flex;flex-direction:column;gap:8px;padding:16px;background:#fff;border:1px solid #e8edf5;border-radius:12px}.weather-item strong{color:#26364b}.weather-item span{color:#687589;font-size:13px}.weather-item small{color:#9aa3af}
 .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.result-workspace { width: 100%; max-width: none; height: 100%; min-height: 0; margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0; }
+.conversation-panel, .manual-panel { min-width: 0; background: #fff; border: 0; border-radius: 0; box-shadow: none; }
+.conversation-panel { border-right: 1px solid #f0f0f0; }
+.conversation-panel { height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.conversation-panel-header, .manual-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px; border-bottom: 1px solid #edf0f4; }
+.conversation-panel-header h2, .manual-toolbar h2 { margin: 0; color: #1f2937; font-size: 20px; }
+.conversation-status { color: #6e7783; font-size: 12px; white-space: nowrap; }
+.conversation-status:first-letter { color: #22a06b; }
+.conversation-messages { flex: 1; overflow-y: auto; padding: 20px; background: #fbfcfe; }
+.assistant-message, .user-message { max-width: 92%; margin-bottom: 14px; padding: 13px 14px; border-radius: 13px; font-size: 13px; line-height: 1.65; }
+.assistant-message { max-width: none; margin: 0; padding: 0 0 18px; background: transparent; color: #394b63; border: 0; border-radius: 0; }
+.assistant-message strong { display: block; margin-bottom: 5px; color: #1760c4; }
+.assistant-message p { margin: 0; }
+.user-message { margin-left: auto; background: #1760c4; color: #fff; }
+.conversation-composer { display: flex; gap: 8px; padding: 14px; border-top: 1px solid #edf0f4; }
+.conversation-composer textarea { flex: 1; resize: none; padding: 10px 11px; border: 1px solid #dfe5ee; border-radius: 10px; outline: none; font: inherit; font-size: 13px; }
+.conversation-composer textarea:focus { border-color: #1760c4; box-shadow: 0 0 0 2px rgba(23,96,196,.1); }
+.conversation-composer button, .pdf-button { align-self: flex-end; padding: 9px 13px; border: 0; border-radius: 9px; background: #1760c4; color: #fff; cursor: pointer; font-size: 13px; white-space: nowrap; }
+.conversation-composer button:disabled { background: #c5cfdd; cursor: not-allowed; }
+.manual-panel { min-height: 0; height: 100%; overflow-y: auto; padding-bottom: 30px; scrollbar-width: thin; scrollbar-color: #c6cbd3 transparent; }
+.conversation-panel, .conversation-messages { scrollbar-width: thin; scrollbar-color: #c6cbd3 transparent; }
+.conversation-messages { background: #fff; }
+.manual-panel::-webkit-scrollbar, .conversation-panel::-webkit-scrollbar, .conversation-messages::-webkit-scrollbar { width: 6px; }
+.manual-panel::-webkit-scrollbar-track, .conversation-panel::-webkit-scrollbar-track, .conversation-messages::-webkit-scrollbar-track { background: transparent; }
+.manual-panel::-webkit-scrollbar-thumb, .conversation-panel::-webkit-scrollbar-thumb, .conversation-messages::-webkit-scrollbar-thumb { background: #c6cbd3; border-radius: 999px; }
+.manual-panel::-webkit-scrollbar-thumb:hover, .conversation-panel::-webkit-scrollbar-thumb:hover, .conversation-messages::-webkit-scrollbar-thumb:hover { background: #adb4be; }
+.manual-panel > .result-header, .manual-panel > .suggestion, .manual-panel > .summary-grid, .manual-panel > .day-list, .manual-panel > .weather-section { max-width: none; margin-left: 24px; margin-right: 24px; }
+.manual-panel > .result-header { margin-top: 26px; }
+.manual-panel > .suggestion { margin-top: 0; }
+.manual-toolbar .eyebrow { margin: 0 0 5px; }
+.pdf-button { background: #fff; color: #1760c4; border: 1px solid #1760c4; }
+.pdf-button:hover { background: #f0f5ff; }
+@media (max-width: 900px) { .result-page { height: auto; min-height: 100%; overflow: visible; }.result-workspace { height: auto; grid-template-columns: 1fr; }.conversation-panel { position: static; height: 360px; border-right: 0; border-bottom: 1px solid #f0f0f0; }.manual-panel { min-height: 0; height: auto; max-height: none; } }
+@media print { .conversation-panel, .pdf-button, .manual-toolbar { display: none !important; }.result-page { padding: 0; background: #fff; }.result-workspace { display: block; }.manual-panel { border: 0; box-shadow: none; }.manual-panel > .result-header, .manual-panel > .suggestion, .manual-panel > .summary-grid, .manual-panel > .day-list, .manual-panel > .weather-section { margin-left: 0; margin-right: 0; } }
 </style>

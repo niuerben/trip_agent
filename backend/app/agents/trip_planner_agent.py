@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from hello_agents import SimpleAgent
 from hello_agents.tools import MCPTool
 from ..services.llm_service import get_llm
-from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel
+from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel, Preference
 from ..config import get_settings
 from ..services.amap_photo_service import AmapPhotoService, get_amap_photo_service
 
@@ -222,16 +222,19 @@ class MultiAgentTripPlanner:
             traceback.print_exc()
             raise
     
-    def plan_trip(self, request: TripRequest) -> TripPlan:
+    def plan_trip(self, request: TripRequest, preference: Optional[Preference] = None) -> TripPlan:
         """
         使用多智能体协作生成旅行计划
 
         Args:
-            request: 旅行请求
+            request: 旅行请求(需求提示词，沿用 TripRequest)
+            preference: 用户偏好(偏好提示词，来自 talk_agent)，可为空
 
         Returns:
             旅行计划
         """
+        if preference is None:
+            preference = Preference()
         try:
             print(f"\n{'='*60}")
             print(f"🚀 开始多智能体协作规划旅行...")
@@ -239,11 +242,13 @@ class MultiAgentTripPlanner:
             print(f"日期: {request.start_date} 至 {request.end_date}")
             print(f"天数: {request.travel_days}天")
             print(f"偏好: {', '.join(request.preferences) if request.preferences else '无'}")
+            if preference.prompt:
+                print(f"偏好提示词: {preference.prompt[:100]}")
             print(f"{'='*60}\n")
 
             # 步骤1: 景点搜索Agent搜索景点
             print("📍 步骤1: 搜索景点...")
-            attraction_query = self._build_attraction_query(request)
+            attraction_query = self._build_attraction_query(request, preference)
             attraction_response = self.attraction_agent.run(attraction_query)
             print(f"景点搜索结果: {attraction_response[:200]}...\n")
 
@@ -261,12 +266,18 @@ class MultiAgentTripPlanner:
 
             # 步骤4: 行程规划Agent整合信息生成计划
             print("📋 步骤4: 生成行程计划...")
-            planner_query = self._build_planner_query(request, attraction_response, weather_response, hotel_response)
+            planner_query = self._build_planner_query(
+                request,
+                attraction_response,
+                weather_response,
+                hotel_response,
+                preference,
+            )
             planner_response = self.planner_agent.run(planner_query)
             print(f"行程规划结果: {planner_response[:300]}...\n")
 
             # 解析最终计划
-            trip_plan = self._parse_response(planner_response, request)
+            trip_plan = self._parse_response(planner_response, request, preference)
             trip_plan = self._enrich_attraction_images(trip_plan)
 
             print(f"{'='*60}")
@@ -279,26 +290,66 @@ class MultiAgentTripPlanner:
             print(f"❌ 生成旅行计划失败: {str(e)}")
             import traceback
             traceback.print_exc()
-            return self._create_fallback_plan(request, "模型或高德服务响应超时/不可用")
+            if request.current_plan:
+                try:
+                    print("⚠️ 定向重规划失败，保留原旅行计划")
+                    return TripPlan.model_validate(request.current_plan)
+                except Exception as preserve_error:
+                    print(f"⚠️ 原旅行计划无法恢复: {preserve_error}")
+            return self._create_fallback_plan(request, "模型或高德服务响应超时/不可用", preference)
 
     @staticmethod
     def _enrich_attraction_images(plan: TripPlan) -> TripPlan:
-        """用高德 POI 图片补齐模型未返回的景点图片。"""
+        """用高德 POI 图片补齐模型未返回的景点图片。
+
+        一个城市只请求一次 POI 列表，再按景点名称匹配，避免为每个景点
+        单独请求高德接口导致规划链路被网络 IO 拖慢。
+        """
         settings = get_settings()
         if not settings.amap_api_key:
             return plan
 
         photo_service = get_amap_photo_service()
-        cached: Dict[str, Any] = {}
-        for day in plan.days:
-            for attraction in day.attractions:
-                if MultiAgentTripPlanner._is_amap_image_url(attraction.image_url):
+        attractions = [
+            attraction
+            for day in plan.days
+            for attraction in day.attractions
+            if not MultiAgentTripPlanner._is_amap_image_url(attraction.image_url)
+        ]
+        if not attractions:
+            return plan
+
+        try:
+            pois = photo_service.search_pois(
+                "景点",
+                city=plan.city,
+                offset=min(20, max(10, len(attractions) * 3)),
+            )
+        except Exception as error:
+            print(f"⚠️ 高德图片补齐跳过: {type(error).__name__}: {error}")
+            return plan
+
+        def normalize(value: str) -> str:
+            return "".join(str(value or "").split()).lower()
+
+        normalized_pois = [
+            (normalize(poi.get("name", "")), poi)
+            for poi in pois
+            if isinstance(poi, dict)
+        ]
+        for attraction in attractions:
+            attraction_name = normalize(attraction.name)
+            if not attraction_name:
+                continue
+            for poi_name, poi in normalized_pois:
+                if not poi_name or not (
+                    attraction_name in poi_name or poi_name in attraction_name
+                ):
                     continue
-                key = f"{plan.city}:{attraction.name}"
-                if key not in cached:
-                    cached[key] = photo_service.get_photo_url(attraction.name, plan.city)
-                if cached[key]:
-                    attraction.image_url = cached[key]
+                photos = AmapPhotoService._extract_photos(poi)
+                if photos:
+                    attraction.image_url = photos[0]["url"]
+                    break
         return plan
 
     @staticmethod
@@ -306,7 +357,7 @@ class MultiAgentTripPlanner:
         """只接受高德图片地址，避免模型示例 URL 被直接展示。"""
         return bool(url) and "autonavi.com" in url.lower()
     
-    def _build_attraction_query(self, request: TripRequest) -> str:
+    def _build_attraction_query(self, request: TripRequest, preference: Optional[Preference] = None) -> str:
         """构建景点搜索查询 - 直接包含工具调用"""
         keywords = []
         if request.preferences:
@@ -317,9 +368,11 @@ class MultiAgentTripPlanner:
 
         # 直接返回工具调用格式
         query = f"请使用amap_maps_text_search工具搜索{request.city}的{keywords}相关景点。\n[TOOL_CALL:amap_maps_text_search:keywords={keywords},city={request.city}]"
+        if preference and preference.prompt:
+            query += f"\n用户偏好参考: {preference.prompt}"
         return query
 
-    def _build_planner_query(self, request: TripRequest, attractions: str, weather: str, hotels: str = "") -> str:
+    def _build_planner_query(self, request: TripRequest, attractions: str, weather: str, hotels: str = "", preference: Optional[Preference] = None) -> str:
         """构建行程规划查询"""
         query = f"""请根据以下信息生成{request.city}的{request.travel_days}天旅行计划:
 
@@ -348,12 +401,27 @@ class MultiAgentTripPlanner:
 4. 返回完整的JSON格式数据
 5. 景点的经纬度坐标要真实准确
 """
+        if request.current_plan and request.change_request:
+            query += f"""
+**当前旅行计划(JSON):**
+{json.dumps(request.current_plan, ensure_ascii=False)}
+
+**定向修改要求:**
+{request.change_request}
+
+**定向修改规则:**
+1. 只修改用户明确要求的日期、景点、餐饮、酒店、交通或预算。
+2. 未被要求修改的日期和内容必须保留。
+3. 返回完整的旅行计划 JSON，不能只返回修改片段。
+"""
         if request.free_text_input:
             query += f"\n**额外要求:** {request.free_text_input}"
+        if preference and preference.prompt:
+            query += f"\n**用户偏好:** {preference.prompt}"
 
         return query
-    
-    def _parse_response(self, response: str, request: TripRequest) -> TripPlan:
+
+    def _parse_response(self, response: str, request: TripRequest, preference: Optional[Preference] = None) -> TripPlan:
         """
         解析Agent响应
         
@@ -394,12 +462,18 @@ class MultiAgentTripPlanner:
         except Exception as e:
             print(f"⚠️  解析响应失败: {str(e)}")
             print(f"   将使用备用方案生成计划")
-            return self._create_fallback_plan(request, "模型返回内容无法解析")
-    
+            if request.current_plan:
+                try:
+                    return TripPlan.model_validate(request.current_plan)
+                except Exception:
+                    pass
+            return self._create_fallback_plan(request, "模型返回内容无法解析", preference)
+
     @staticmethod
     def _create_fallback_plan(
         request: TripRequest,
-        fallback_reason: str = "未配置模型密钥"
+        fallback_reason: str = "未配置模型密钥",
+        preference: Optional[Preference] = None,
     ) -> TripPlan:
         """创建备用计划(当Agent失败时)"""
         from datetime import datetime, timedelta
@@ -489,16 +563,20 @@ class MultiAgentTripPlanner:
             )
             days.append(day_plan)
         
+        overall_suggestions = (
+            f"{fallback_reason}，已生成{request.city}{request.travel_days}日基础行程。"
+            "服务恢复后可获得更精确的高德景点、天气和图片推荐。"
+        )
+        if preference and preference.prompt:
+            overall_suggestions += f" 已记录你的偏好: {preference.prompt}"
+
         return TripPlan(
             city=request.city,
             start_date=request.start_date,
             end_date=request.end_date,
             days=days,
             weather_info=weather_info,
-            overall_suggestions=(
-                f"{fallback_reason}，已生成{request.city}{request.travel_days}日基础行程。"
-                "服务恢复后可获得更精确的高德景点、天气和图片推荐。"
-            )
+            overall_suggestions=overall_suggestions,
         )
 
 

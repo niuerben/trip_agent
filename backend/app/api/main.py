@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
 from ..database import database_health, init_database
-from .routes import trip, poi, map as map_routes, auth, conversations
+from .routes import trip, poi, map as map_routes, auth, conversations, talk
 
 # 获取配置
 settings = get_settings()
@@ -40,6 +40,7 @@ app.include_router(poi.router, prefix="/api")
 app.include_router(map_routes.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(conversations.router, prefix="/api")
+app.include_router(talk.router, prefix="/api")
 
 
 @app.on_event("startup")

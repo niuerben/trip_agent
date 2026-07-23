@@ -42,6 +42,28 @@ async def init_database() -> None:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        await connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                conversation_id VARCHAR(100) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                user_id VARCHAR(190) NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+                role VARCHAR(20) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        await connection.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
+            ON chat_messages (conversation_id, created_at)
+        """))
+        await connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS conversation_preferences (
+                conversation_id VARCHAR(100) PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                user_id VARCHAR(190) NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+                prompt TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
 
 
 async def database_health() -> bool:

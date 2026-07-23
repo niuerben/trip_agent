@@ -87,6 +87,10 @@ export interface TripFormData {
   accommodation: string
   preferences: string[]
   free_text_input: string
+  conversation_id?: string
+  preference?: Preference
+  current_plan?: TripPlan
+  change_request?: string
 }
 
 export type TripFormState = Omit<TripFormData, 'start_date' | 'end_date'> & {
@@ -98,5 +102,43 @@ export interface TripPlanResponse {
   success: boolean
   message: string
   data?: TripPlan
+}
+
+export interface Preference {
+  prompt: string
+}
+
+export interface TalkMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatMessage {
+  id: number
+  conversation_id: string
+  role: 'user' | 'assistant'
+  content: string
+  created_at: string
+}
+
+export interface TalkRequest {
+  conversation_id?: string
+  messages?: TalkMessage[]
+  message: string
+}
+
+export interface TalkResponse {
+  success: boolean
+  reply: string
+  intent: 'chat' | 'replan'
+  change_request?: string
+  preference?: Preference
+  done: boolean
+  messages: ChatMessage[]
+}
+
+export interface ChatHistoryResponse {
+  success: boolean
+  messages: ChatMessage[]
 }
 

@@ -18,7 +18,21 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+try:
+    from playwright.sync_api import (
+        Page,
+        TimeoutError as PlaywrightTimeoutError,
+        sync_playwright,
+    )
+except ModuleNotFoundError as error:
+    if error.name == "playwright":
+        raise SystemExit(
+            "缺少 Playwright 依赖。请在当前运行脚本的 Python 环境中执行：\n"
+            "  python -m pip install playwright\n"
+            "  python -m playwright install\n"
+            "然后重新运行：python test/test_trip_planner.py"
+        ) from error
+    raise
 
 
 TEST_USERNAME = "admin"
@@ -147,7 +161,17 @@ def run_trip_planner_test(
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel="msedge", headless=not headed)
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
-        page.goto(base_url, wait_until="domcontentloaded")
+        try:
+            page.goto(base_url, wait_until="domcontentloaded")
+        except Exception as error:  # noqa: BLE001 - 转换为可执行的测试提示
+            if "ERR_CONNECTION_REFUSED" in str(error):
+                raise AssertionError(
+                    f"无法连接前端 {base_url}。请先在另一个终端启动前端：\n"
+                    "  cd frontend\n"
+                    "  npm run dev -- --host 0.0.0.0\n"
+                    "后端也需运行在 http://localhost:8000。"
+                ) from error
+            raise
         page.get_by_role("main").wait_for()
 
         login(page, TEST_USERNAME, TEST_PASSWORD)
@@ -175,10 +199,10 @@ def run_trip_planner_test(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="使用 Microsoft Edge 测试旅行规划")
-    parser.add_argument("--city", default="陆丰")
+    parser.add_argument("--city", default="深圳坪山")
     parser.add_argument("--start-date", default="2026-07-27")
     parser.add_argument("--end-date", default="2026-07-29")
-    parser.add_argument("--preferences", nargs="+", default=["美食"])
+    parser.add_argument("--preferences", nargs="+", default=["美食","休闲"])
     parser.add_argument("--transportation", default="公共交通")
     parser.add_argument("--accommodation", default="经济型酒店")
     parser.add_argument("--free-text", default="三人行，吃好吃的，玩好玩的，每餐预算人均不超过 40 元")

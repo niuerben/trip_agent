@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     planner_mode: str = "auto"
     planner_init_timeout_seconds: int = 180
     planner_execution_timeout_seconds: int = 110
+    # 高德 Web 服务请求超时。连接和读取分开配置，避免单次网络抖动拖垮整条规划链路。
+    amap_connect_timeout_seconds: int = 5
+    amap_read_timeout_seconds: int = 12
+    amap_request_retries: int = 1
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4"

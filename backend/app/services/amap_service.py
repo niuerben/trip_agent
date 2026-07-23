@@ -57,7 +57,12 @@ class AmapService:
 
     def __init__(self):
         """初始化服务。MCP 仅在路线和详情接口使用时按需启动。"""
-        self.api_key = get_settings().amap_api_key
+        settings = get_settings()
+        self.api_key = settings.amap_api_key
+        self.timeout = (
+            settings.amap_connect_timeout_seconds,
+            settings.amap_read_timeout_seconds,
+        )
         self.mcp_tool: Optional[MCPTool] = None
 
     def _get_mcp_tool(self) -> MCPTool:
@@ -94,7 +99,7 @@ class AmapService:
                     "page": 1,
                     "output": "json",
                 },
-                timeout=10,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             payload = response.json()
@@ -153,7 +158,7 @@ class AmapService:
                     "extensions": "all",
                     "output": "json",
                 },
-                timeout=10,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             payload = response.json()

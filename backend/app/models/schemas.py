@@ -7,8 +7,22 @@ from datetime import date
 
 # ============ 请求模型 ============
 
+class Preference(BaseModel):
+    """用户偏好，由 talk_agent 对话产出。"""
+    prompt: str = Field(default="", description="用户偏好提示词")
+
 class TripRequest(BaseModel):
-    """旅行规划请求"""
+    """
+        旅行规划请求
+        city: 目的城市
+        start_date: 开始日期 YYYY-MM-DD
+        end_date: 结束日期 YYYY-MM-DD
+        travel_days: 旅行天数
+        transportation: 交通方式
+        accommodation: 住宿偏好
+        preferences: 旅行偏好标签
+        free_text_input: 额外要求
+    """
     city: str = Field(..., description="目的地城市", example="北京")
     start_date: str = Field(..., description="开始日期 YYYY-MM-DD", example="2025-06-01")
     end_date: str = Field(..., description="结束日期 YYYY-MM-DD", example="2025-06-03")
@@ -17,6 +31,10 @@ class TripRequest(BaseModel):
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
     preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
+    conversation_id: Optional[str] = Field(default=None, description="关联的行程对话ID")
+    preference: Optional[Preference] = Field(default=None, description="talk_agent 提炼的用户偏好")
+    current_plan: Optional[dict] = Field(default=None, description="当前旅行计划，用于定向修改")
+    change_request: Optional[str] = Field(default="", description="用户要求修改的内容")
     
     class Config:
         json_schema_extra = {
@@ -28,9 +46,51 @@ class TripRequest(BaseModel):
                 "transportation": "公共交通",
                 "accommodation": "经济型酒店",
                 "preferences": ["历史文化", "美食"],
-                "free_text_input": "希望多安排一些博物馆"
+                "free_text_input": "希望多安排一些博物馆",
+                "conversation_id": "conversation_demo",
+                "preference": {"prompt": "偏好自然风光和当地美食，节奏悠闲"},
+                "change_request": "将第二天改为自然风光路线"
             }
         }
+
+
+class TalkMessage(BaseModel):
+    """单条对话消息"""
+    role: str = Field(..., description="角色: user / assistant")
+    content: str = Field(..., description="消息内容")
+
+
+class TalkRequest(BaseModel):
+    """talk_agent 对话请求"""
+    conversation_id: Optional[str] = Field(default=None, description="所属行程对话ID，用于持久化聊天记录")
+    messages: List[TalkMessage] = Field(default=[], description="历史对话")
+    message: str = Field(..., description="用户本轮输入")
+
+
+class ChatMessage(BaseModel):
+    """持久化的聊天消息"""
+    id: int = Field(..., description="消息ID")
+    conversation_id: str = Field(..., description="所属行程对话ID")
+    role: str = Field(..., description="角色: user / assistant")
+    content: str = Field(..., description="消息内容")
+    created_at: str = Field(..., description="创建时间(北京时间)")
+
+
+class TalkResponse(BaseModel):
+    """talk_agent 对话响应"""
+    success: bool = Field(default=True, description="是否成功")
+    reply: str = Field(default="", description="assistant 回复")
+    intent: str = Field(default="chat", description="语义意图: chat / replan")
+    change_request: Optional[str] = Field(default=None, description="提炼后的行程修改要求")
+    preference: Optional["Preference"] = Field(default=None, description="提炼出的偏好")
+    done: bool = Field(default=False, description="偏好是否收集完成")
+    messages: List[ChatMessage] = Field(default=[], description="持久化后的完整聊天记录")
+
+
+class ChatHistoryResponse(BaseModel):
+    """聊天历史响应"""
+    success: bool = Field(default=True, description="是否成功")
+    messages: List[ChatMessage] = Field(default=[], description="聊天记录")
 
 
 class POISearchRequest(BaseModel):
