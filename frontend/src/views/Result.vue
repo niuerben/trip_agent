@@ -190,6 +190,7 @@ let mapInstance: any = null
 let mapMarkers: any[] = []
 let mapPolyline: any = null
 let amapNamespace: any = null
+const locationEnrichmentAttempted = new Set<string>()
 
 interface RouteNode {
   id: string
@@ -412,7 +413,7 @@ async function sendMessage() {
     plan.value = replanned.data
     if (conversationId.value) {
       updateConversation(conversationId.value, replanned.data)
-      void enrichMissingImages(conversationId.value, replanned.data, loadVersion)
+      void enrichPlanLocationsAndImages(conversationId.value, replanned.data, loadVersion)
     }
   } catch {
     chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: '抱歉，暂时无法回复，请稍后再试。' })
@@ -501,7 +502,7 @@ function loadConversation() {
       conversationId.value = conversation.id
       plan.value = conversation.plan
       void loadChatHistory(conversation.id, version)
-      void enrichMissingImages(conversation.id, conversation.plan, version)
+      void enrichPlanLocationsAndImages(conversation.id, conversation.plan, version)
       return
     }
 
@@ -537,15 +538,13 @@ onBeforeUnmount(() => {
   mapInstance = null
 })
 
-async function enrichMissingImages(
+async function enrichPlanLocationsAndImages(
   conversationId: string,
   currentPlan: TripPlan,
   version: number
 ) {
-  const hasMissingImages = currentPlan.days.some((day) =>
-    day.attractions.some((attraction) => !isAmapImageUrl(attraction.image_url))
-  )
-  if (!hasMissingImages) return
+  if (locationEnrichmentAttempted.has(conversationId)) return
+  locationEnrichmentAttempted.add(conversationId)
 
   try {
     const response = await enrichTripPlanImages(currentPlan)
@@ -558,10 +557,6 @@ async function enrichMissingImages(
   } catch {
     // 图片补齐失败不影响已有行程内容展示。
   }
-}
-
-function isAmapImageUrl(url?: string | null) {
-  return Boolean(url && url.toLowerCase().includes('autonavi.com'))
 }
 
 function startNewPlan() {

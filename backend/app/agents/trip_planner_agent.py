@@ -111,7 +111,7 @@ class TripPlannerAgent:
 
     @staticmethod
     def _enrich_attraction_images(plan: TripPlan) -> TripPlan:
-        """用高德 POI 图片补齐模型未返回的景点图片。
+        """用高德 POI 校正景点坐标并补齐图片。
 
         一个城市只请求一次 POI 列表，再按景点名称匹配，避免为每个景点
         单独请求高德接口导致规划链路被网络 IO 拖慢。
@@ -125,7 +125,6 @@ class TripPlannerAgent:
             attraction
             for day in plan.days
             for attraction in day.attractions
-            if not TripPlannerAgent._is_amap_image_url(attraction.image_url)
         ]
         if not attractions:
             return plan
@@ -152,16 +151,115 @@ class TripPlannerAgent:
             attraction_name = normalize(attraction.name)
             if not attraction_name:
                 continue
+            matched = False
             for poi_name, poi in normalized_pois:
                 if not poi_name or not (
                     attraction_name in poi_name or poi_name in attraction_name
                 ):
                     continue
+                location = TripPlannerAgent._parse_poi_location(poi)
+                if location:
+                    # 高德 POI 的 location 已经是高德地图使用的 GCJ-02 坐标，
+                    # 优先覆盖模型生成的近似坐标，避免地图标记偏移。
+                    attraction.location = location
                 photos = AmapPhotoService._extract_photos(poi)
-                if photos:
+                if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
                     attraction.image_url = photos[0]["url"]
+                matched = True
+                break
+
+            # 学校、大学等 POI 经常不会出现在“景点”关键词列表中，
+            # 对这些名称再发起一次精确查询，避免使用模型近似坐标。
+            if not matched and any(
+                marker in attraction.name
+                for marker in ("大学", "学院", "学校", "校园")
+            ):
+                exact_cities = [plan.city]
+                if plan.city.endswith("坪山"):
+                    exact_cities.append("深圳")
+                for exact_city in exact_cities:
+                    try:
+                        exact_pois = photo_service.search_pois(
+                            attraction.name,
+                            city=exact_city,
+                            offset=10,
+                        )
+                    except Exception as error:
+                        print(
+                            f"⚠️ 高德精确 POI 坐标补齐跳过({attraction.name}): "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        continue
+                    exact_match = next(
+                        (
+                            poi
+                            for poi in exact_pois
+                            if (
+                                attraction_name in normalize(poi.get("name", ""))
+                                or normalize(poi.get("name", "")) in attraction_name
+                            )
+                        ),
+                        None,
+                    )
+                    if not exact_match:
+                        continue
+                    location = TripPlannerAgent._parse_poi_location(exact_match)
+                    if location:
+                        attraction.location = location
+                    photos = AmapPhotoService._extract_photos(exact_match)
+                    if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
+                        attraction.image_url = photos[0]["url"]
                     break
+
+        # 酒店和餐馆也可能只有名称没有坐标，按类别补一次高德 POI 坐标。
+        route_targets = {
+            "酒店": [day.hotel for day in plan.days if day.hotel],
+            "餐厅": [
+                meal
+                for day in plan.days
+                for meal in day.meals
+            ],
+        }
+        for keywords, targets in route_targets.items():
+            if not targets:
+                continue
+            try:
+                pois = photo_service.search_pois(
+                    keywords,
+                    city=plan.city,
+                    offset=min(20, max(10, len(targets) * 3)),
+                )
+            except Exception as error:
+                print(f"⚠️ 高德{keywords}坐标补齐跳过: {type(error).__name__}: {error}")
+                continue
+            normalized_pois = [
+                (normalize(poi.get("name", "")), poi)
+                for poi in pois
+                if isinstance(poi, dict)
+            ]
+            for target in targets:
+                target_name = normalize(getattr(target, "name", ""))
+                for poi_name, poi in normalized_pois:
+                    if target_name and poi_name and (
+                        target_name in poi_name or poi_name in target_name
+                    ):
+                        location = TripPlannerAgent._parse_poi_location(poi)
+                        if location:
+                            target.location = location
+                        break
         return plan
+
+    @staticmethod
+    def _parse_poi_location(poi: dict) -> Optional[Location]:
+        """解析高德 POI 的 ``经度,纬度`` 字符串。"""
+        raw_location = str(poi.get("location") or "")
+        try:
+            longitude, latitude = (float(value) for value in raw_location.split(",", 1))
+        except (TypeError, ValueError):
+            return None
+        if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+            return None
+        return Location(longitude=longitude, latitude=latitude)
 
     @staticmethod
     def _is_amap_image_url(url: Optional[str]) -> bool:
@@ -303,7 +401,11 @@ class TripPlannerAgent:
                             latitude=float(location_parts[1]),
                         )
                     except (IndexError, ValueError):
-                        location = Location(longitude=116.4, latitude=39.9)
+                        location = TripPlannerAgent._fallback_city_location(
+                            request.city,
+                            i,
+                            j,
+                        )
                     photos = AmapPhotoService._extract_photos(poi)
                     attractions.append(
                         Attraction(
@@ -321,9 +423,10 @@ class TripPlannerAgent:
                         Attraction(
                             name=f"{request.city}景点{j + 1}",
                             address=f"{request.city}市",
-                            location=Location(
-                                longitude=116.4 + i * 0.01 + j * 0.005,
-                                latitude=39.9 + i * 0.01 + j * 0.005,
+                            location=TripPlannerAgent._fallback_city_location(
+                                request.city,
+                                i,
+                                j,
                             ),
                             visit_duration=120,
                             description=f"这是{request.city}的著名景点",
@@ -361,6 +464,31 @@ class TripPlannerAgent:
             weather_info=weather_info,
             overall_suggestions=overall_suggestions,
         )
+
+    @staticmethod
+    def _fallback_city_location(city: str, day_index: int, item_index: int) -> Location:
+        """在高德暂不可用时使用城市级中心点，避免把深圳标到北京。"""
+        city_centers = {
+            "深圳": (114.0579, 22.5431),
+            "深圳坪山": (114.3389, 22.7080),
+            "化州": (110.6396, 21.6635),
+            "陆丰": (115.6523, 22.9465),
+            "北京": (116.4074, 39.9042),
+        }
+        longitude, latitude = next(
+            (
+                center
+                for name, center in sorted(
+                    city_centers.items(),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+                if name in city
+            ),
+            (113.2644, 23.1291),
+        )
+        offset = day_index * 0.002 + item_index * 0.001
+        return Location(longitude=longitude + offset, latitude=latitude + offset)
 
 
 # 全局单 Agent 实例
