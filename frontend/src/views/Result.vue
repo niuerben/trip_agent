@@ -11,15 +11,26 @@
       <span>{{ routeNodes.length ? `${routeNodes.length} 个路线节点` : '等待旅行计划' }}</span>
     </div>
 
-    <aside class="conversation-panel conversation-float">
+    <aside class="conversation-panel conversation-float" :class="{ 'conversation-collapsed': chatCollapsed }">
       <div class="conversation-panel-header">
-        <div>
+        <div class="chat-heading">
           <p class="eyebrow">AI 助手</p>
           <h2>行程讨论</h2>
         </div>
-        <span class="conversation-status">● 在线</span>
+        <div class="chat-header-actions">
+          <span class="conversation-status">● 在线</span>
+          <button
+            class="chat-collapse-button"
+            type="button"
+            :aria-label="chatCollapsed ? '展开聊天' : '折叠聊天'"
+            :title="chatCollapsed ? '展开聊天' : '折叠聊天'"
+            @click="chatCollapsed = !chatCollapsed"
+          >
+            <span aria-hidden="true">{{ chatCollapsed ? '⌁' : '—' }}</span>
+          </button>
+        </div>
       </div>
-      <div class="conversation-messages" aria-live="polite">
+      <div v-if="!chatCollapsed" class="conversation-messages" aria-live="polite">
         <div class="assistant-message">
           <strong>行旅助手</strong>
           <p>{{ plan ? `已为你整理${plan.city}的旅行计划，可以继续告诉我想调整的内容。` : '填写旅行信息后，我会帮你安排景点、餐饮、交通和住宿。' }}</p>
@@ -40,7 +51,7 @@
           <p>正在思考…</p>
         </div>
       </div>
-      <form class="conversation-composer" @submit.prevent="sendMessage">
+      <form v-if="!chatCollapsed" class="conversation-composer" @submit.prevent="sendMessage">
         <textarea
           v-model="chatInput"
           rows="2"
@@ -111,6 +122,7 @@
                 @dragover.prevent
                 @drop="dropNode(node.id)"
                 @dragend="finishNodeDrag"
+                @dblclick="focusNodeOnMap(node)"
               >
                 <span class="node-marker">{{ nodeIcon(node.type) }}</span>
                 <div class="node-content">
@@ -169,6 +181,7 @@ const routeNodes = ref<RouteNode[]>([])
 const pdfExporting = ref(false)
 const chatInput = ref('')
 const chatSending = ref(false)
+const chatCollapsed = ref(false)
 const conversationId = ref<string | null>(null)
 const chatMessages = ref<Array<{ id: number | string; role: 'user' | 'assistant'; content: string }>>([])
 let nextMessageId = 1
@@ -256,6 +269,11 @@ function startNodeDrag(id: string) {
 
 function finishNodeDrag() {
   draggingNodeId = null
+}
+
+function focusNodeOnMap(node: RouteNode) {
+  if (!mapInstance || !node.location) return
+  mapInstance.setZoomAndCenter(16, [node.location.longitude, node.location.latitude], false, 500)
 }
 
 function dropNode(targetId: string) {
@@ -604,6 +622,8 @@ function startNewPlan() {
 .conversation-float .conversation-panel-header { padding: 18px 20px 15px; background: rgba(255,255,255,.82); border-radius: 18px 18px 0 0; }
 .conversation-float .conversation-messages { padding: 18px 20px; background: rgba(249,252,255,.72); }
 .conversation-float .conversation-composer { padding: 12px; background: rgba(255,255,255,.84); border-radius: 0 0 18px 18px; }
+.chat-header-actions { display: flex; align-items: center; gap: 9px; }.chat-collapse-button { width: 27px; height: 27px; display: grid; place-items: center; border: 1px solid #dce5ed; border-radius: 8px; background: rgba(255,255,255,.75); color: #607487; cursor: pointer; font-size: 16px; line-height: 1; }.chat-collapse-button:hover { border-color: #8bb6e8; background: #f1f7ff; color: #1768d4; }
+.conversation-collapsed { width: 58px; height: 58px; border-radius: 17px; }.conversation-collapsed .conversation-panel-header { width: 100%; height: 100%; padding: 0; justify-content: center; border-radius: 17px; }.conversation-collapsed .chat-heading, .conversation-collapsed .conversation-status { display: none; }.conversation-collapsed .chat-header-actions { width: 100%; height: 100%; justify-content: center; }.conversation-collapsed .chat-collapse-button { width: 100%; height: 100%; border: 0; background: transparent; font-size: 22px; }
 .route-panel { position: absolute; top: 16px; right: 18px; z-index: 4; width: min(560px, calc(100% - 430px)); height: calc(100% - 32px); min-width: 430px; overflow-y: auto; padding-bottom: 28px; border: 1px solid rgba(213,224,234,.95); border-radius: 18px; background: rgba(255,255,255,.95); box-shadow: 0 18px 44px rgba(42,64,82,.18); scrollbar-width: thin; scrollbar-color: #aebdca transparent; backdrop-filter: blur(14px); }
 .route-panel::-webkit-scrollbar { width: 6px; }.route-panel::-webkit-scrollbar-thumb { border-radius: 99px; background: #aebdca; }
 .route-panel .manual-toolbar { position: sticky; top: 0; z-index: 2; padding: 18px 22px 14px; background: rgba(255,255,255,.94); border-radius: 18px 18px 0 0; }
