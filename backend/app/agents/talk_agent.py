@@ -1,7 +1,7 @@
 """偏好对话智能体
 
 与用户多轮对话，从聊天中提炼出「用户偏好提示词」，
-供 MultiAgentTripPlanner.plan_trip 使用。不依赖高德 MCP 工具，构造轻量。
+供 TripPlannerAgent.plan_trip 使用。不依赖高德 MCP 工具，构造轻量。
 """
 
 from ..services.llm_service import get_llm

@@ -5,10 +5,11 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
-from ...agents.trip_planner_agent import MultiAgentTripPlanner, get_trip_planner_agent
+from ...agents.trip_planner_agent import TripPlannerAgent, get_trip_planner_agent
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
+from ...services.trip_plan_validator import validate_trip_plan
 from .conversations import user_id_from_request
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
@@ -77,12 +78,12 @@ async def plan_trip(request: TripRequest, http_request: Request):
 
         if not has_llm_key:
             print("未配置模型密钥，直接使用基础计划")
-            trip_plan = MultiAgentTripPlanner._create_fallback_plan(
+            trip_plan = TripPlannerAgent._create_fallback_plan(
                 request,
                 "未配置模型密钥",
                 preference,
             )
-            trip_plan = MultiAgentTripPlanner._enrich_attraction_images(trip_plan)
+            trip_plan = TripPlannerAgent._enrich_attraction_images(trip_plan)
         else:
             try:
                 agent = await asyncio.wait_for(
@@ -99,13 +100,15 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     "模型服务不可用，使用基础计划: "
                     f"{type(agent_error).__name__}: {agent_error}"
                 )
-                trip_plan = MultiAgentTripPlanner._create_fallback_plan(
+                trip_plan = TripPlannerAgent._create_fallback_plan(
                     request,
                     "模型或高德服务响应超时/不可用",
                     preference,
                 )
-                trip_plan = MultiAgentTripPlanner._enrich_attraction_images(trip_plan)
+                trip_plan = TripPlannerAgent._enrich_attraction_images(trip_plan)
 
+        # 无论计划来自单 Agent 还是兜底流程，出站前统一经过业务校验。
+        validate_trip_plan(trip_plan, request)
         print("旅行计划生成成功，准备返回响应\n")
         return TripPlanResponse(
             success=True,
@@ -131,7 +134,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
 async def enrich_trip_images(plan: TripPlan):
     """为历史计划中缺少 image_url 的景点补充高德 POI 图片。"""
     enriched_plan = await asyncio.to_thread(
-        MultiAgentTripPlanner._enrich_attraction_images,
+        TripPlannerAgent._enrich_attraction_images,
         plan,
     )
     return TripPlanResponse(
