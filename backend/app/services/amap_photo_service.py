@@ -106,7 +106,16 @@ class AmapPhotoService:
 
     def search_pois(self, keywords: str, city: str = "", offset: int = 10) -> List[dict]:
         """返回带图片扩展字段的高德 POI 原始结果。"""
-        return self._fetch_pois(keywords, city=city, offset=offset)
+        pois = self._fetch_pois(keywords, city=city, offset=offset)
+        try:
+            from .poi_vector_store import get_poi_vector_store
+
+            store = get_poi_vector_store()
+            if store:
+                store.upsert_pois(pois, city)
+        except Exception as error:
+            print(f"⚠️ POI 写入 Chroma 跳过: {type(error).__name__}: {error}")
+        return pois
 
     def get_photo_url(self, keywords: str, city: str = "") -> Optional[str]:
         """获取单张图片 URL(命中缓存, 找不到返回 None)"""

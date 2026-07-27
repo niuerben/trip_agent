@@ -3,6 +3,7 @@
 微信网页登录和GitHub OAuth都需要在部署环境中配置客户端密钥；本模块只负责
 服务端换取授权码、签发本应用JWT，不把第三方密钥暴露给浏览器。
 """
+import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -57,12 +58,20 @@ def frontend_redirect(token: str, redirect_uri: str, user: dict) -> RedirectResp
 async def password_login(payload: LoginRequest):
     """使用配置的账号密码签发JWT，适合本地/内部部署使用。"""
     if engine is not None:
-        async with engine.connect() as connection:
-            result = await connection.execute(text("""
-                SELECT id, display_name, avatar, password_hash
-                FROM app_users WHERE username = :username AND provider = 'local'
-            """), {"username": payload.username})
-            user_row = result.first()
+        try:
+            async def query_local_user():
+                async with engine.connect() as connection:
+                    result = await connection.execute(text("""
+                        SELECT id, display_name, avatar, password_hash
+                        FROM app_users WHERE username = :username AND provider = 'local'
+                    """), {"username": payload.username})
+                    return result.first()
+
+            # 数据库不可达时仍允许本地 .env 账号登录，避免登录接口被连接池无限阻塞。
+            user_row = await asyncio.wait_for(query_local_user(), timeout=3)
+        except Exception as error:
+            print(f"本地用户数据库查询失败，回退配置账号: {type(error).__name__}: {error}")
+            user_row = None
         if user_row:
             if not user_row.password_hash or not verify_password(payload.password, user_row.password_hash):
                 raise HTTPException(status_code=401, detail="用户名或密码错误")

@@ -9,13 +9,19 @@
     <div class="map-toolbar" aria-label="地图状态">
       <span class="map-live-dot"></span>
       <span>{{ routeNodes.length ? `${routeNodes.length} 个路线节点` : '等待旅行计划' }}</span>
+      <span v-if="mapRouteStatus" class="map-route-status">{{ mapRouteStatus }}</span>
+      <span v-if="plan?.days?.length" class="map-day-legend">
+        <span v-for="(_, index) in plan.days" :key="index"><i :style="{ backgroundColor: routeDayColor(index) }"></i>第{{ index + 1 }}天</span>
+      </span>
+      <span v-if="focusedNode?.location" class="map-focus-info">
+        {{ focusedNode.name }} · {{ focusedNode.location.longitude.toFixed(6) }}, {{ focusedNode.location.latitude.toFixed(6) }}
+      </span>
     </div>
 
     <aside class="conversation-panel conversation-float" :class="{ 'conversation-collapsed': chatCollapsed }">
       <div class="conversation-panel-header">
         <div class="chat-heading">
-          <p class="eyebrow">AI 助手</p>
-          <h2>行程讨论</h2>
+          <h2>我要改计划</h2>
         </div>
         <div class="chat-header-actions">
           <span class="conversation-status">● 在线</span>
@@ -50,6 +56,15 @@
           <strong>行旅助手</strong>
           <p>正在思考…</p>
         </div>
+        <div v-if="plan && !chatSending" class="topk-suggestions" aria-label="快捷建议">
+          <button
+            v-for="suggestion in topKSuggestions"
+            :key="suggestion"
+            type="button"
+            class="topk-suggestion"
+            @click="chatInput = suggestion"
+          >{{ suggestion }}</button>
+        </div>
       </div>
       <form v-if="!chatCollapsed" class="conversation-composer" @submit.prevent="sendMessage">
         <textarea
@@ -62,16 +77,28 @@
       </form>
     </aside>
 
-    <section ref="manualPanel" class="route-panel">
-      <div class="manual-toolbar">
-        <div>
-          <p class="eyebrow">旅游路线</p>
-          <h2>路线安排</h2>
+    <section ref="manualPanel" class="route-panel" :class="{ 'route-panel-collapsed': manualCollapsed }">
+      <button
+        v-if="manualCollapsed"
+        type="button"
+        class="route-expand-button"
+        aria-label="展开旅游路线"
+        title="展开旅游路线"
+        @click="manualCollapsed = false"
+      >‹</button>
+      <template v-else>
+        <div class="manual-toolbar">
+          <div>
+            <p class="eyebrow">旅游路线</p>
+            <h2>路线安排</h2>
+          </div>
+          <div class="manual-toolbar-actions">
+            <button class="route-collapse-button" type="button" aria-label="收缩旅游路线" title="收缩旅游路线" @click="manualCollapsed = true">›</button>
+            <button class="pdf-button" type="button" :disabled="pdfExporting" @click="downloadPdf">
+              {{ pdfExporting ? '生成中…' : '⇩ 下载 PDF' }}
+            </button>
+          </div>
         </div>
-        <button class="pdf-button" type="button" :disabled="pdfExporting" @click="downloadPdf">
-          {{ pdfExporting ? '生成中…' : '⇩ 下载 PDF' }}
-        </button>
-      </div>
 
       <template v-if="plan">
         <header class="result-header">
@@ -122,7 +149,7 @@
                 @dragover.prevent
                 @drop="dropNode(node.id)"
                 @dragend="finishNodeDrag"
-                @dblclick="focusNodeOnMap(node)"
+                @click="focusNodeOnMap(node)"
               >
                 <span class="node-marker">{{ nodeIcon(node.type) }}</span>
                 <div class="node-content">
@@ -141,14 +168,20 @@
           </article>
         </section>
 
-        <section v-if="plan.weather_info?.length" class="weather-section">
-          <div class="section-heading"><h2>天气信息</h2><span class="map-hint">高德天气</span></div>
+        <section v-if="plan.days?.length" class="weather-section">
+          <div class="section-heading"><h2>天气信息</h2><span class="map-hint">逐日预报</span></div>
           <div class="weather-row">
-            <article v-for="weather in plan.weather_info" :key="weather.date" class="weather-item">
-              <strong>{{ weather.date }}</strong>
-              <span>☀️ {{ weather.day_weather }} {{ weather.day_temp }}°</span>
-              <span>🌙 {{ weather.night_weather }} {{ weather.night_temp }}°</span>
-              <small>{{ weather.wind_direction }} {{ weather.wind_power }}</small>
+            <article v-for="card in travelWeatherCards" :key="card.date" class="weather-item">
+              <strong>{{ card.date }}</strong>
+              <template v-if="card.weather">
+                <span>☀️ {{ card.weather.day_weather }} {{ card.weather.day_temp }}°</span>
+                <span>🌙 {{ card.weather.night_weather }} {{ card.weather.night_temp }}°</span>
+                <small>{{ card.weather.wind_direction }} {{ card.weather.wind_power }} · {{ card.weather.source || '高德' }}</small>
+              </template>
+              <template v-else>
+                <span class="weather-unavailable">高德预报暂未覆盖</span>
+                <small>该日期超出当前预报窗口</small>
+              </template>
             </article>
           </div>
         </section>
@@ -157,6 +190,7 @@
       <a-empty v-else description="暂未找到旅行计划">
         <a-button type="primary" @click="startNewPlan">开始规划</a-button>
       </a-empty>
+      </template>
     </section>
   </div>
 </template>
@@ -165,10 +199,10 @@
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Location, TripFormData, TripPlan } from '@/types'
-import { enrichTripPlanImages, generateTripPlan, getChatHistory, sendChatMessage } from '@/services/api'
+import { enrichTripPlanImages, generateTripPlan, getChatHistory, getChatSuggestions, getRouteGeometry, sendChatMessage, type RouteGeometrySegment } from '@/services/api'
 import { clearLegacyPlan, createConversation, getConversation, getCurrentConversationId, loadLegacyPlan, setCurrentConversationId, updateConversation } from '@/services/conversations'
 
 const router = useRouter()
@@ -182,15 +216,45 @@ const pdfExporting = ref(false)
 const chatInput = ref('')
 const chatSending = ref(false)
 const chatCollapsed = ref(false)
+const manualCollapsed = ref(false)
 const conversationId = ref<string | null>(null)
 const chatMessages = ref<Array<{ id: number | string; role: 'user' | 'assistant'; content: string }>>([])
+const focusedNode = ref<RouteNode | null>(null)
+const topKSuggestions = ref<string[]>([])
+// 历史会话可能包含旧版本透传的“本日预报”；界面只渲染实际行程日对应的天气。
+const travelWeather = computed(() => {
+  if (!plan.value) return []
+  const travelDates = new Set(plan.value.days.map((day) => day.date))
+  return (plan.value.weather_info || []).filter((weather) => travelDates.has(weather.date))
+})
+const travelWeatherCards = computed(() => {
+  if (!plan.value) return []
+  const weatherByDate = new Map(travelWeather.value.map((weather) => [weather.date, weather]))
+  return plan.value.days.map((day) => ({
+    date: day.date,
+    weather: weatherByDate.get(day.date),
+  }))
+})
+const planContext = computed(() => {
+  if (!plan.value) return ''
+  const days = plan.value.days.map((day) => {
+    const attractions = day.attractions.map((item) => item.name).join('、') || '暂无景点'
+    return `第${day.day_index + 1}天：${attractions}`
+  }).join('；')
+  return `${plan.value.city}，${days}`
+})
 let nextMessageId = 1
 let loadVersion = 0
 let mapInstance: any = null
 let mapMarkers: any[] = []
-let mapPolyline: any = null
+let mapPolylines: any[] = []
+let mapRouteServices: any[] = []
+let mapRenderVersion = 0
 let amapNamespace: any = null
-const locationEnrichmentAttempted = new Set<string>()
+const mapRouteStatus = ref('')
+const routeDayColors = ['#1677ff', '#f97316', '#16a34a', '#d946ef', '#0891b2']
+const locationEnrichmentInFlight = new Set<string>()
+const locationEnrichmentCompleted = new Set<string>()
 
 interface RouteNode {
   id: string
@@ -206,6 +270,16 @@ interface RouteNode {
   hotelType?: string
 }
 
+function hasMapLocation(location?: Location): boolean {
+  return Boolean(
+    location
+    && Number.isFinite(location.longitude)
+    && Number.isFinite(location.latitude)
+    && Math.abs(location.longitude) <= 180
+    && Math.abs(location.latitude) <= 90,
+  )
+}
+
 function rebuildRouteNodes(value: TripPlan | null) {
   if (!value) {
     routeNodes.value = []
@@ -214,8 +288,54 @@ function rebuildRouteNodes(value: TripPlan | null) {
 
   const nodes: RouteNode[] = []
   value.days.forEach((day, dayIndex) => {
-    if (day.hotel) {
-      nodes.push({
+    const dayNodes: RouteNode[] = []
+    const addMealNodes = (meals: typeof day.meals, offset: number) => {
+      meals.filter((meal) => hasMapLocation(meal.location)).forEach((meal, mealIndex) => {
+        dayNodes.push({
+          id: `day-${dayIndex}-meal-${offset + mealIndex}`,
+          dayIndex,
+          type: 'meal',
+          name: meal.name,
+          description: meal.description || meal.address || '当地特色餐饮',
+          address: meal.address,
+          location: meal.location,
+          cost: meal.estimated_cost,
+          mealType: meal.type,
+        })
+      })
+    }
+    const breakfast = day.meals.filter((meal) => meal.type === 'breakfast')
+    const lunch = day.meals.filter((meal) => meal.type === 'lunch')
+    const dinner = day.meals.filter((meal) => meal.type === 'dinner')
+    const otherMeals = day.meals.filter((meal) => !['breakfast', 'lunch', 'dinner'].includes(meal.type))
+    addMealNodes(breakfast, 0)
+    const attractionNodes = day.attractions
+      .filter((attraction) => hasMapLocation(attraction.location))
+      .map((attraction, attractionIndex) => ({
+        id: `day-${dayIndex}-attraction-${attractionIndex}`,
+        dayIndex,
+        type: 'attraction',
+        name: attraction.name,
+        description: `${attraction.visit_duration} 分钟 · ${attraction.description}`,
+        address: attraction.address,
+        location: attraction.location,
+      } satisfies RouteNode))
+    // 同日景点按与上一站的空间距离排序，并以午餐把上午/下午行程自然分开。
+    const nearbyAttractions = orderNodesByProximity(
+      attractionNodes,
+      dayNodes[dayNodes.length - 1]?.location,
+    )
+    const morningCount = Math.ceil(nearbyAttractions.length / 2)
+    dayNodes.push(...nearbyAttractions.slice(0, morningCount))
+    addMealNodes(lunch, breakfast.length)
+    dayNodes.push(...orderNodesByProximity(
+      nearbyAttractions.slice(morningCount),
+      dayNodes[dayNodes.length - 1]?.location,
+    ))
+    addMealNodes(dinner, breakfast.length + lunch.length)
+    addMealNodes(otherMeals, breakfast.length + lunch.length + dinner.length)
+    if (day.hotel && hasMapLocation(day.hotel.location)) {
+      dayNodes.push({
         id: `day-${dayIndex}-hotel`,
         dayIndex,
         type: 'hotel',
@@ -227,36 +347,76 @@ function rebuildRouteNodes(value: TripPlan | null) {
         hotelType: day.hotel.type,
       })
     }
-    day.attractions.forEach((attraction, attractionIndex) => {
-      nodes.push({
-        id: `day-${dayIndex}-attraction-${attractionIndex}`,
-        dayIndex,
-        type: 'attraction',
-        name: attraction.name,
-        description: `${attraction.visit_duration} 分钟 · ${attraction.description}`,
-        address: attraction.address,
-        location: attraction.location,
-      })
-    })
-    day.meals.forEach((meal, mealIndex) => {
-      nodes.push({
-        id: `day-${dayIndex}-meal-${mealIndex}`,
-        dayIndex,
-        type: 'meal',
-        name: meal.name,
-        description: meal.description || meal.address || '当地特色餐饮',
-        address: meal.address,
-        location: meal.location,
-        cost: meal.estimated_cost,
-        mealType: meal.type,
-      })
-    })
+    nodes.push(...dayNodes)
   })
   routeNodes.value = nodes
+  const schoolNodes = nodes.filter((node) => /大学|学院|学校|校园/.test(node.name))
+  if (import.meta.env.DEV && schoolNodes.length) {
+    console.info('地图节点坐标', JSON.stringify(schoolNodes.map((node) => ({
+      name: node.name,
+      address: node.address,
+      location: node.location,
+    }))))
+  }
+}
+
+function planarDistance(left?: Location, right?: Location): number {
+  if (!left || !right) return Number.POSITIVE_INFINITY
+  const latitudeScale = Math.cos(((left.latitude + right.latitude) / 2) * Math.PI / 180)
+  const longitude = (left.longitude - right.longitude) * latitudeScale
+  const latitude = left.latitude - right.latitude
+  return longitude * longitude + latitude * latitude
+}
+
+function orderNodesByProximity(nodes: RouteNode[], anchor?: Location): RouteNode[] {
+  const remaining = [...nodes]
+  const ordered: RouteNode[] = []
+  let current = anchor
+  while (remaining.length) {
+    const nextIndex = current
+      ? remaining.reduce((bestIndex, candidate, index) => (
+        planarDistance(candidate.location, current) < planarDistance(remaining[bestIndex].location, current)
+          ? index
+          : bestIndex
+      ), 0)
+      : 0
+    const [next] = remaining.splice(nextIndex, 1)
+    ordered.push(next)
+    current = next.location
+  }
+  return ordered
 }
 
 function routeNodesForDay(dayIndex: number) {
   return routeNodes.value.filter((node) => node.dayIndex === dayIndex)
+}
+
+function routeDayColor(dayIndex: number): string {
+  return routeDayColors[dayIndex % routeDayColors.length]
+}
+
+function buildMarkerOffsets(nodes: RouteNode[]): Map<string, { x: number; y: number }> {
+  const groups = new Map<string, RouteNode[]>()
+  nodes.forEach((node) => {
+    const key = `${node.location!.longitude.toFixed(5)},${node.location!.latitude.toFixed(5)}`
+    const group = groups.get(key) || []
+    group.push(node)
+    groups.set(key, group)
+  })
+  const offsets = new Map<string, { x: number; y: number }>()
+  groups.forEach((group) => {
+    if (group.length === 1) {
+      offsets.set(group[0].id, { x: 0, y: 0 })
+      return
+    }
+    group.forEach((node, index) => {
+      const ring = Math.floor(index / 6)
+      const angle = -Math.PI / 2 + (index % 6) * (Math.PI * 2 / Math.min(group.length, 6))
+      const radius = 20 + ring * 14
+      offsets.set(node.id, { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius })
+    })
+  })
+  return offsets
 }
 
 function nodeIcon(type: RouteNode['type']) {
@@ -274,6 +434,12 @@ function finishNodeDrag() {
 
 function focusNodeOnMap(node: RouteNode) {
   if (!mapInstance || !node.location) return
+  focusedNode.value = node
+  console.info('双击定位节点', JSON.stringify({
+    name: node.name,
+    address: node.address,
+    location: node.location,
+  }))
   mapInstance.setZoomAndCenter(16, [node.location.longitude, node.location.latitude], false, 500)
 }
 
@@ -315,32 +481,46 @@ async function initMap() {
   }
 }
 
-function renderMap() {
+function clearRouteOverlays() {
+  mapPolylines.forEach((polyline) => polyline.setMap(null))
+  mapPolylines = []
+  mapRouteServices.forEach((service) => service.clear?.())
+  mapRouteServices = []
+}
+
+async function renderMap() {
   if (!mapInstance || !amapNamespace) return
+  const renderVersion = ++mapRenderVersion
   mapMarkers.forEach((marker) => marker.setMap(null))
   mapMarkers = []
-  mapPolyline?.setMap(null)
+  clearRouteOverlays()
 
   const locatedNodes = routeNodes.value.filter((node) => node.location)
-  if (!locatedNodes.length) return
-  const path = locatedNodes.map((node) => [node.location!.longitude, node.location!.latitude])
-  mapPolyline = new amapNamespace.Polyline({
-    path,
-    strokeColor: '#1668d7',
-    strokeWeight: 5,
-    strokeOpacity: 0.82,
-    showDir: true,
-    lineJoin: 'round',
-  })
-  mapPolyline.setMap(mapInstance)
+  if (!locatedNodes.length) {
+    mapRouteStatus.value = ''
+    return
+  }
 
+  const markerOffsets = buildMarkerOffsets(locatedNodes)
   locatedNodes.forEach((node, index) => {
+    if (import.meta.env.DEV && /大学|学院|学校|校园/.test(node.name)) {
+      console.info('地图 Marker 坐标', JSON.stringify({
+        name: node.name,
+        address: node.address,
+        location: node.location,
+      }))
+    }
     const marker = new amapNamespace.Marker({
       position: [node.location!.longitude, node.location!.latitude],
       title: `${index + 1}. ${node.name}`,
       draggable: true,
-      anchor: 'bottom-center',
-      label: { content: `${index + 1}`, direction: 'top' },
+      anchor: 'center',
+      offset: new amapNamespace.Pixel(
+        markerOffsets.get(node.id)?.x || 0,
+        markerOffsets.get(node.id)?.y || 0,
+      ),
+      zIndex: 100 + index,
+      content: `<span style="display:grid;place-items:center;width:29px;height:29px;border:3px solid #fff;border-radius:50%;background:${routeDayColor(node.dayIndex)};box-shadow:0 2px 7px rgba(30,55,80,.38);color:#fff;font:700 12px/1 system-ui,sans-serif">${index + 1}</span>`,
     })
     marker.on('dragend', (event: any) => {
       const current = routeNodes.value.find((item) => item.id === node.id)
@@ -355,6 +535,78 @@ function renderMap() {
     mapMarkers.push(marker)
   })
   mapInstance.setFitView(mapMarkers, false, [100, 100, 100, 100])
+  const dailyRoutes = (plan.value?.days || [])
+    .map((day, dayIndex) => ({
+      dayIndex,
+      city: plan.value?.city || '',
+      useTransit: /公共交通|地铁|公交/.test(day.transportation || ''),
+      nodes: routeNodesForDay(dayIndex),
+    }))
+    .filter((route) => route.nodes.length >= 2)
+  if (!dailyRoutes.length) {
+    mapRouteStatus.value = '当天节点不足，未绘制道路路线'
+    return
+  }
+  const routeLegs = dailyRoutes.flatMap((route) => route.nodes.slice(1).map((node, index) => ({
+    ...route,
+    origin: route.nodes[index],
+    destination: node,
+  })))
+  mapRouteStatus.value = `正在绘制 ${routeLegs.length} 段道路${routeLegs.some((leg) => leg.useTransit) ? '和地铁/公交' : ''}路线…`
+  const completed = await Promise.all(routeLegs.map((leg) => drawRouteLeg(leg, renderVersion)))
+  if (renderVersion !== mapRenderVersion) return
+  const roadCount = completed.filter((result) => result.road).length
+  const transitCount = completed.filter((result) => result.transit).length
+  mapRouteStatus.value = roadCount
+    ? `已绘制 ${roadCount}/${routeLegs.length} 段道路${transitCount ? ` · ${transitCount} 段地铁/公交` : ''}`
+    : '道路路线暂不可用，仅显示地点标记'
+}
+
+function addGeometrySegments(segments: RouteGeometrySegment[], layer: 'road' | 'transit', dayIndex: number) {
+  segments.forEach((segment) => {
+    if (segment.points.length < 2) return
+    const polyline = new amapNamespace.Polyline({
+      path: segment.points,
+      // 颜色仅表达日期；道路实线、公共交通虚线和线宽表达交通层。
+      strokeColor: routeDayColor(dayIndex),
+      strokeWeight: layer === 'road' ? 8 : (segment.kind === 'subway' ? 10 : 7),
+      strokeOpacity: layer === 'road' ? 0.78 : 0.92,
+      strokeStyle: layer === 'road' ? 'solid' : 'dashed',
+      isOutline: true,
+      borderWeight: layer === 'road' ? 2 : 3,
+      outlineColor: '#ffffff',
+      lineJoin: 'round',
+      lineCap: 'round',
+      zIndex: layer === 'road' ? 20 : 30,
+    })
+    polyline.setMap(mapInstance)
+    mapPolylines.push(polyline)
+  })
+}
+
+async function drawRouteLeg(
+  leg: { origin: RouteNode; destination: RouteNode; city: string; useTransit: boolean; dayIndex: number },
+  renderVersion: number,
+): Promise<{ road: boolean; transit: boolean }> {
+  if (!leg.origin.location || !leg.destination.location) return { road: false, transit: false }
+  const city = leg.city.replace(/坪山|龙岗|宝安|龙华|光明|盐田|大鹏/g, '') || leg.city
+  try {
+    const [roadResponse, transitResponse] = await Promise.all([
+      getRouteGeometry(leg.origin.location, leg.destination.location, city, 'driving'),
+      leg.useTransit
+        ? getRouteGeometry(leg.origin.location, leg.destination.location, city, 'transit').catch(() => null)
+        : Promise.resolve(null),
+    ])
+    if (renderVersion !== mapRenderVersion) return { road: false, transit: false }
+    const roadSegments = roadResponse.data?.segments || []
+    const transitSegments = transitResponse?.data?.segments || []
+    addGeometrySegments(roadSegments, 'road', leg.dayIndex)
+    addGeometrySegments(transitSegments, 'transit', leg.dayIndex)
+    return { road: roadSegments.length > 0, transit: transitSegments.length > 0 }
+  } catch (error) {
+    console.warn('路线几何加载失败:', error)
+    return { road: false, transit: false }
+  }
 }
 
 async function sendMessage() {
@@ -368,6 +620,8 @@ async function sendMessage() {
   try {
     const response = await sendChatMessage({
       conversation_id: conversationId.value || undefined,
+      city: plan.value?.city,
+      plan_context: planContext.value,
       message: text,
     })
     if (response.messages?.length) {
@@ -380,10 +634,15 @@ async function sendMessage() {
     } else {
       chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: response.reply })
     }
+    topKSuggestions.value = response.top_suggestions || []
 
-    if (response.intent !== 'replan' || !plan.value) return
+    const shouldReplan = Boolean(plan.value)
+      && response.intent === 'replan'
+      && Boolean(response.change_set?.operations?.length)
+    if (!shouldReplan || !plan.value) return
 
     const currentPlan = plan.value
+    const changeRequest = response.change_request?.trim() || text
     chatMessages.value.push({
       id: `local-${nextMessageId++}`,
       role: 'assistant',
@@ -399,24 +658,34 @@ async function sendMessage() {
       transportation: firstDay?.transportation || '公共交通',
       accommodation: firstDay?.accommodation || '经济型酒店',
       preferences: [],
-      free_text_input: response.change_request || text,
+      free_text_input: changeRequest,
       conversation_id: conversationId.value || undefined,
       preference: response.preference,
       current_plan: currentPlan,
-      change_request: response.change_request || text,
+      change_request: changeRequest,
+      change_set: response.change_set,
     }
     const replanned = await generateTripPlan(replanRequest)
     if (!replanned.success || !replanned.data) {
       throw new Error(replanned.message || '重新规划失败')
     }
 
+    // 初次打开历史会话时，坐标/图片补齐可能仍在请求中。重新规划的结果已
+    // 通过后端 Validator，含有当前路线所需的真实 POI 坐标；提升版本号可
+    // 让旧请求的回包失效，防止它把新计划覆盖回旧计划。
+    loadVersion += 1
     plan.value = replanned.data
     if (conversationId.value) {
       updateConversation(conversationId.value, replanned.data)
-      void enrichPlanLocationsAndImages(conversationId.value, replanned.data, loadVersion)
     }
-  } catch {
-    chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: '抱歉，暂时无法回复，请稍后再试。' })
+  } catch (error) {
+    console.error('对话或重新规划失败:', error)
+    const detail = error instanceof Error ? error.message : '未知错误'
+    chatMessages.value.push({
+      id: `local-${nextMessageId++}`,
+      role: 'assistant',
+      content: `重新规划失败：${detail}。原计划已保留。`,
+    })
   } finally {
     chatSending.value = false
   }
@@ -433,6 +702,22 @@ async function loadChatHistory(id: string, version: number) {
     }))
   } catch {
     // 聊天历史加载失败不影响行程展示。
+  }
+}
+
+async function loadChatSuggestions(id: string, version: number) {
+  if (!plan.value) return
+  try {
+    const response = await getChatSuggestions({
+      conversation_id: id,
+      city: plan.value.city,
+      plan_context: planContext.value,
+    })
+    if (version !== loadVersion) return
+    topKSuggestions.value = response.top_suggestions || []
+  } catch {
+    // 推荐加载失败不影响当前行程和聊天记录。
+    topKSuggestions.value = []
   }
 }
 
@@ -491,6 +776,7 @@ function loadConversation() {
   plan.value = null
   conversationId.value = null
   chatMessages.value = []
+  topKSuggestions.value = []
 
   try {
     const routeConversationId = typeof route.query.conversation === 'string'
@@ -502,7 +788,11 @@ function loadConversation() {
       conversationId.value = conversation.id
       plan.value = conversation.plan
       void loadChatHistory(conversation.id, version)
-      void enrichPlanLocationsAndImages(conversation.id, conversation.plan, version)
+      void loadChatSuggestions(conversation.id, version)
+      // 同一会话首次加载时补齐坐标、图片及缺失旅行日天气。
+      if (needsPlanEnrichment(conversation.plan)) {
+        void enrichPlanLocationsAndImages(conversation.id, conversation.plan, version)
+      }
       return
     }
 
@@ -513,6 +803,7 @@ function loadConversation() {
       conversationId.value = migrated.id
       plan.value = legacyPlan
       void loadChatHistory(migrated.id, version)
+      void loadChatSuggestions(migrated.id, version)
       router.replace({ path: '/result', query: { conversation: migrated.id } })
     }
   } catch {
@@ -533,7 +824,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   mapMarkers.forEach((marker) => marker.setMap(null))
-  mapPolyline?.setMap(null)
+  clearRouteOverlays()
   mapInstance?.destroy()
   mapInstance = null
 })
@@ -541,10 +832,12 @@ onBeforeUnmount(() => {
 async function enrichPlanLocationsAndImages(
   conversationId: string,
   currentPlan: TripPlan,
-  version: number
+  version: number,
+  force = false,
 ) {
-  if (locationEnrichmentAttempted.has(conversationId)) return
-  locationEnrichmentAttempted.add(conversationId)
+  if (!force && locationEnrichmentCompleted.has(conversationId)) return
+  if (locationEnrichmentInFlight.has(conversationId)) return
+  locationEnrichmentInFlight.add(conversationId)
 
   try {
     const response = await enrichTripPlanImages(currentPlan)
@@ -553,9 +846,12 @@ async function enrichPlanLocationsAndImages(
       plan.value = response.data
       // 图片补齐不是用户的新对话，不能刷新历史记录排序或覆盖生成时间。
       updateConversation(conversationId, response.data, { touchUpdatedAt: false })
+      locationEnrichmentCompleted.add(conversationId)
     }
   } catch {
     // 图片补齐失败不影响已有行程内容展示。
+  } finally {
+    locationEnrichmentInFlight.delete(conversationId)
   }
 }
 
@@ -563,6 +859,16 @@ function startNewPlan() {
   clearLegacyPlan()
   localStorage.removeItem('trip_planner_current_conversation')
   router.push('/')
+}
+
+function needsPlanEnrichment(value: TripPlan) {
+  const attractions = value.days.flatMap((day) => day.attractions || [])
+  const meals = value.days.flatMap((day) => day.meals || [])
+  const hasMissingPoi = attractions.some((attraction) => !attraction.poi_id)
+  const hasMissingMealPoi = meals.some((meal) => !meal.poi_id || !hasMapLocation(meal.location))
+  const weatherDates = new Set((value.weather_info || []).map((weather) => weather.date))
+  const hasMissingTravelWeather = value.days.some((day) => !weatherDates.has(day.date))
+  return hasMissingPoi || hasMissingMealPoi || hasMissingTravelWeather
 }
 </script>
 
@@ -583,6 +889,10 @@ function startNewPlan() {
 .assistant-message { max-width: none; margin: 0; padding: 0 0 18px; background: transparent; color: #394b63; border: 0; border-radius: 0; }
 .assistant-message strong { display: block; margin-bottom: 5px; color: #1760c4; }
 .assistant-message p { margin: 0; }
+.topk-suggestions { display: flex; flex-direction: column; gap: 7px; margin: -3px 0 16px; }
+.topk-label { color: #8a98a7; font-size: 11px; }
+.topk-suggestion { align-self: flex-start; padding: 7px 10px; border: 1px solid #d6e3f0; border-radius: 999px; background: #f7fbff; color: #35618c; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
+.topk-suggestion:hover { border-color: #8bb6e8; background: #eef6ff; color: #1768d4; }
 .user-message { margin-left: auto; background: #1760c4; color: #fff; }
 .conversation-composer { display: flex; gap: 8px; padding: 14px; border-top: 1px solid #edf0f4; }
 .conversation-composer textarea { flex: 1; resize: none; padding: 10px 11px; border: 1px solid #dfe5ee; border-radius: 10px; outline: none; font: inherit; font-size: 13px; }
@@ -612,6 +922,8 @@ function startNewPlan() {
 .map-grid { position: absolute; inset: -20%; opacity: .45; background-image: linear-gradient(27deg, transparent 46%, #fff 47%, #fff 48%, transparent 49%), linear-gradient(112deg, transparent 46%, #fff 47%, #fff 48%, transparent 49%), linear-gradient(90deg, transparent 49%, rgba(104,143,162,.24) 50%, transparent 51%); background-size: 170px 130px, 220px 170px, 70px 70px; transform: rotate(-8deg); }
 .map-fallback-label { position: relative; z-index: 1; padding: 12px 18px; border-radius: 999px; background: rgba(255,255,255,.78); box-shadow: 0 8px 22px rgba(55,75,91,.12); font-size: 13px; }
 .map-toolbar { position: absolute; top: 16px; left: 18px; z-index: 2; display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid rgba(255,255,255,.84); border-radius: 999px; background: rgba(255,255,255,.86); color: #526176; box-shadow: 0 5px 18px rgba(49,71,92,.12); font-size: 12px; backdrop-filter: blur(10px); }
+.map-focus-info { padding-left: 8px; border-left: 1px solid #d9e0ea; color: #244b7a; }
+.map-day-legend { display: inline-flex; gap: 6px; padding-left: 8px; border-left: 1px solid #d9e0ea; }.map-day-legend > span { display: inline-flex; align-items: center; gap: 3px; }.map-day-legend i { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
 .map-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #16a36c; box-shadow: 0 0 0 4px rgba(22,163,108,.12); }
 .conversation-float { position: absolute; left: 18px; bottom: 18px; z-index: 5; width: min(380px, calc(100% - 36px)); height: min(64vh, 590px); border: 1px solid rgba(213,224,234,.95); border-radius: 18px; background: rgba(255,255,255,.94); box-shadow: 0 18px 44px rgba(42,64,82,.2); backdrop-filter: blur(14px); }
 .conversation-float .conversation-panel-header { padding: 18px 20px 15px; background: rgba(255,255,255,.82); border-radius: 18px 18px 0 0; }
@@ -622,6 +934,12 @@ function startNewPlan() {
 .route-panel { position: absolute; top: 16px; right: 18px; z-index: 4; width: min(560px, calc(100% - 430px)); height: calc(100% - 32px); min-width: 430px; overflow-y: auto; padding-bottom: 28px; border: 1px solid rgba(213,224,234,.95); border-radius: 18px; background: rgba(255,255,255,.95); box-shadow: 0 18px 44px rgba(42,64,82,.18); scrollbar-width: thin; scrollbar-color: #aebdca transparent; backdrop-filter: blur(14px); }
 .route-panel::-webkit-scrollbar { width: 6px; }.route-panel::-webkit-scrollbar-thumb { border-radius: 99px; background: #aebdca; }
 .route-panel .manual-toolbar { position: sticky; top: 0; z-index: 2; padding: 18px 22px 14px; background: rgba(255,255,255,.94); border-radius: 18px 18px 0 0; }
+.manual-toolbar-actions { display: flex; align-items: center; gap: 8px; }
+.route-collapse-button, .route-expand-button { display: grid; place-items: center; border: 1px solid #d6e2ed; border-radius: 9px; background: #fff; color: #526b83; cursor: pointer; }
+.route-collapse-button { width: 31px; height: 31px; font-size: 22px; line-height: 1; }
+.route-collapse-button:hover, .route-expand-button:hover { border-color: #8bb6e8; background: #f1f7ff; color: #1768d4; }
+.route-panel-collapsed { width: 48px; min-width: 48px; height: 48px; top: 16px; right: 18px; overflow: hidden; border-radius: 14px; }
+.route-expand-button { width: 100%; height: 100%; border: 0; font-size: 27px; line-height: 1; }
 .route-panel .result-header, .route-panel .route-note, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 22px; margin-right: 22px; }
 .route-panel .result-header { margin-top: 22px; margin-bottom: 16px; }
 .route-panel .result-header h1 { font-size: 29px; line-height: 1.15; }.route-panel .eyebrow { margin-bottom: 5px; }
@@ -634,7 +952,7 @@ function startNewPlan() {
 .day-route { margin-bottom: 16px; padding: 15px 15px 16px; border: 1px solid #e1eaf1; border-radius: 14px; background: rgba(255,255,255,.8); }.day-route-header { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #edf1f5; }.day-route-header h3 { margin: 0 0 3px; color: #263b51; font-size: 15px; }.day-route-header p { margin: 0; color: #8492a1; font-size: 11px; line-height: 1.45; }.day-route-header .transport { margin-left: auto; color: #637589; font-size: 11px; }
 .day-number { width: 31px; height: 31px; display: grid; place-items: center; flex: 0 0 31px; border-radius: 9px; background: #1768d4; color: #fff; font-weight: 700; }
 .route-track { position: relative; display: flex; flex-direction: column; gap: 8px; padding: 13px 0 0 16px; }.route-track::before { content: ''; position: absolute; top: 16px; bottom: 16px; left: 28px; width: 2px; background: linear-gradient(#75a9e9, #c7d8e8); }.route-node { position: relative; z-index: 1; display: flex; align-items: flex-start; gap: 10px; min-height: 54px; padding: 9px 10px; border: 1px solid transparent; border-radius: 10px; background: rgba(247,250,253,.9); cursor: grab; transition: border-color .16s, background .16s, transform .16s; }.route-node:hover { border-color: #a7c9ef; background: #f3f8ff; transform: translateX(2px); }.route-node:active { cursor: grabbing; }.node-marker { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 25px; border-radius: 50%; background: #1768d4; color: #fff; font-size: 12px; font-weight: 700; box-shadow: 0 0 0 4px #fff; }.route-node-hotel .node-marker { background: #8b5cf6; }.route-node-meal .node-marker { background: #e58a35; }.node-content { min-width: 0; flex: 1; }.node-title-row { display: flex; align-items: center; gap: 8px; }.node-title-row strong { overflow: hidden; color: #2d4054; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }.drag-handle { margin-left: auto; color: #9aabb9; font-size: 17px; line-height: 1; }.node-content p { margin: 3px 0; overflow: hidden; color: #617487; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.node-content small { display: block; overflow: hidden; color: #93a0ad; font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.route-empty { padding: 12px; color: #99a6b2; font-size: 12px; }
-.weather-section { margin-top: 24px; }.weather-section .section-heading { align-items: center; }.weather-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px; }.weather-item { display: flex; flex-direction: column; gap: 5px; padding: 11px; border: 1px solid #e4ebf2; border-radius: 10px; background: rgba(249,251,253,.82); }.weather-item strong { color: #344b62; font-size: 11px; }.weather-item span, .weather-item small { color: #718397; font-size: 10px; }
+.weather-section { margin-top: 24px; }.weather-section .section-heading { align-items: center; }.weather-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px; }.weather-item { display: flex; flex-direction: column; gap: 5px; padding: 11px; border: 1px solid #e4ebf2; border-radius: 10px; background: rgba(249,251,253,.82); }.weather-item strong { color: #344b62; font-size: 11px; }.weather-item span, .weather-item small { color: #718397; font-size: 10px; }.weather-unavailable { color: #8a98a7 !important; }
 @media (max-width: 1100px) { .route-panel { width: min(510px, calc(100% - 350px)); min-width: 350px; }.conversation-float { width: 315px; } }
 @media (max-width: 760px) { .map-toolbar { top: 10px; left: 10px; }.conversation-float { left: 10px; bottom: 10px; width: calc(100% - 20px); height: 275px; }.conversation-float .conversation-messages { padding: 12px 14px; }.route-panel { top: 10px; right: 10px; width: calc(100% - 20px); min-width: 0; height: calc(100% - 295px); border-radius: 14px; }.route-panel .manual-toolbar { padding: 13px 16px 11px; }.route-panel .result-header, .route-panel .route-note, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 16px; margin-right: 16px; }.route-panel .result-header h1 { font-size: 23px; }.route-summary { grid-template-columns: repeat(2, 1fr); }.route-summary > div:last-child { grid-column: 1 / -1; }.map-hint { display: none; } }
 </style>

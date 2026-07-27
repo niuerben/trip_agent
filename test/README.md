@@ -1,33 +1,83 @@
-cd test
+# 单元测试
 
-## 安装测试依赖
-
-请使用运行测试脚本的同一个 Python 环境安装：
+## test_agent_loop_logging.py，Agent 循环与日志
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m playwright install
+python unit/test_agent_loop_logging.py
 ```
 
-脚本使用本机 Microsoft Edge，通常不需要额外下载 Edge 浏览器；`playwright install` 用于补齐 Playwright 运行依赖。
-
-## test_api.py
-
-## test_trip_planner.py
-
-运行前请保持两个服务处于启动状态：
+## test_directed_replan.py，定向重规划
 
 ```powershell
-# 终端 1：后端
-cd backend
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# 终端 2：前端
-cd frontend
-npm run dev -- --host 0.0.0.0
-
-# 终端 3：测试
-cd test
+python unit/test_directed_replan.py
 ```
 
-python test_trip_planner.py
+## test_evidence_plan.py，POI 近邻排程
+
+```powershell
+python unit/test_evidence_plan.py
+```
+
+## test_planner_review_logging.py，规划审查日志
+
+```powershell
+python unit/test_planner_review_logging.py
+```
+
+## test_planning_react.py，ReAct 规划与校验
+
+```powershell
+python unit/test_planning_react.py
+```
+
+## test_poi_vector_store.py，POI 向量库
+
+```powershell
+python unit/test_poi_vector_store.py
+```
+
+## test_route_geometry.py，道路与公共交通路线几何
+
+```powershell
+python unit/test_route_geometry.py
+```
+
+## test_route_ordering.py，景点近邻排序
+
+```powershell
+python unit/test_route_ordering.py
+```
+
+## test_talk_replan.py，对话重规划意图
+
+```powershell
+python unit/test_talk_replan.py
+```
+
+## test_weather_dates.py，旅行日期天气筛选
+
+```powershell
+python unit/test_weather_dates.py
+```
+
+# 集成测试
+
+## test_api.py，后端 API
+
+```powershell
+python integration/test_api.py
+```
+
+## test_chroma_hit.py，Chroma 检索结果
+
+```powershell
+python integration/test_chroma_hit.py
+```
+
+# 端到端测试
+
+## test_trip_planner.py，网页旅行规划流程
+
+```powershell
+python e2e/test_trip_planner.py
+```

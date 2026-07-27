@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { ChatHistoryResponse, TalkRequest, TalkResponse, TripFormData, TripPlan, TripPlanResponse } from '@/types'
+import type { ChatHistoryResponse, Location, TalkRequest, TalkResponse, TalkSuggestionsRequest, TalkSuggestionsResponse, TripFormData, TripPlan, TripPlanResponse } from '@/types'
 
 // 开发模式使用空 baseURL（同源相对路径），请求经 Vite 代理转发到后端，
 // 这样局域网设备访问 http://<本机IP>:5173 时 API 也走同一来源，无需暴露后端或改 CORS。
@@ -9,7 +9,7 @@ const API_BASE_URL = import.meta.env.DEV
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 120000, // 2分钟超时
+  timeout: 240000, // 规划包含模型和高德精确 POI 查询，允许最长4分钟
   headers: {
     'Content-Type': 'application/json'
   }
@@ -66,7 +66,8 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
 
 export async function enrichTripPlanImages(plan: TripPlan): Promise<TripPlanResponse> {
   const response = await apiClient.post<TripPlanResponse>('/api/trip/enrich-images', plan, {
-    timeout: 15000
+    // 每个景点按名称精确查询高德 POI，陆丰等多景点行程可能需要更长时间。
+    timeout: 60000
   })
   return response.data
 }
@@ -85,6 +86,45 @@ export async function sendChatMessage(payload: TalkRequest): Promise<TalkRespons
 export async function getChatHistory(conversationId: string): Promise<ChatHistoryResponse> {
   const response = await apiClient.get<ChatHistoryResponse>(`/api/talk/${encodeURIComponent(conversationId)}`, {
     timeout: 15000
+  })
+  return response.data
+}
+
+export interface RouteGeometrySegment {
+  kind: 'road' | 'walk' | 'bus' | 'subway'
+  points: [number, number][]
+}
+
+export interface RouteGeometryResponse {
+  success: boolean
+  data: {
+    route_type: 'driving' | 'transit'
+    segments: RouteGeometrySegment[]
+  }
+}
+
+export async function getRouteGeometry(
+  origin: Location,
+  destination: Location,
+  city: string,
+  routeType: 'driving' | 'transit',
+): Promise<RouteGeometryResponse> {
+  const response = await apiClient.get<RouteGeometryResponse>('/api/map/route-geometry', {
+    params: {
+      origin: `${origin.longitude},${origin.latitude}`,
+      destination: `${destination.longitude},${destination.latitude}`,
+      city,
+      route_type: routeType,
+    },
+    timeout: 30000,
+  })
+  return response.data
+}
+
+/** 刷新页面或打开历史会话时，从会话记忆恢复动态 Top3 建议。 */
+export async function getChatSuggestions(payload: TalkSuggestionsRequest): Promise<TalkSuggestionsResponse> {
+  const response = await apiClient.post<TalkSuggestionsResponse>('/api/talk/suggestions', payload, {
+    timeout: 30000
   })
   return response.data
 }
@@ -108,7 +148,7 @@ export function beginOAuth(provider: 'wechat' | 'github'): string {
 }
 
 export async function loginWithPassword(username: string, password: string): Promise<{ access_token: string; user: { id?: string; name: string; avatar?: string } }> {
-  const response = await apiClient.post('/api/auth/login', { username, password }, { timeout: 10000 })
+  const response = await apiClient.post('/api/auth/login', { username, password }, { timeout: 15000 })
   return response.data
 }
 

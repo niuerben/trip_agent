@@ -1,66 +1,101 @@
 """基于 FunctionCallAgent 的旅行规划系统。"""
 
 import json
+import math
+import re
+from itertools import permutations
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 from typing import Optional
-from hello_agents import FunctionCallAgent
-from hello_agents.tools import MCPTool
 from ..services.llm_service import get_llm
-from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel, Preference
+from ..models.schemas import (
+    Attraction,
+    ChangeOperation,
+    ChangeSet,
+    DayPlan,
+    Location,
+    Meal,
+    Preference,
+    TripPlan,
+    TripRequest,
+    WeatherInfo,
+)
 from ..config import get_settings
 from ..services.amap_photo_service import AmapPhotoService, get_amap_photo_service
-from ..services.trip_plan_validator import validate_trip_plan
+from ..services.trip_plan_validator import (
+    TripPlanValidationError,
+    is_within_city,
+    validate_trip_plan,
+)
+from ..services.poi_vector_store import classify_poi_group
+from .planning_react_agent import (
+    PlanningSession,
+    PlanningToolset,
+    ValidatedPlanningReActAgent,
+)
 
-PLANNER_SYSTEM_PROMPT = """你是行旅天下的旅行规划 Agent，负责独立完成完整旅行计划。
+def _normalize_city_for_amap(city: str) -> str:
+    """标准化城市名给高德 API，避免区县名导致 citylimit 失效搜出外地结果。
 
-你可以通过高德 MCP 工具获取 POI、天气、酒店、路线和图片信息。请自主判断需要调用哪些工具，
-先获取事实数据，再生成计划。工具返回的数据优先级高于模型记忆，禁止编造高德没有返回的景点、酒店、
-天气或图片信息。
+    高德 REST API 的 city 参数要求地级市名或 adcode，传区县名（如"深圳坪山"）
+    会被当模糊查询，citylimit 约束失效，返回全国热门 POI（如北京西单）。
+    这里做简单映射：区县 → 所属地级市，保证 citylimit 生效。
+    """
+    city = (city or "").strip()
+    # 常见区县 → 地级市映射（按需扩充）
+    mappings = {
+        "深圳坪山": "深圳",
+        "深圳龙岗": "深圳",
+        "深圳宝安": "深圳",
+        "深圳龙华": "深圳",
+        "深圳光明": "深圳",
+        "深圳大鹏": "深圳",
+        "深圳盐田": "深圳",
+        "陆丰": "汕尾",
+        "化州": "茂名",
+    }
+    return mappings.get(city, city)
 
-规划要求：
-1. 使用用户提供的城市、日期、交通、住宿和偏好。
-2. 每天安排合理数量的景点，并考虑景点之间的距离和交通方式。
-3. 每天安排早餐、午餐和晚餐。
-4. 生成酒店、天气、预算和实用建议。
-5. 当输入包含当前计划和修改要求时，只修改用户明确要求的内容，未涉及的日期和内容保持不变。
-6. 工具失败时保留已确认的数据，不得用虚构内容替代工具结果。
-7. 最终只返回符合 TripPlan JSON Schema 的 JSON，不要返回 Markdown 或解释文字。
 
-最终 JSON 必须包含 city、start_date、end_date、days、weather_info、overall_suggestions；
-每个 day 必须包含 date、day_index、description、transportation、accommodation、attractions 和 meals。
-"""
+_DISTRICT_SCOPES = {
+    "深圳坪山": ("深圳", "坪山"),
+    "深圳坪山区": ("深圳", "坪山"),
+    "深圳龙岗": ("深圳", "龙岗"),
+    "深圳龙岗区": ("深圳", "龙岗"),
+    "深圳宝安": ("深圳", "宝安"),
+    "深圳宝安区": ("深圳", "宝安"),
+    "深圳龙华": ("深圳", "龙华"),
+    "深圳龙华区": ("深圳", "龙华"),
+    "深圳光明": ("深圳", "光明"),
+    "深圳光明区": ("深圳", "光明"),
+    "深圳盐田": ("深圳", "盐田"),
+    "深圳盐田区": ("深圳", "盐田"),
+    "深圳大鹏": ("深圳", "大鹏新区"),
+    "深圳大鹏新区": ("深圳", "大鹏新区"),
+}
+
+def _district_keyword(city: str) -> str:
+    """返回区县级搜索词；地级市请求返回空字符串。"""
+    return _DISTRICT_SCOPES.get((city or "").strip(), ("", ""))[1]
+
+
+def _is_district_request(city: str) -> bool:
+    return bool(_district_keyword(city))
 
 
 class TripPlannerAgent:
-    """使用单个 FunctionCallAgent 完成旅行规划。"""
+    """准备规划上下文并委托给受 Validator 约束的 ReAct Agent。"""
 
     def __init__(self):
-        """初始化单 Agent 旅行规划系统。"""
-        print("🔄 开始初始化单 Agent 旅行规划系统...")
+        """初始化薄规划入口；领域工具由每次 ReAct 会话按请求创建。"""
+        print("🔄 开始初始化 ReAct 旅行规划系统...")
 
         try:
-            settings = get_settings()
             self.llm = get_llm()
-
-            print("  - 创建高德 MCP 工具...")
-            self.amap_tool = MCPTool(
-                name="amap",
-                description="高德地图服务",
-                server_command=["uvx", "amap-mcp-server"],
-                env={"AMAP_MAPS_API_KEY": settings.amap_api_key},
-                auto_expand=True
-            )
-            self.amap_tool.expandable = True
-            print("  - 创建单旅行规划 Agent...")
-            self.agent = FunctionCallAgent(
-                name="旅行规划 Agent",
-                llm=self.llm,
-                system_prompt=PLANNER_SYSTEM_PROMPT,
-                max_tool_iterations=8,
-            )
-            self.agent.add_tool(self.amap_tool)
-
-            print("✅ 单 Agent 旅行规划系统初始化成功")
-            print(f"   MCP 工具数量: {len(self.agent.list_tools())}")
+            self.agent_name = "旅行规划 ReAct Agent"
+            self.tools_count = 2
+            print("✅ ReAct 旅行规划系统初始化成功")
+            print("   领域工具数量: 2")
 
         except Exception as e:
             print(f"❌ 旅行规划 Agent 初始化失败: {str(e)}")
@@ -82,40 +117,470 @@ class TripPlannerAgent:
                 print(f"偏好提示词: {preference.prompt[:100]}")
             print(f"{'=' * 60}\n")
 
-            planner_query = self._build_planner_query(request, preference)
-            planner_response = self.agent.run(
-                planner_query,
-                max_tool_iterations=8,
-                tool_choice="auto",
-            )
-            print(f"规划 Agent 返回: {planner_response[:300]}...\n")
+            # 行政区中心和 adcode 只查询一次，后续 Chroma/坐标校验共用。
+            settings = get_settings()
+            city_center = None
+            city_adcode = None
+            try:
+                from ..services.amap_service import get_amap_service
 
-            trip_plan = self._parse_response(planner_response, request, preference)
-            validate_trip_plan(trip_plan, request)
-            return self._enrich_attraction_images(trip_plan)
+                amap_service = get_amap_service()
+                city_center = amap_service.get_city_center(request.city)
+                city_adcode = amap_service.get_city_adcode(request.city)
+            except Exception as error:
+                print(f"⚠️ 目标行政区解析失败: {type(error).__name__}: {error}")
+
+            radius_km = (
+                settings.district_geo_radius_km
+                if _is_district_request(request.city)
+                else settings.city_geo_radius_km
+            )
+            scope_adcode = city_adcode if _is_district_request(request.city) else None
+            vector_pois = self._retrieve_cached_pois(
+                request,
+                preference,
+                adcode=scope_adcode,
+            )
+            change_set = request.change_set
+            requires_full_replan = bool(
+                change_set
+                and any(operation.operation == "full_replan" for operation in change_set.operations)
+            )
+            if request.current_plan and change_set and not requires_full_replan:
+                original_plan = TripPlan.model_validate(request.current_plan)
+                try:
+                    trip_plan, changes = self._execute_change_set(
+                        original_plan.model_copy(deep=True),
+                        change_set,
+                        request,
+                        vector_pois,
+                        scope_adcode,
+                    )
+                    validate_trip_plan(
+                        trip_plan,
+                        request,
+                        city_center=city_center,
+                        radius_km=radius_km,
+                        require_enriched_locations=True,
+                    )
+                    print(
+                        "定向重规划完成: " + "；".join(changes)
+                        + "；未重新检索酒店、餐厅、天气或路线。"
+                    )
+                    return trip_plan
+                except TripPlanValidationError as validation_error:
+                    # 旧计划含占位餐馆等遗留缺陷时，把已执行的局部修改作为
+                    # Draft 交给 ReAct，根据 Validator Observation 定向补齐。
+                    print(f"定向修改后的 Draft 需继续修复: {validation_error}")
+                    request.current_plan = trip_plan.model_dump()
+                except ValueError as change_set_error:
+                    # Talk LLM 有时能正确识别重规划意图，却为餐饮等当前局部执行器
+                    # 尚未表达的变更输出空操作。此时保留原计划，转由 ReAct 根据完整
+                    # 上下文和 change_request 完成真实 POI 检索及校验，避免把“已更新”
+                    # 变成 422 或仅修改一段文案。
+                    print(
+                        "ChangeSet 无法局部执行，转入 ReAct 定向重规划: "
+                        f"{change_set_error}"
+                    )
+                    request.current_plan = original_plan.model_dump()
+
+            planner_query = self._build_planner_query(request, preference, vector_pois)
+            planning_session = PlanningSession(
+                request=request,
+                city_center=city_center,
+                radius_km=radius_km,
+                target_adcode=scope_adcode,
+                amap_city=_normalize_city_for_amap(request.city),
+                cached_pois=vector_pois,
+            )
+            planning_tools = PlanningToolset(planning_session)
+            preloaded = (
+                settings.planner_preload_poi_evidence
+                and planning_tools.prepare_required_evidence()
+            )
+            if preloaded:
+                print("已预取餐饮、景点和酒店 POI 证据；优先用确定性近邻排程。")
+            else:
+                print("POI 预取不完整，回退到按需 ReAct 检索。")
+            trip_plan = None
+            if preloaded and settings.planner_preloaded_deterministic_plan:
+                draft = self._build_evidence_plan(request, planning_session)
+                if draft is not None:
+                    validation = json.loads(planning_tools.validate_draft(
+                        draft.model_dump_json()
+                    ))
+                    if validation.get("passed"):
+                        trip_plan = planning_session.validated_plan
+                        print("POI 证据近邻排程已通过 Validator；跳过长 JSON 模型调用。")
+                    else:
+                        print("确定性排程未通过 Validator，回退到 ReAct。")
+            if trip_plan is None:
+                planner_response = ValidatedPlanningReActAgent(
+                    llm=self.llm,
+                    session=planning_session,
+                ).run(planner_query)
+                print(f"规划 Agent 返回: {planner_response[:300]}...\n")
+                trip_plan = planning_session.validated_plan
+                if trip_plan is None:
+                    raise RuntimeError("ReAct 已结束，但没有通过 Validator 的旅行计划")
+            # ReAct 已经完成内容选择；日期归属由规划入口根据请求统一落盘，
+            # 保证每个 Chroma 餐馆都挂在明确的旅行日 day.meals 下。
+            trip_plan = self._fill_plan_timeline(trip_plan, request)
+            # 模型负责选择真实 POI；再由确定性近邻排序消除同一天内不必要的
+            # 东西折返。地图和路线卡片会使用这一顺序绘制道路导航。
+            trip_plan = self._order_day_attractions_by_proximity(trip_plan)
+            weather_facts = trip_plan.weather_info
+            if not weather_facts:
+                try:
+                    from ..services.amap_service import get_amap_service
+
+                    weather_facts = get_amap_service().get_weather(
+                        _normalize_city_for_amap(request.city)
+                    )
+                except Exception as weather_error:
+                    print(f"高德短期天气查询失败，改为按缺失日期补查: {weather_error}")
+            trip_plan.weather_info = self._complete_weather_for_travel_dates(
+                weather_facts,
+                request,
+                city_center,
+            )
+
+            if request.current_plan and (request.change_set or request.change_request):
+                previous_plan = TripPlan.model_validate(request.current_plan)
+                if trip_plan.model_dump() == previous_plan.model_dump():
+                    raise ValueError("规划 Agent 未实际修改旅行计划")
+
+            # enrichment 先跑：校正坐标 + 用高德在城 POI 替换越界景点，
+            # 再交给 validate 做最终闸门（修复失败才报错触发降级）。
+            trip_plan = self._enrich_attraction_images(
+                trip_plan,
+                city_center=city_center,
+                radius_km=radius_km,
+                target_adcode=scope_adcode,
+            )
+            validate_trip_plan(
+                trip_plan,
+                request,
+                city_center=city_center,
+                radius_km=radius_km,
+                require_enriched_locations=True,
+            )
+            return trip_plan
         except Exception as error:
             print(f"旅行规划 Agent 失败: {type(error).__name__}: {error}")
             import traceback
             traceback.print_exc()
-            if request.current_plan:
-                try:
-                    print("定向重规划失败，保留原旅行计划")
-                    return TripPlan.model_validate(request.current_plan)
-                except Exception as preserve_error:
-                    print(f"原旅行计划无法恢复: {preserve_error}")
-            return self._create_fallback_plan(
-                request,
-                "模型或高德服务响应超时/不可用",
-                preference,
-            )
+            # 未通过 ReAct + Validator 的计划禁止用占位数据伪装成功。
+            raise
 
     @staticmethod
-    def _enrich_attraction_images(plan: TripPlan) -> TripPlan:
+    def _fill_plan_timeline(plan: TripPlan, request: TripRequest) -> TripPlan:
+        """为 Agent 已选出的每日内容补齐请求日期和从 0 开始的 day_index。"""
+        try:
+            start = date.fromisoformat(request.start_date)
+        except ValueError:
+            return plan
+        for index, day in enumerate(plan.days):
+            day.date = (start + timedelta(days=index)).isoformat()
+            day.day_index = index
+        return plan
+
+    @staticmethod
+    def _meal_cost(candidate: dict, budget_limit: int | None) -> int:
+        """从 POI 证据读取人均价；高德缺价时给出保守的到店预估。"""
+        raw_cost = str(candidate.get("cost") or "").strip()
+        match = re.search(r"\d+(?:\.\d+)?", raw_cost)
+        cost = int(float(match.group())) if match else 30
+        return min(cost, budget_limit) if budget_limit and cost > budget_limit else cost
+
+    @staticmethod
+    def _requested_meal_budget(request: TripRequest) -> int | None:
+        """识别“人均不超过 40 元”一类约束，供候选优先级使用。"""
+        text = " ".join((request.free_text_input or "", *request.preferences))
+        matched = re.search(r"(?:人均|每餐|餐饮)?.{0,12}(?:不超过|不高于|最多|预算)\s*(\d+)\s*元", text)
+        return int(matched.group(1)) if matched else None
+
+    @classmethod
+    def _build_evidence_plan(
+        cls,
+        request: TripRequest,
+        session: PlanningSession,
+    ) -> TripPlan | None:
+        """在完整 POI 证据已准备好时，快速生成一个可审计的近邻计划。
+
+        结构化的日期、坐标和餐饮类型不需要模型推理。直接由已检索的真实
+        POI 组合，既消除长 JSON 的模型延迟，也让“餐饮不重复、相邻不跨区”
+        成为算法约束而非提示词愿望。任何证据不够或无法排出合格路线时返回
+        ``None``，保留原 ReAct 路径处理复杂请求。
+        """
+        meal_records = list(session.evidence_records.get("meal", {}).values())
+        attraction_records = list(session.evidence_records.get("attraction", {}).values())
+        if not attraction_records:
+            return None
+        required_types = [
+            item.strip()
+            for item in get_settings().required_meal_types.split(",")
+            if item.strip()
+        ]
+        required_meal_count = request.travel_days * len(required_types)
+        budget_limit = cls._requested_meal_budget(request)
+
+        def valid_record(record: dict) -> bool:
+            return bool(record.get("poi_id") and cls._parse_poi_location(record))
+
+        meals = [record for record in meal_records if valid_record(record)]
+        if budget_limit:
+            affordable = [
+                record for record in meals
+                if cls._meal_cost(record, None) <= budget_limit
+            ]
+            # 缺少价格的高德 POI 不应让全程无法生成；它们会以保守预算展示。
+            if len(affordable) >= required_meal_count:
+                meals = affordable
+        if len(meals) < required_meal_count:
+            return None
+
+        # 先按地理邻近把餐馆分成每日 3 个一组。这样每一天自然围绕一个
+        # 小片区展开，不会出现模型常见的“东边午餐、西边景点、再回东边”。
+        remaining = list(meals)
+        meal_groups: list[list[dict]] = []
+        while len(meal_groups) < request.travel_days:
+            seed = min(
+                remaining,
+                key=lambda item: (
+                    cls._parse_poi_location(item).latitude,
+                    cls._parse_poi_location(item).longitude,
+                ),
+            )
+            seed_location = cls._parse_poi_location(seed)
+            group = sorted(
+                remaining,
+                key=lambda item: cls._geo_distance_squared(
+                    seed_location, cls._parse_poi_location(item)
+                ),
+            )[:len(required_types)]
+            meal_groups.append(group)
+            used = {str(item["poi_id"]) for item in group}
+            remaining = [item for item in remaining if str(item["poi_id"]) not in used]
+
+        attractions = [record for record in attraction_records if valid_record(record)]
+        if not attractions:
+            return None
+        start = date.fromisoformat(request.start_date)
+        days: list[DayPlan] = []
+        # POI 证据足够时每个片区展示两个不同景点，既保留旅行计划的丰富度，
+        # 也避免同一景点因跨日重复而在地图上叠成难以辨认的编号。
+        attractions_per_day = 2 if len(attractions) >= request.travel_days * 2 else 1
+        unused_attractions = list(attractions)
+        for day_index, group in enumerate(meal_groups):
+            group_locations = [cls._parse_poi_location(item) for item in group]
+            centroid = Location(
+                longitude=sum(item.longitude for item in group_locations) / len(group_locations),
+                latitude=sum(item.latitude for item in group_locations) / len(group_locations),
+            )
+            candidate_attractions = unused_attractions or attractions
+            selected_attractions = sorted(
+                candidate_attractions,
+                key=lambda item: cls._geo_distance_squared(
+                    centroid, cls._parse_poi_location(item)
+                ),
+            )[:attractions_per_day]
+            if not selected_attractions:
+                return None
+            selected_ids = {str(item["poi_id"]) for item in selected_attractions}
+            unused_attractions = [
+                item for item in unused_attractions
+                if str(item["poi_id"]) not in selected_ids
+            ]
+            attraction_locations = [
+                cls._parse_poi_location(item) for item in selected_attractions
+            ]
+
+            # 对同一组餐厅枚举早餐、午餐、晚餐的排列，最小化最远相邻腿，
+            # 再最小化总距离。路线结构与 Validator 完全一致：
+            # 早→景点1→午→景点2→晚。
+            ordered_group = min(
+                permutations(group),
+                key=lambda ordered: (
+                    max(
+                        cls._geo_distance_squared(left, right)
+                        for left, right in zip(
+                            (
+                                cls._parse_poi_location(ordered[0]),
+                                attraction_locations[0],
+                                cls._parse_poi_location(ordered[1]),
+                                *attraction_locations[1:],
+                            ),
+                            (
+                                attraction_locations[0],
+                                cls._parse_poi_location(ordered[1]),
+                                *attraction_locations[1:],
+                                cls._parse_poi_location(ordered[2]),
+                            ),
+                        )
+                    ),
+                    sum(
+                        cls._geo_distance_squared(left, right)
+                        for left, right in zip(
+                            (
+                                cls._parse_poi_location(ordered[0]),
+                                attraction_locations[0],
+                                cls._parse_poi_location(ordered[1]),
+                                *attraction_locations[1:],
+                            ),
+                            (
+                                attraction_locations[0],
+                                cls._parse_poi_location(ordered[1]),
+                                *attraction_locations[1:],
+                                cls._parse_poi_location(ordered[2]),
+                            ),
+                        )
+                    ),
+                ),
+            )
+            day_meals = [
+                Meal(
+                    type=meal_type,
+                    name=str(record.get("name") or ""),
+                    address=str(record.get("address") or ""),
+                    location=cls._parse_poi_location(record),
+                    description="可按当日路线就近用餐，建议以店内实际菜单为准。",
+                    estimated_cost=cls._meal_cost(record, budget_limit),
+                    poi_id=str(record.get("poi_id") or ""),
+                )
+                for meal_type, record in zip(required_types, ordered_group)
+            ]
+            days.append(DayPlan(
+                date=(start + timedelta(days=day_index)).isoformat(),
+                day_index=day_index,
+                description="围绕同一片区安排景点与三餐，减少往返。",
+                transportation=request.transportation,
+                accommodation=request.accommodation,
+                attractions=[
+                    Attraction(
+                        name=str(attraction.get("name") or ""),
+                        address=str(attraction.get("address") or ""),
+                        location=cls._parse_poi_location(attraction),
+                        visit_duration=120,
+                        description=str(attraction.get("type") or "高德 POI 景点"),
+                        poi_id=str(attraction.get("poi_id") or ""),
+                    )
+                    for attraction in selected_attractions
+                ],
+                meals=day_meals,
+            ))
+
+        return TripPlan(
+            city=request.city,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            days=days,
+            weather_info=[],
+            overall_suggestions="按每天同片区顺序出行；餐厅均不重复，出发前请确认营业时间。",
+        )
+
+    @staticmethod
+    def _weather_for_travel_dates(
+        weather_info: list[WeatherInfo],
+        request: TripRequest,
+    ) -> list[WeatherInfo]:
+        """仅保留旅行日期内的高德预报，绝不把本日天气改标为旅行日天气。
+
+        高德的预报从查询当天开始返回有限天数。旅行日期超出预报窗口时，
+        只展示可获得的旅行日预报，避免向用户展示与本次行程无关的“今天”。
+        """
+        try:
+            start = date.fromisoformat(request.start_date)
+        except ValueError:
+            print(f"天气日期筛选跳过: 无法解析旅行开始日期 {request.start_date!r}")
+            return []
+
+        travel_dates = {
+            (start + timedelta(days=index)).isoformat()
+            for index in range(request.travel_days)
+        }
+        selected: list[WeatherInfo] = []
+        seen_dates: set[str] = set()
+        for item in weather_info:
+            if item.date not in travel_dates or item.date in seen_dates:
+                continue
+            selected.append(item)
+            seen_dates.add(item.date)
+
+        ignored_dates = [item.date for item in weather_info if item.date not in travel_dates]
+        if ignored_dates:
+            print(
+                "天气已按旅行日期筛选: "
+                f"旅行日={sorted(travel_dates)}; 忽略非旅行日预报={ignored_dates}"
+            )
+        if not selected and weather_info:
+            print(
+                "高德预报未覆盖旅行日期，天气区块将不展示；"
+                f"旅行日={sorted(travel_dates)}"
+            )
+        return selected
+
+    @staticmethod
+    def _complete_weather_for_travel_dates(
+        weather_info: list[WeatherInfo],
+        request: TripRequest,
+        city_center: Optional[Location] = None,
+    ) -> list[WeatherInfo]:
+        """保留已有旅行日预报，并且只精确补查缺失的旅行日期。"""
+        selected = TripPlannerAgent._weather_for_travel_dates(weather_info, request)
+        start = date.fromisoformat(request.start_date)
+        ordered_dates = [
+            (start + timedelta(days=index)).isoformat()
+            for index in range(request.travel_days)
+        ]
+        weather_by_date = {item.date: item for item in selected}
+        missing_dates = [item for item in ordered_dates if item not in weather_by_date]
+        if not missing_dates:
+            return [weather_by_date[item] for item in ordered_dates]
+
+        from ..services.amap_service import get_amap_service
+
+        service = get_amap_service()
+        for missing_date in missing_dates:
+            try:
+                print(f"天气缺失日期精确补查: 城市={request.city}; 日期={missing_date}")
+                weather_by_date[missing_date] = service.get_weather_for_date(
+                    request.city,
+                    missing_date,
+                    location=city_center,
+                )
+            except Exception as error:
+                print(
+                    f"天气缺失日期补查失败: 日期={missing_date}; "
+                    f"{type(error).__name__}: {error}"
+                )
+        return [weather_by_date[item] for item in ordered_dates if item in weather_by_date]
+
+    @staticmethod
+    def _enrich_attraction_images(
+        plan: TripPlan,
+        city_center: Optional[Location] = None,
+        radius_km: Optional[float] = None,
+        target_adcode: Optional[str] = None,
+    ) -> TripPlan:
         """用高德 POI 校正景点坐标并补齐图片。
 
         一个城市只请求一次 POI 列表，再按景点名称匹配，避免为每个景点
         单独请求高德接口导致规划链路被网络 IO 拖慢。
+
+        当提供 ``city_center`` 时，额外执行越界重查：坐标偏离目标城市的景点
+        （如深圳计划里混入的北京景点）会被替换为高德在该城市搜到的真实 POI，
+        候选耗尽则丢弃该景点，最终交由 ``validate_trip_plan`` 兜底。
         """
+        # 历史计划可能只有“第1天早餐”等占位餐饮；先从 Chroma 回填真实餐馆，
+        # 这条路径不依赖高德图片 API，确保已有缓存坐标能进入每日路线。
+        TripPlannerAgent._enrich_meal_pois(
+            plan,
+            city_center=city_center,
+            radius_km=radius_km,
+            target_adcode=target_adcode,
+        )
+
         settings = get_settings()
         if not settings.amap_api_key:
             return plan
@@ -129,104 +594,154 @@ class TripPlannerAgent:
         if not attractions:
             return plan
 
+        # 标准化城市名给高德，避免区县名搜出外地结果；区县 adcode 负责二次硬过滤。
+        city_normalized = _normalize_city_for_amap(plan.city)
+        district_keyword = _district_keyword(plan.city)
+        broad_keyword = f"{district_keyword} 景点" if district_keyword else "景点"
         try:
+            # 泛搜索只用于图片兜底，禁止用它的模糊结果覆盖景点坐标。
             pois = photo_service.search_pois(
-                "景点",
-                city=plan.city,
+                broad_keyword,
+                city=city_normalized,
                 offset=min(20, max(10, len(attractions) * 3)),
             )
         except Exception as error:
-            print(f"⚠️ 高德图片补齐跳过: {type(error).__name__}: {error}")
-            return plan
+            print(f"⚠️ 高德泛搜索跳过: {type(error).__name__}: {error}")
+            pois = []
 
         def normalize(value: str) -> str:
             return "".join(str(value or "").split()).lower()
 
+        def poi_in_scope(poi: dict) -> bool:
+            if not isinstance(poi, dict):
+                return False
+            poi_adcode = str(poi.get("adcode") or "").strip()
+            if target_adcode and poi_adcode:
+                return poi_adcode == target_adcode
+            if not city_center or not radius_km:
+                # 历史图片补齐接口未传入地理基准时，保持原有补图行为。
+                return True
+            location = TripPlannerAgent._parse_poi_location(poi)
+            return bool(
+                location
+                and city_center
+                and radius_km
+                and is_within_city(location, city_center, radius_km)
+            )
+
         normalized_pois = [
             (normalize(poi.get("name", "")), poi)
             for poi in pois
-            if isinstance(poi, dict)
+            if poi_in_scope(poi)
         ]
+        exact_poi_cache: dict[tuple[str, str], list[dict]] = {}
+
+        def exact_poi_for(name: str) -> Optional[dict]:
+            """按景点名称精确查询，返回名称完全相同的 POI。"""
+            cities = [_normalize_city_for_amap(plan.city)]
+            # 已标准化的城市无需额外添加（旧逻辑是坪山→深圳兜底，现在统一走 normalize）
+            normalized_name = normalize(name)
+            for city in cities:
+                cache_key = (normalized_name, city)
+                if cache_key not in exact_poi_cache:
+                    try:
+                        exact_poi_cache[cache_key] = photo_service.search_pois(
+                            name,
+                            city=city,
+                            offset=20,
+                        )
+                    except Exception as error:
+                        print(
+                            f"⚠️ 高德景点精确查询跳过({name}, {city}): "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        exact_poi_cache[cache_key] = []
+                exact_match = next(
+                    (
+                        poi for poi in exact_poi_cache[cache_key]
+                        if normalize(poi.get("name", "")) == normalized_name
+                        and poi_in_scope(poi)
+                    ),
+                    None,
+                )
+                if exact_match:
+                    return exact_match
+            return None
+
+        # 多个景点并发查询，避免 12 个景点串行等待网络超时，导致前端继续使用旧坐标。
+        unique_names = list(dict.fromkeys(attraction.name for attraction in attractions))
+        exact_matches: dict[str, Optional[dict]] = {}
+        with ThreadPoolExecutor(max_workers=min(4, len(unique_names))) as executor:
+            futures = {
+                executor.submit(exact_poi_for, name): name
+                for name in unique_names
+            }
+            for future, name in ((future, futures[future]) for future in futures):
+                try:
+                    exact_matches[name] = future.result()
+                except Exception as error:
+                    print(
+                        f"⚠️ 高德景点精确查询失败({name}): "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    exact_matches[name] = None
+
         for attraction in attractions:
             attraction_name = normalize(attraction.name)
             if not attraction_name:
                 continue
-            matched = False
-            for poi_name, poi in normalized_pois:
-                if not poi_name or not (
-                    attraction_name in poi_name or poi_name in attraction_name
-                ):
-                    continue
-                location = TripPlannerAgent._parse_poi_location(poi)
-                if location:
-                    # 高德 POI 的 location 已经是高德地图使用的 GCJ-02 坐标，
-                    # 优先覆盖模型生成的近似坐标，避免地图标记偏移。
-                    attraction.location = location
-                photos = AmapPhotoService._extract_photos(poi)
+            exact_match = exact_matches.get(attraction.name)
+            if exact_match:
+                TripPlannerAgent._apply_poi_data(attraction, exact_match)
+                photos = AmapPhotoService._extract_photos(exact_match)
                 if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
                     attraction.image_url = photos[0]["url"]
-                matched = True
-                break
+                continue
 
-            # 学校、大学等 POI 经常不会出现在“景点”关键词列表中，
-            # 对这些名称再发起一次精确查询，避免使用模型近似坐标。
-            if not matched and any(
-                marker in attraction.name
-                for marker in ("大学", "学院", "学校", "校园")
-            ):
-                exact_cities = [plan.city]
-                if plan.city.endswith("坪山"):
-                    exact_cities.append("深圳")
-                for exact_city in exact_cities:
-                    try:
-                        exact_pois = photo_service.search_pois(
-                            attraction.name,
-                            city=exact_city,
-                            offset=10,
-                        )
-                    except Exception as error:
-                        print(
-                            f"⚠️ 高德精确 POI 坐标补齐跳过({attraction.name}): "
-                            f"{type(error).__name__}: {error}"
-                        )
-                        continue
-                    exact_match = next(
-                        (
-                            poi
-                            for poi in exact_pois
-                            if (
-                                attraction_name in normalize(poi.get("name", ""))
-                                or normalize(poi.get("name", "")) in attraction_name
-                            )
-                        ),
-                        None,
-                    )
-                    if not exact_match:
-                        continue
-                    location = TripPlannerAgent._parse_poi_location(exact_match)
-                    if location:
-                        attraction.location = location
-                    photos = AmapPhotoService._extract_photos(exact_match)
-                    if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
-                        attraction.image_url = photos[0]["url"]
-                    break
+            # 精确查询无结果时，只允许泛搜索命中“名称完全相同”的 POI，
+            # 避免把模型景点坐标替换成附近的其他地点。
+            exact_from_broad = next(
+                (poi for poi_name, poi in normalized_pois if poi_name == attraction_name),
+                None,
+            )
+            if exact_from_broad:
+                TripPlannerAgent._apply_poi_data(attraction, exact_from_broad)
+                photos = AmapPhotoService._extract_photos(exact_from_broad)
+                if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
+                    attraction.image_url = photos[0]["url"]
+
+        # 越界重查：坐标校正后仍偏离目标城市的景点，多半是模型套用了其他城市的坐标
+        # （如深圳计划里的北京故宫）。用高德在该城市搜到的真实 POI 整条替换，
+        # 候选池耗尽则丢弃，避免把外地坐标画到地图上。
+        if city_center is not None and radius_km and radius_km > 0:
+            TripPlannerAgent._repair_out_of_city_attractions(
+                plan, pois, city_center, radius_km, normalize, target_adcode
+            )
 
         # 酒店和餐馆也可能只有名称没有坐标，按类别补一次高德 POI 坐标。
         route_targets = {
-            "酒店": [day.hotel for day in plan.days if day.hotel],
+            "酒店": [
+                day.hotel
+                for day in plan.days
+                if day.hotel and day.hotel.location is None
+            ],
             "餐厅": [
                 meal
                 for day in plan.days
                 for meal in day.meals
+                if meal.location is None
             ],
         }
         for keywords, targets in route_targets.items():
             if not targets:
                 continue
             try:
+                scoped_keywords = (
+                    f"{district_keyword} {keywords}" if district_keyword else keywords
+                )
                 pois = photo_service.search_pois(
-                    keywords,
-                    city=plan.city,
+                    scoped_keywords,
+                    city=city_normalized,
                     offset=min(20, max(10, len(targets) * 3)),
                 )
             except Exception as error:
@@ -235,7 +750,7 @@ class TripPlannerAgent:
             normalized_pois = [
                 (normalize(poi.get("name", "")), poi)
                 for poi in pois
-                if isinstance(poi, dict)
+                if poi_in_scope(poi)
             ]
             for target in targets:
                 target_name = normalize(getattr(target, "name", ""))
@@ -247,7 +762,207 @@ class TripPlannerAgent:
                         if location:
                             target.location = location
                         break
+
+        # 酒店/餐厅坐标可选：仍越界的直接清空，避免把外地点位画到地图上
+        # （景点是必填坐标，已在越界重查里替换，这里只处理可选点位）。
+        if city_center is not None and radius_km and radius_km > 0:
+            for targets in route_targets.values():
+                for target in targets:
+                    location = getattr(target, "location", None)
+                    if location is not None and not is_within_city(location, city_center, radius_km):
+                        target.location = None
         return plan
+
+    @staticmethod
+    def _enrich_meal_pois(
+        plan: TripPlan,
+        city_center: Optional[Location] = None,
+        radius_km: Optional[float] = None,
+        target_adcode: Optional[str] = None,
+    ) -> TripPlan:
+        """把历史计划中的餐饮占位项回填为 Chroma 真实餐馆 POI。"""
+        meals = [meal for day in plan.days for meal in day.meals]
+        if not meals:
+            return plan
+        try:
+            from ..services.poi_vector_store import get_poi_vector_store
+
+            store = get_poi_vector_store()
+            if not store:
+                return plan
+            candidates = store.search(
+                query=f"{plan.city} 餐馆 美食",
+                city=_normalize_city_for_amap(plan.city),
+                limit=max(20, len(meals) * 3),
+                adcode=target_adcode,
+                poi_group="meal",
+            )
+        except Exception as error:
+            print(f"⚠️ Chroma 餐馆回填跳过: {type(error).__name__}: {error}")
+            return plan
+
+        def normalise(value: object) -> str:
+            return "".join(str(value or "").split()).lower()
+
+        def in_scope(candidate: dict) -> bool:
+            if not city_center or not radius_km:
+                return True
+            location = TripPlannerAgent._parse_poi_location({
+                "location": f"{candidate.get('longitude')},{candidate.get('latitude')}"
+            })
+            return bool(location and is_within_city(location, city_center, radius_km))
+
+        candidates = [candidate for candidate in candidates if in_scope(candidate)]
+        if not candidates:
+            return plan
+
+        used_ids: set[str] = set()
+        for meal in meals:
+            if meal.poi_id and meal.location:
+                continue
+            meal_name = normalise(meal.name)
+            candidate = next(
+                (
+                    item for item in candidates
+                    if item.get("poi_id") not in used_ids
+                    and (
+                        str(item.get("poi_id") or "") == str(meal.poi_id or "")
+                        or (meal_name and meal_name in normalise(item.get("name")))
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                candidate = next(
+                    (
+                        item for item in candidates
+                        if item.get("poi_id") not in used_ids
+                    ),
+                    candidates[0],
+                )
+            poi_id = str(candidate.get("poi_id") or "")
+            if not poi_id:
+                continue
+            used_ids.add(poi_id)
+            location = TripPlannerAgent._parse_poi_location({
+                "location": f"{candidate.get('longitude')},{candidate.get('latitude')}"
+            })
+            if location is None:
+                continue
+            meal.name = str(candidate.get("name") or meal.name)
+            meal.address = str(candidate.get("address") or meal.address or "")
+            meal.location = location
+            meal.poi_id = poi_id
+            if not meal.description or meal.description in {
+                "午餐推荐", "晚餐推荐", "早餐推荐", "当地特色早餐", "当地特色餐饮",
+            }:
+                meal.description = str(candidate.get("type") or "高德餐饮 POI")
+            if not meal.estimated_cost:
+                match = re.search(r"\d+(?:\.\d+)?", str(candidate.get("cost") or ""))
+                if match:
+                    meal.estimated_cost = int(float(match.group()))
+            print(
+                f"Chroma 餐馆回填: {meal.type}={meal.name} | "
+                f"{meal.address} | {location.longitude},{location.latitude}"
+            )
+        return plan
+
+    @staticmethod
+    def _repair_out_of_city_attractions(
+        plan: TripPlan,
+        pois: list,
+        city_center: Location,
+        radius_km: float,
+        normalize,
+        target_adcode: Optional[str] = None,
+    ) -> None:
+        """把坐标越界的景点替换为高德在该城市搜到的真实 POI，候选耗尽则丢弃。
+
+        替换源是泛搜索(``城市 + 景点``)返回的、坐标落在城内的真实 POI，
+        天然与目标城市一致；每个候选只用一次，避免重复景点。
+        """
+        used_names = {
+            normalize(attraction.name)
+            for day in plan.days
+            for attraction in day.attractions
+        }
+        replacement_pool: list[dict] = []
+        for poi in pois:
+            if not isinstance(poi, dict):
+                continue
+            location = TripPlannerAgent._parse_poi_location(poi)
+            poi_adcode = str(poi.get("adcode") or "").strip()
+            if target_adcode and poi_adcode:
+                in_scope = poi_adcode == target_adcode
+            else:
+                in_scope = bool(
+                    location and is_within_city(location, city_center, radius_km)
+                )
+            if location is None or not in_scope:
+                continue
+            poi_name = normalize(poi.get("name", ""))
+            if not poi_name or poi_name in used_names:
+                continue
+            used_names.add(poi_name)
+            replacement_pool.append(poi)
+
+        pool_iter = iter(replacement_pool)
+        for index, day in enumerate(plan.days, start=1):
+            kept: list[Attraction] = []
+            for attraction in day.attractions:
+                if is_within_city(attraction.location, city_center, radius_km):
+                    kept.append(attraction)
+                    continue
+                replacement = next(pool_iter, None)
+                if replacement is None:
+                    print(
+                        f"⚠️ 第{index}天景点“{attraction.name}”坐标越界且无城内候选，已丢弃"
+                    )
+                    continue
+                print(
+                    f"⚠️ 第{index}天景点“{attraction.name}”坐标越界，"
+                    f"替换为“{replacement.get('name')}”"
+                )
+                TripPlannerAgent._overwrite_attraction_from_poi(
+                    attraction, replacement, plan.city
+                )
+                kept.append(attraction)
+            day.attractions = kept
+
+    @staticmethod
+    def _overwrite_attraction_from_poi(
+        attraction: Attraction, poi: dict, city: str
+    ) -> None:
+        """用城内 POI 整条覆盖越界景点，保证名称/地址/坐标/图片彼此一致。
+
+        模型原本的描述是针对外地景点写的，替换坐标后必须一并清掉，
+        否则会出现“名字是深圳景点、简介却在讲北京”的错位。
+        """
+        TripPlannerAgent._apply_poi_data(attraction, poi)
+        poi_type = str(poi.get("type") or "").split(";")[0].strip()
+        attraction.description = poi_type or f"{city}的推荐景点"
+        attraction.category = "景点"
+        attraction.rating = None
+        attraction.ticket_price = 0
+        attraction.photos = []
+        photos = AmapPhotoService._extract_photos(poi)
+        attraction.image_url = photos[0]["url"] if photos else None
+
+    @staticmethod
+    def _apply_poi_data(attraction: Attraction, poi: dict) -> None:
+        """将高德 POI 的权威名称、地址、编号和 GCJ-02 坐标写回景点。"""
+        location = TripPlannerAgent._parse_poi_location(poi)
+        if location:
+            attraction.location = location
+        poi_id = str(poi.get("id") or "")
+        if poi_id:
+            attraction.poi_id = poi_id
+        poi_name = str(poi.get("name") or "").strip()
+        if poi_name:
+            attraction.name = poi_name
+        poi_address = str(poi.get("address") or "").strip()
+        if poi_address:
+            attraction.address = poi_address
 
     @staticmethod
     def _parse_poi_location(poi: dict) -> Optional[Location]:
@@ -270,8 +985,10 @@ class TripPlannerAgent:
         self,
         request: TripRequest,
         preference: Optional[Preference] = None,
+        vector_pois: Optional[list[dict]] = None,
     ) -> str:
-        """构建单 Agent 查询，将规划和重规划上下文一次性传入。"""
+        """构建规划任务；POI 候选由 search_poi Observation 按需提供。"""
+        del vector_pois
         query = f"""请根据以下信息生成{request.city}的{request.travel_days}天旅行计划:
 
 **基本信息:**
@@ -279,10 +996,43 @@ class TripPlannerAgent:
 - 日期: {request.start_date} 至 {request.end_date}
 - 天数: {request.travel_days}天
 - 交通方式: {request.transportation}
-- 住宿: {request.accommodation}
+        - 住宿: {request.accommodation}
 - 偏好: {', '.join(request.preferences) if request.preferences else '无'}
 """
-        if request.current_plan and request.change_request:
+        try:
+            start = date.fromisoformat(request.start_date)
+            daily_schedule = "\n".join(
+                f"- 第{index + 1}天: date={(start + timedelta(days=index)).isoformat()}；"
+                "必须在该 day 的 meals 中安排 breakfast、lunch、dinner"
+                for index in range(request.travel_days)
+            )
+            query += (
+                "\n**每日计划必须覆盖以下日期（餐馆按所在 day 写入 day.meals）:**\n"
+                f"{daily_schedule}\n"
+            )
+        except ValueError:
+            # 请求模型通常已保证日期格式；异常时交给最终 Validator 报告。
+            pass
+        district_keyword = _district_keyword(request.city)
+        if district_keyword:
+            query += (
+                f"\n**硬性目标范围:** 仅限{request.city}（{district_keyword}区/新区），"
+                "不得使用深圳其他行政区的景点、酒店或餐厅。\n"
+            )
+        if request.current_plan and (request.change_set or request.change_request):
+            auto_replan = bool(
+                request.change_set
+                and any(item.operation == "full_replan" for item in request.change_set.operations)
+            )
+            replan_rules = (
+                "1. 保持目的地和日期不变，主动优化每日节奏、景点组合、餐饮和路线。\n"
+                "2. 直接完成规划，不要向用户追问。\n"
+                "3. 返回完整的旅行计划 JSON。"
+                if auto_replan
+                else "1. 只修改用户明确要求的日期、景点、餐饮、酒店、交通或预算。\n"
+                "2. 未被要求修改的日期和内容必须保留。\n"
+                "3. 返回完整的旅行计划 JSON，不能只返回修改片段。"
+            )
             query += f"""
 **当前旅行计划(JSON):**
 {json.dumps(request.current_plan, ensure_ascii=False)}
@@ -290,206 +1040,336 @@ class TripPlannerAgent:
 **定向修改要求:**
 {request.change_request}
 
+**结构化 ChangeSet:**
+{request.change_set.model_dump_json() if request.change_set else '无'}
+
 **定向修改规则:**
-1. 只修改用户明确要求的日期、景点、餐饮、酒店、交通或预算。
-2. 未被要求修改的日期和内容必须保留。
-3. 返回完整的旅行计划 JSON，不能只返回修改片段。
+{replan_rules}
 """
         if request.free_text_input:
             query += f"\n**额外要求:** {request.free_text_input}"
-        if preference and preference.prompt:
+        if preference and preference.prompt and preference.prompt != request.free_text_input:
             query += f"\n**用户偏好:** {preference.prompt}"
+
+        query += (
+            "\n\n**路线顺序要求:** 同一天的景点必须位于彼此相近的片区，并按地理邻近顺序安排；"
+            "不得在同一天内先去城区东侧、再去西侧、随后又回到东侧。"
+            "早餐、午餐和晚餐必须与相邻景点同片区；相邻节点直线距离不得超过 5 公里。"
+            "同一餐馆 POI 整个行程只能使用一次，禁止重复同一美食城。"
+            "\n\n**Draft 最小契约:** 顶层包含 city、start_date、end_date、days、weather_info、"
+            "overall_suggestions；每个 day 包含 date、day_index、description、transportation、"
+            "accommodation、attractions、meals。景点必须包含 name、address、location、"
+            "visit_duration、description、poi_id。每餐必须包含 type、name、address、location、"
+            "description、estimated_cost、poi_id。"
+        )
 
         return query
 
-    def _parse_response(self, response: str, request: TripRequest, preference: Optional[Preference] = None) -> TripPlan:
-        """
-        解析Agent响应
-        
-        Args:
-            response: Agent响应文本
-            request: 原始请求
-            
-        Returns:
-            旅行计划
-        """
-        try:
-            # 尝试从响应中提取JSON
-            # 查找JSON代码块
-            if "```json" in response:
-                json_start = response.find("```json") + 7
-                json_end = response.find("```", json_start)
-                json_str = response[json_start:json_end].strip()
-            elif "```" in response:
-                json_start = response.find("```") + 3
-                json_end = response.find("```", json_start)
-                json_str = response[json_start:json_end].strip()
-            elif "{" in response and "}" in response:
-                # 直接查找JSON对象
-                json_start = response.find("{")
-                json_end = response.rfind("}") + 1
-                json_str = response[json_start:json_end]
-            else:
-                raise ValueError("响应中未找到JSON数据")
-            
-            # 解析JSON
-            data = json.loads(json_str)
-            
-            # 转换为TripPlan对象
-            trip_plan = TripPlan(**data)
-            
-            return trip_plan
-            
-        except Exception as e:
-            print(f"⚠️  解析响应失败: {str(e)}")
-            print(f"   将使用备用方案生成计划")
-            if request.current_plan:
-                try:
-                    return TripPlan.model_validate(request.current_plan)
-                except Exception:
-                    pass
-            return self._create_fallback_plan(request, "模型返回内容无法解析", preference)
-
     @staticmethod
-    def _create_fallback_plan(
-        request: TripRequest,
-        fallback_reason: str = "未配置模型密钥",
-        preference: Optional[Preference] = None,
-    ) -> TripPlan:
-        """创建备用计划(当Agent失败时)"""
-        from datetime import datetime, timedelta
+    def _geo_distance_squared(left: Location, right: Location) -> float:
+        """用于同城 POI 排序的轻量近似距离；无需发起额外路线请求。"""
+        latitude_scale = math.cos(math.radians((left.latitude + right.latitude) / 2))
+        longitude_delta = (left.longitude - right.longitude) * latitude_scale
+        latitude_delta = left.latitude - right.latitude
+        return longitude_delta * longitude_delta + latitude_delta * latitude_delta
 
-        poi_candidates = []
-        weather_info = []
-        try:
-            from ..services.amap_photo_service import get_amap_photo_service
-
-            keywords = request.preferences[0] if request.preferences else "景点"
-            poi_candidates = get_amap_photo_service().search_pois(
-                keywords,
-                city=request.city,
-                offset=max(6, request.travel_days * 2),
+    @classmethod
+    def _order_day_attractions_by_proximity(cls, plan: TripPlan) -> TripPlan:
+        """从早餐（或酒店）出发，以近邻顺序排列当日景点，避免无意义折返。"""
+        for day in plan.days:
+            remaining = [item for item in day.attractions if item.location is not None]
+            without_location = [item for item in day.attractions if item.location is None]
+            if len(remaining) < 2:
+                continue
+            breakfast = next((meal for meal in day.meals if meal.type == "breakfast"), None)
+            current = (
+                breakfast.location if breakfast and breakfast.location else
+                day.hotel.location if day.hotel and day.hotel.location else
+                remaining[0].location
             )
-        except Exception as error:
-            print(f"高德 POI 兜底搜索失败: {error}")
-
-        try:
-            # 即使 LLM/MCP 初始化超时，天气仍通过高德 REST API 独立获取。
-            from ..services.amap_service import get_amap_service
-
-            weather_info = get_amap_service().get_weather(request.city)
-        except Exception as error:
-            print(f"高德天气兜底查询失败: {error}")
-        
-        # 解析日期
-        start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
-        
-        # 创建每日行程
-        days = []
-        for i in range(request.travel_days):
-            current_date = start_date + timedelta(days=i)
-
-            attractions = []
-            for j in range(2):
-                poi_index = i * 2 + j
-                poi = poi_candidates[poi_index] if poi_index < len(poi_candidates) else None
-                if poi:
-                    location_parts = str(poi.get("location", "")).split(",")
-                    try:
-                        location = Location(
-                            longitude=float(location_parts[0]),
-                            latitude=float(location_parts[1]),
-                        )
-                    except (IndexError, ValueError):
-                        location = TripPlannerAgent._fallback_city_location(
-                            request.city,
-                            i,
-                            j,
-                        )
-                    photos = AmapPhotoService._extract_photos(poi)
-                    attractions.append(
-                        Attraction(
-                            name=poi.get("name") or f"{request.city}景点{j + 1}",
-                            address=poi.get("address") or f"{request.city}市",
-                            location=location,
-                            visit_duration=120,
-                            description=poi.get("type") or f"{request.city}的推荐地点",
-                            category="景点",
-                            image_url=photos[0]["url"] if photos else None,
-                        )
-                    )
-                else:
-                    attractions.append(
-                        Attraction(
-                            name=f"{request.city}景点{j + 1}",
-                            address=f"{request.city}市",
-                            location=TripPlannerAgent._fallback_city_location(
-                                request.city,
-                                i,
-                                j,
-                            ),
-                            visit_duration=120,
-                            description=f"这是{request.city}的著名景点",
-                            category="景点",
-                        )
-                    )
-
-            day_plan = DayPlan(
-                date=current_date.strftime("%Y-%m-%d"),
-                day_index=i,
-                description=f"第{i+1}天行程",
-                transportation=request.transportation,
-                accommodation=request.accommodation,
-                attractions=attractions,
-                meals=[
-                    Meal(type="breakfast", name=f"第{i+1}天早餐", description="当地特色早餐"),
-                    Meal(type="lunch", name=f"第{i+1}天午餐", description="午餐推荐"),
-                    Meal(type="dinner", name=f"第{i+1}天晚餐", description="晚餐推荐")
-                ]
-            )
-            days.append(day_plan)
-        
-        overall_suggestions = (
-            f"{fallback_reason}，已生成{request.city}{request.travel_days}日基础行程。"
-            "服务恢复后可获得更精确的高德景点、天气和图片推荐。"
-        )
-        if preference and preference.prompt:
-            overall_suggestions += f" 已记录你的偏好: {preference.prompt}"
-
-        return TripPlan(
-            city=request.city,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            days=days,
-            weather_info=weather_info,
-            overall_suggestions=overall_suggestions,
-        )
-
-    @staticmethod
-    def _fallback_city_location(city: str, day_index: int, item_index: int) -> Location:
-        """在高德暂不可用时使用城市级中心点，避免把深圳标到北京。"""
-        city_centers = {
-            "深圳": (114.0579, 22.5431),
-            "深圳坪山": (114.3389, 22.7080),
-            "化州": (110.6396, 21.6635),
-            "陆丰": (115.6523, 22.9465),
-            "北京": (116.4074, 39.9042),
-        }
-        longitude, latitude = next(
-            (
-                center
-                for name, center in sorted(
-                    city_centers.items(),
-                    key=lambda item: len(item[0]),
-                    reverse=True,
+            ordered = []
+            while remaining:
+                next_index = min(
+                    range(len(remaining)),
+                    key=lambda index: cls._geo_distance_squared(
+                        current,
+                        remaining[index].location,
+                    ),
                 )
-                if name in city
-            ),
-            (113.2644, 23.1291),
-        )
-        offset = day_index * 0.002 + item_index * 0.001
-        return Location(longitude=longitude + offset, latitude=latitude + offset)
+                next_attraction = remaining.pop(next_index)
+                ordered.append(next_attraction)
+                current = next_attraction.location
+            day.attractions = ordered + without_location
+        return plan
 
+    def _execute_change_set(
+        self,
+        plan: TripPlan,
+        change_set: ChangeSet,
+        request: TripRequest,
+        vector_pois: list[dict],
+        target_adcode: Optional[str],
+    ) -> tuple[TripPlan, list[str]]:
+        """执行 LLM 产生的白名单操作；任何操作失败都会阻止整次持久化。"""
+        changes: list[str] = []
+        for operation in change_set.operations:
+            if operation.operation == "delete_attraction":
+                removed = self._delete_attractions(plan, operation)
+                if not removed:
+                    raise ValueError("delete_attraction 没有匹配到任何景点")
+                changes.append("移除 " + "、".join(removed))
+                continue
+
+            if operation.operation in {"replace_attraction", "add_attraction"}:
+                target = operation.target
+                query = ((target.name if target else None) or (target.semantic if target else None) or "").strip()
+                if not query:
+                    raise ValueError(f"{operation.operation} 缺少 target.name 或 target.semantic")
+                poi = self._resolve_replacement_poi(request, query, vector_pois, target_adcode)
+                if poi is None:
+                    raise ValueError(f"在{request.city}范围内没有找到符合“{query}”的真实 POI")
+                if operation.operation == "replace_attraction":
+                    replaced = self._replace_attraction(plan, operation, poi)
+                    if not replaced:
+                        raise ValueError("replace_attraction 没有匹配到待替换景点")
+                    changes.append(f"替换 {replaced} 为 {poi.get('name')}")
+                else:
+                    day_index = self._add_attraction(plan, operation, poi)
+                    changes.append(f"在第{day_index + 1}天添加 {poi.get('name')}")
+                continue
+
+            if operation.operation == "update_day":
+                day_index = operation.selector.day_index if operation.selector else None
+                if day_index is None or day_index >= len(plan.days):
+                    raise ValueError("update_day 缺少有效的 selector.day_index")
+                allowed = {"description", "transportation", "accommodation"}
+                updated = []
+                for field, value in operation.fields.items():
+                    if field in allowed and isinstance(value, str):
+                        setattr(plan.days[day_index], field, value)
+                        updated.append(field)
+                if not updated:
+                    raise ValueError("update_day 没有可执行的白名单字段")
+                changes.append(f"更新第{day_index + 1}天: {', '.join(updated)}")
+                continue
+
+            raise ValueError(f"局部执行器不支持操作: {operation.operation}")
+        return plan, changes
+
+    @staticmethod
+    def _operation_matches_attraction(attraction: Attraction, operation: ChangeOperation) -> bool:
+        selector = operation.selector
+        if selector is None:
+            return False
+        searchable = "".join(
+            "|".join((attraction.name, attraction.description, attraction.category or "")).split()
+        ).lower()
+        checks = []
+        if selector.name:
+            checks.append("".join(selector.name.split()).lower() in searchable)
+        if selector.semantic:
+            checks.append("".join(selector.semantic.split()).lower() in searchable)
+        return bool(checks) and all(checks)
+
+    @classmethod
+    def _delete_attractions(cls, plan: TripPlan, operation: ChangeOperation) -> list[str]:
+        removed: list[str] = []
+        for day in plan.days:
+            retained = []
+            for attraction in day.attractions:
+                day_matches = (
+                    operation.selector is None
+                    or operation.selector.day_index is None
+                    or operation.selector.day_index == day.day_index
+                )
+                if day_matches and cls._operation_matches_attraction(attraction, operation):
+                    removed.append(attraction.name)
+                else:
+                    retained.append(attraction)
+            day.attractions = retained
+        return removed
+
+    @classmethod
+    def _replace_attraction(cls, plan: TripPlan, operation: ChangeOperation, poi: dict) -> str | None:
+        for day in plan.days:
+            for attraction in day.attractions:
+                if cls._operation_matches_attraction(attraction, operation):
+                    old_name = attraction.name
+                    cls._overwrite_attraction_from_poi(attraction, poi, plan.city)
+                    return old_name
+        return None
+
+    @classmethod
+    def _add_attraction(cls, plan: TripPlan, operation: ChangeOperation, poi: dict) -> int:
+        requested_index = operation.selector.day_index if operation.selector else None
+        if requested_index is None:
+            requested_index = min(range(len(plan.days)), key=lambda index: len(plan.days[index].attractions))
+        if requested_index < 0 or requested_index >= len(plan.days):
+            raise ValueError("add_attraction 的 selector.day_index 超出行程范围")
+        location = cls._parse_poi_location(poi)
+        if location is None:
+            raise ValueError("新增 POI 缺少有效坐标")
+        attraction = Attraction(
+            name=str(poi.get("name") or ""),
+            address=str(poi.get("address") or ""),
+            location=location,
+            visit_duration=120,
+            description=str(poi.get("type") or "真实高德 POI"),
+            poi_id=str(poi.get("id") or poi.get("poi_id") or ""),
+        )
+        plan.days[requested_index].attractions.append(attraction)
+        return requested_index
+
+    @staticmethod
+    def _poi_as_amap_record(poi: dict) -> dict:
+        """统一 Chroma 元数据与高德 REST POI 的字段，便于覆盖行程节点。"""
+        result = dict(poi)
+        if not result.get("id"):
+            result["id"] = result.get("poi_id") or ""
+        if not result.get("location"):
+            longitude = result.get("longitude")
+            latitude = result.get("latitude")
+            if longitude is not None and latitude is not None:
+                result["location"] = f"{longitude},{latitude}"
+        return result
+
+    @staticmethod
+    def _poi_matches_target(poi: dict, target: str) -> bool:
+        normalized_target = "".join((target or "").split()).lower()
+        normalized_name = "".join(str(poi.get("name") or "").split()).lower()
+        poi_type = str(poi.get("type") or "")
+        if normalized_target == "大学":
+            return "大学" in normalized_name or "高等院校" in poi_type
+        return bool(normalized_target and normalized_target in normalized_name)
+
+    @staticmethod
+    def _rank_replacement_poi(poi: dict, target: str) -> int:
+        """用高德名称和类型挑选地点主体，排除同名公交站、停车场等附属 POI。"""
+        name = str(poi.get("name") or "")
+        poi_type = str(poi.get("type") or "")
+        target = (target or "").strip()
+        score = 0
+        if name == target:
+            score += 80
+        elif name.endswith(target):
+            score += 50
+        elif target in name:
+            score += 30
+
+        if "大学" in target:
+            if "高等院校" in poi_type:
+                score += 120
+            elif "学校" in poi_type:
+                score += 15
+            if "大学" in name:
+                score += 40
+            if any(marker in f"{name}|{poi_type}" for marker in (
+                "附属", "医院", "公交", "地铁", "停车", "酒店", "宾馆", "研究院",
+            )):
+                score -= 200
+        return score
+
+    def _resolve_replacement_poi(
+        self,
+        request: TripRequest,
+        target: str,
+        vector_pois: list[dict],
+        target_adcode: Optional[str],
+    ) -> Optional[dict]:
+        """先从 Chroma 召回替换目标，缺失时只做一次高德 REST 精确搜索。"""
+        def in_scope(poi: dict) -> bool:
+            poi_adcode = str(poi.get("adcode") or "").strip()
+            return not target_adcode or poi_adcode == target_adcode
+
+        candidates = [
+            self._poi_as_amap_record(poi)
+            for poi in vector_pois
+            if classify_poi_group(poi) == "attraction"
+            and self._poi_matches_target(poi, target)
+            and in_scope(poi)
+        ]
+        if not candidates:
+            district_keyword = _district_keyword(request.city)
+            keywords = f"{district_keyword} {target}" if district_keyword else target
+            try:
+                pois = get_amap_photo_service().search_pois(
+                    keywords,
+                    city=_normalize_city_for_amap(request.city),
+                    offset=20,
+                )
+                candidates = [
+                    self._poi_as_amap_record(poi)
+                    for poi in pois
+                    if classify_poi_group(poi) == "attraction"
+                    and self._poi_matches_target(poi, target)
+                    and in_scope(poi)
+                ]
+                print(
+                    f"定向替换 POI 查询: 目标={target}; 城市={request.city}; "
+                    f"候选={len(candidates)}"
+                )
+            except Exception as error:
+                print(f"⚠️ 定向替换 POI 查询失败: {type(error).__name__}: {error}")
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda poi: self._rank_replacement_poi(poi, target))
+
+    @staticmethod
+    def _retrieve_cached_pois(
+        request: TripRequest,
+        preference: Optional[Preference],
+        adcode: Optional[str] = None,
+    ) -> list[dict]:
+        """先按景点、酒店、餐馆三大类从 Chroma 召回，天气和路线仍实时查询。"""
+        try:
+            from ..services.poi_vector_store import get_poi_vector_store
+
+            store = get_poi_vector_store()
+            if not store:
+                return []
+            query = " ".join(
+                value for value in (
+                    request.city,
+                    " ".join(request.preferences),
+                    request.change_request or "",
+                    request.free_text_input or "",
+                    preference.prompt if preference else "",
+                ) if value
+            )
+            city = _normalize_city_for_amap(request.city)
+            results = []
+            group_queries = {
+                "attraction": f"{query} 景点",
+                "hotel": f"{query} 酒店住宿",
+                "meal": f"{query} 餐馆美食",
+            }
+            for group, group_query in group_queries.items():
+                group_results = store.search(
+                    query=group_query,
+                    # 写入 POI 时使用与高德 citylimit 一致的地级市键，
+                    # 例如“深圳坪山”写入“深圳”，检索必须使用同一键。
+                    city=city,
+                    limit=get_settings().poi_vector_top_k,
+                    adcode=adcode,
+                    poi_group=group,
+                )
+                results.extend(group_results)
+            # 同一 POI 可能由多次高德搜索写入，保持候选稳定且不重复。
+            deduplicated = list({
+                (poi.get("poi_id") or poi.get("name"), poi.get("poi_group")): poi
+                for poi in results
+            }.values())
+            print(
+                f"Chroma POI 分大类召回: 城市={request.city}; "
+                f"景点={sum(p.get('poi_group') == 'attraction' for p in deduplicated)}; "
+                f"酒店={sum(p.get('poi_group') == 'hotel' for p in deduplicated)}; "
+                f"餐馆={sum(p.get('poi_group') == 'meal' for p in deduplicated)}"
+            )
+            return deduplicated
+        except Exception as error:
+            print(f"⚠️ Chroma POI 检索跳过: {type(error).__name__}: {error}")
+            return []
 
 # 全局单 Agent 实例
 _trip_planner_agent = None
@@ -503,4 +1383,3 @@ def get_trip_planner_agent() -> TripPlannerAgent:
         _trip_planner_agent = TripPlannerAgent()
 
     return _trip_planner_agent
-

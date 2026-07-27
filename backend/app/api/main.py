@@ -1,5 +1,6 @@
 """FastAPI主应用"""
 
+import asyncio
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
 from ..database import database_health, init_database
+from ..services.poi_vector_store import get_poi_vector_store
 from .routes import trip, poi, map as map_routes, auth, conversations, talk
 
 # 获取配置
@@ -63,6 +65,22 @@ async def startup_event():
         raise
 
     await init_database()
+
+    # Chroma 在后端启动阶段预热，避免首个规划请求承担 PersistentClient
+    # 和 collection 初始化耗时。Chroma 不可用时保持 REST/MCP 降级链路。
+    chroma_started = asyncio.get_running_loop().time()
+    chroma_store = await asyncio.to_thread(get_poi_vector_store)
+    chroma_elapsed_ms = round(
+        (asyncio.get_running_loop().time() - chroma_started) * 1000,
+        3,
+    )
+    if chroma_store is not None:
+        print(f"Chroma 启动预热完成，耗时 {chroma_elapsed_ms:.3f} ms")
+    else:
+        print(
+            f"Chroma 启动预热失败，耗时 {chroma_elapsed_ms:.3f} ms；"
+            "后续使用 REST/MCP 降级链路"
+        )
     
     print("\n" + "="*60)
     print("API文档: http://localhost:8000/docs")

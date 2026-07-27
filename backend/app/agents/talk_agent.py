@@ -8,7 +8,7 @@ from ..services.llm_service import get_llm
 import json
 from typing import Any
 
-from ..models.schemas import Preference, TalkRequest, TalkResponse
+from ..models.schemas import ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
 
 from hello_agents import SimpleAgent
 
@@ -24,28 +24,47 @@ TALK_AGENT_PROMPT = f"""你是「行旅天下」的旅行偏好顾问。你的�
 4. 预算与住宿档次倾向
 5. 同行人员(独自 / 情侣 / 家庭带娃 / 朋友)等其他关键约束
 
-**语义判定规则:**
-1. 如果用户只是询问、闲聊、询问建议或了解目的地信息，intent 填 "chat"。
-2. 如果用户要求修改景点、日期、交通、住宿、餐饮、预算或某一天的安排，intent 填 "replan"。
-3. intent 为 "replan" 时，change_request 必须是清晰、完整的修改要求。
-4. intent 为 "chat" 时，change_request 必须为 null。
+**变更判定与 ChangeSet 规则:**
+1. 询问、闲聊或咨询建议时，intent 填 "chat"，change_set 填 null。
+2. 用户表达改计划、重排、替换、增加、删除或调整时，intent 必须填 "replan"，并直接输出可执行的 change_set，禁止追问后停住。
+3. 只能使用以下 operation：add_attraction、delete_attraction、replace_attraction、update_day、full_replan。
+4. 删除一类地点时，把类别写在 selector.semantic，例如“删除寺庙”输出 delete_attraction + semantic="寺庙"。
+5. 替换地点时，selector 指向旧地点，target 指向新地点或类别；“马峦山改大学”应输出 target.semantic="大学"。
+6. 用户只说“我要改计划”时，输出 full_replan。禁止输出 SQL、正则表达式或自然语言操作说明。
 
 **对话规则:**
 1. 每轮只温和地追问 1-2 个问题，语气亲切自然，避免一次抛出一长串问题。
 2. preference.prompt 只填写从对话中提炼出的稳定旅行偏好；没有新偏好时填 null。
 3. 只返回 JSON，不要返回 Markdown 代码块或 JSON 以外的文字。
+4. top_suggestions 必须基于对话历史、当前行程摘要和已知偏好，返回 3 条彼此不同、可直接点击发送的下一步建议；禁止使用固定模板。
 
 **严格返回格式:**
 {{
   "reply": "给用户看的自然语言回复",
   "intent": "chat 或 replan",
-  "change_request": "完整的行程修改要求，普通聊天时为 null",
+  "change_request": "给日志和用户看的简短变更摘要，普通聊天时为 null",
+  "change_set": {{
+    "operations": [
+      {{"operation": "delete_attraction", "selector": {{"semantic": "寺庙"}}}}
+    ]
+  }} 或 null,
+  "top_suggestions": ["建议1", "建议2", "建议3"],
   "preference": {{"prompt": "稳定的用户旅行偏好"}} 或 null,
   "done": true 或 false
 }}
 
 **示例:**
-{{"reply":"我会把第二天调整为自然风光路线。","intent":"replan","change_request":"将第二天改为自然风光路线","preference":{{"prompt":"偏好自然风光"}},"done":true}}
+{{"reply":"我会移除寺庙景点。","intent":"replan","change_request":"移除寺庙景点","change_set":{{"operations":[{{"operation":"delete_attraction","selector":{{"semantic":"寺庙"}}}}]}},"top_suggestions":["增加校园附近餐饮","把第二天安排得更轻松","添加一处室内景点"],"preference":null,"done":true}}
+"""
+
+SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
+根据提供的目的地、当前行程、对话历史和已知偏好，生成恰好 3 条彼此不同、可直接点击发送的中文建议。
+建议应具体关联已有行程和最近对话，避免泛泛而谈、避免固定模板，也不要假设用户尚未说过的偏好。
+只返回 JSON，不要 Markdown 或解释：
+{"top_suggestions":["建议1","建议2","建议3"]}
+
+**示例：**
+{"top_suggestions":["把深圳技术大学安排在第二天上午","补充大学附近人均 40 元以内的午餐","将第三天调整为轻松的室内路线"]}
 """
 
 
@@ -60,6 +79,11 @@ class TalkAgent:
             name="旅行偏好顾问",
             llm=self.llm,
             system_prompt=TALK_AGENT_PROMPT,
+        )
+        self.suggestion_agent = SimpleAgent(
+            name="旅行建议生成器",
+            llm=self.llm,
+            system_prompt=SUGGESTION_AGENT_PROMPT,
         )
         print("✅ 偏好对话智能体初始化成功")
 
@@ -76,31 +100,113 @@ class TalkAgent:
             prompt = self._build_prompt(request)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
+            # 每轮对话都应提供可点击的动态 Top3。主对话模型偶尔会遗漏
+            # top_suggestions 字段，此时使用同一会话上下文单独生成建议，
+            # 不以固定文案冒充推荐。
+            if len(parsed["top_suggestions"]) != 3:
+                parsed["top_suggestions"] = self.generate_suggestions(
+                    TalkRequest(
+                        conversation_id=request.conversation_id,
+                        city=request.city,
+                        plan_context=request.plan_context,
+                        preference=request.preference,
+                        messages=[
+                            *request.messages,
+                            TalkMessage(role="user", content=request.message),
+                            TalkMessage(role="assistant", content=parsed["reply"]),
+                        ],
+                        message="",
+                    )
+                )
             return TalkResponse(
                 success=True,
-                **parsed,
+                reply=parsed["reply"],
+                intent=parsed["intent"],
+                change_request=parsed["change_request"],
+                change_set=parsed["change_set"],
+                top_suggestions=parsed["top_suggestions"],
+                preference=parsed["preference"],
+                done=parsed["done"],
             )
         except Exception as error:
             print(f"⚠️ 偏好对话失败，使用兜底回复: {type(error).__name__}: {error}")
-            # 降级:把用户本轮输入直接作为偏好，保证链路可用
             return TalkResponse(
                 success=True,
-                reply="好的，我已经记下你的偏好啦，可以直接开始规划行程～",
+                reply="我暂时没能理解这次修改要求，请换一种说法再试一次。",
                 preference=self.extract_preference(request.message),
                 intent="chat",
                 change_request=None,
+                change_set=None,
+                top_suggestions=[],
                 done=False,
             )
 
     def _build_prompt(self, request: TalkRequest) -> str:
         """把历史对话与本轮输入拼成一段上下文提示。"""
         lines = []
+        if request.city:
+            lines.append(
+                f"当前旅行计划目的地: {request.city}。用户提到大学、公园、酒店等未带城市的地点时，"
+                "必须理解为该目的地范围内的地点。"
+            )
+        if request.plan_context:
+            lines.append(f"当前行程摘要: {request.plan_context}")
+        if request.preference and request.preference.prompt:
+            lines.append(f"已知长期偏好: {request.preference.prompt}")
         for msg in request.messages:
             role = "用户" if msg.role == "user" else "顾问"
             lines.append(f"{role}: {msg.content}")
         lines.append(f"用户: {request.message}")
         history = "\n".join(lines)
         return f"以下是与用户的对话记录，请根据系统设定继续本轮回复:\n\n{history}"
+
+    def generate_suggestions(self, request: TalkRequest) -> list[str]:
+        """从已持久化的会话记忆恢复动态 Top3，不写入聊天记录。"""
+        try:
+            raw_reply = self.suggestion_agent.run(self._build_suggestion_prompt(request))
+            return self._parse_suggestions(raw_reply)
+        except Exception as error:
+            print(f"⚠️ Top3 建议生成失败: {type(error).__name__}: {error}")
+            return []
+
+    def _build_suggestion_prompt(self, request: TalkRequest) -> str:
+        lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
+        if request.plan_context:
+            lines.append(f"当前行程摘要: {request.plan_context}")
+        if request.preference and request.preference.prompt:
+            lines.append(f"已知长期偏好: {request.preference.prompt}")
+        if request.messages:
+            lines.append("聊天历史:")
+            for msg in request.messages:
+                role = "用户" if msg.role == "user" else "行旅助手"
+                lines.append(f"{role}: {msg.content}")
+        else:
+            lines.append("聊天历史为空；请仅根据当前行程提供下一步可调整项。")
+        lines.append("现在生成恰好 3 条建议。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_suggestions(raw_reply: str) -> list[str]:
+        text = (raw_reply or "").strip()
+        try:
+            if text.startswith("```"):
+                text = text.strip("`").removeprefix("json").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("未找到 JSON 对象")
+            data = json.loads(text[start:end + 1])
+            values = data.get("top_suggestions")
+            if not isinstance(values, list):
+                raise ValueError("top_suggestions 必须是数组")
+            suggestions = list(dict.fromkeys(
+                str(item).strip() for item in values if str(item).strip()
+            ))
+            if len(suggestions) != 3:
+                raise ValueError("top_suggestions 必须恰好包含 3 条建议")
+            return suggestions
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"Top3 建议结构化输出解析失败: {error}")
+            return []
 
     def _parse_reply(self, raw_reply: str) -> dict[str, Any]:
         """解析结构化语义结果；解析失败时安全降级为普通聊天。"""
@@ -122,12 +228,24 @@ class TalkAgent:
             elif isinstance(preference_data, str) and preference_data.strip():
                 preference = Preference(prompt=preference_data.strip())
             change_request = data.get("change_request")
-            if intent == "replan" and not str(change_request or "").strip():
-                raise ValueError("replan 缺少 change_request")
+            change_set_data = data.get("change_set")
+            change_set = ChangeSet.model_validate(change_set_data) if change_set_data else None
+            if intent == "replan" and change_set is None:
+                raise ValueError("replan 缺少 change_set")
+            if intent == "chat":
+                change_set = None
+            raw_suggestions = data.get("top_suggestions") or []
+            top_suggestions = []
+            if isinstance(raw_suggestions, list):
+                top_suggestions = list(dict.fromkeys(
+                    str(item).strip() for item in raw_suggestions if str(item).strip()
+                ))[:3]
             return {
                 "reply": str(data.get("reply") or "好的，我记下了。"),
                 "intent": intent,
                 "change_request": str(change_request).strip() if change_request else None,
+                "change_set": change_set,
+                "top_suggestions": top_suggestions,
                 "preference": preference,
                 "done": bool(data.get("done", preference is not None)),
             }
@@ -137,6 +255,8 @@ class TalkAgent:
                 "reply": text or "好的，我记下了。",
                 "intent": "chat",
                 "change_request": None,
+                "change_set": None,
+                "top_suggestions": [],
                 "preference": None,
                 "done": False,
             }

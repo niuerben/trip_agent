@@ -30,3 +30,6 @@ uv>=0.8.0
 # 其他工具
 python-dateutil>=2.8.2
 huggingface_hub>=0.25.0
+
+# POI 向量检索
+chromadb>=0.5.0

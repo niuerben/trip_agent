@@ -9,6 +9,7 @@
 - 🤖 **AI驱动的旅行规划**: 基于HelloAgents框架的SimpleAgent,智能生成详细的多日旅程
 - 🗺️ **高德地图集成**: 通过MCP协议接入高德地图服务,支持景点搜索、路线规划、天气查询
 - 🧠 **智能工具调用**: Agent自动调用高德地图MCP工具,获取实时POI、路线和天气信息
+- 🗃️ **POI向量缓存**: 使用 Chroma 持久化高德 POI 的名称、地址、POI ID 和 GCJ-02 坐标，规划前优先召回本地候选
 - 🎨 **现代化前端**: Vue3 + TypeScript + Vite,响应式设计,流畅的用户体验
 - 📱 **完整功能**: 包含住宿、交通、餐饮和景点游览时间推荐
 
@@ -18,6 +19,7 @@
 - **框架**: HelloAgents (基于SimpleAgent)
 - **API**: FastAPI
 - **MCP工具**: amap-mcp-server (高德地图)
+- **向量存储**: Chroma PersistentClient（仅缓存 POI，不缓存天气和路线）
 - **LLM**: 支持多种LLM提供商(OpenAI, DeepSeek等)
 
 ### 前端
@@ -93,7 +95,24 @@ cp .env.example .env
 # 编辑.env文件,填入你的API密钥
 ```
 
-5. 启动后端服务
+Chroma 配置项：
+
+```env
+CHROMA_PERSIST_DIRECTORY=data/chroma
+CHROMA_COLLECTION_NAME=amap_pois
+POI_VECTOR_TOP_K=10
+# Chroma 余弦距离阈值：越小越相似，超过阈值自动转高德 POI
+POI_VECTOR_DISTANCE_THRESHOLD=0.55
+```
+
+首次查询 POI 时，系统会将高德返回的 POI 写入 Chroma；后续规划会先按城市和偏好召回候选，天气与路线仍通过高德 MCP 实时查询。默认数据目录为 `backend/data/chroma/`，该目录属于本地可重建缓存，不应提交到 Git。
+
+5. 启动数据库
+```bash
+docker exec -it helloagents-trip-postgres psql -U postgres -d app
+```
+
+6. 启动后端服务
 ```bash
 uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -146,6 +165,17 @@ npm run dev
    - 交通路线规划
    - 天气预报
    - 餐饮推荐
+
+### 预热 POI 向量库
+
+可以在后端目录运行回填脚本，先为常用城市建立 POI 缓存：
+
+```bash
+cd backend
+python scripts/backfill_pois.py --city 深圳 --keywords 景点 公园 美食 酒店
+```
+
+脚本仍以高德返回的 POI 为权威来源，写入名称、地址、POI ID 和经纬度；它不会缓存天气或路线。
 
 ## 🔧 核心实现
 
