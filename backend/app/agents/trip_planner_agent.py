@@ -333,13 +333,25 @@ class TripPlannerAgent:
 
             # enrichment 先跑：校正坐标 + 用高德在城 POI 替换越界景点，
             # 再交给 validate 做最终闸门（修复失败才报错触发降级）。
-            trip_plan = self._enrich_attraction_images(
-                trip_plan,
-                city_center=city_center,
-                radius_km=radius_km,
-                target_adcode=scope_adcode,
-                amap_city=amap_city,
-            )
+            # 定向修改场景下跳过图片补齐（只需验证坐标），因为前端已有旧行程的图片，
+            # 而图片补齐涉及多个高德 API 调用会导致超时。
+            is_targeted_modification = request.current_plan and (request.change_set or request.change_request)
+            if is_targeted_modification:
+                print("定向修改模式：跳过图片补齐，仅验证坐标有效性")
+                TripPlannerAgent._enrich_meal_pois(
+                    trip_plan,
+                    city_center=city_center,
+                    radius_km=radius_km,
+                    target_adcode=scope_adcode,
+                )
+            else:
+                trip_plan = self._enrich_attraction_images(
+                    trip_plan,
+                    city_center=city_center,
+                    radius_km=radius_km,
+                    target_adcode=scope_adcode,
+                    amap_city=amap_city,
+                )
             validate_trip_plan(
                 trip_plan,
                 request,
