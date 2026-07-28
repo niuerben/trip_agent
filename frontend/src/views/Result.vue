@@ -225,7 +225,7 @@
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Location, TripFormData, TripPlan } from '@/types'
 import { enrichTripPlanImages, generateTripPlan, getChatHistory, getChatSuggestions, getRouteGeometry, sendChatMessage, type RouteGeometrySegment } from '@/services/api'
@@ -889,7 +889,14 @@ async function sendMessage() {
     const shouldReplan = Boolean(plan.value)
       && response.intent === 'replan'
       && Boolean(response.change_set?.operations?.length)
-    if (!shouldReplan || !plan.value) return
+    if (!shouldReplan || !plan.value) {
+      if (import.meta.env.DEV && response.intent === 'replan') {
+        console.warn('意图为 replan 但没有有效的 change_set，不触发重规划', { response })
+      }
+      return
+    }
+
+    console.log('🔄 触发重规划', { change_request: response.change_request, operations: response.change_set?.operations?.length })
 
     const currentPlan = plan.value
     const changeRequest = response.change_request?.trim() || text
@@ -920,6 +927,8 @@ async function sendMessage() {
       throw new Error(replanned.message || '重新规划失败')
     }
 
+    console.log('✅ 重规划成功，更新行程', { days: replanned.data.days.length })
+
     // 初次打开历史会话时，坐标/图片补齐可能仍在请求中。重新规划的结果已
     // 通过后端 Validator，含有当前路线所需的真实 POI 坐标；提升版本号可
     // 让旧请求的回包失效，防止它把新计划覆盖回旧计划。
@@ -928,6 +937,17 @@ async function sendMessage() {
     if (conversationId.value) {
       updateConversation(conversationId.value, replanned.data)
     }
+
+    // 强制刷新地图以确保路线立即显示
+    nextTick(() => {
+      renderMap()
+    })
+
+    chatMessages.value.push({
+      id: `local-${nextMessageId++}`,
+      role: 'assistant',
+      content: '✅ 行程已调整完成，请查看上方的路线安排。',
+    })
   } catch (error) {
     console.error('对话或重新规划失败:', error)
     const detail = error instanceof Error ? error.message : '未知错误'

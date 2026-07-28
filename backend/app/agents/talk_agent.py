@@ -14,7 +14,7 @@ from hello_agents import SimpleAgent
 
 # ============ Agent提示词 ============
 
-TALK_AGENT_PROMPT = f"""你是「行旅天下」的旅行偏好顾问。你的任务是通过自然、友好的多轮对话，
+TALK_AGENT_PROMPT = f”””你是「行旅天下」的旅行偏好顾问。你的任务是通过自然、友好的多轮对话，
 了解用户的旅行偏好，最终凝练成一段可供行程规划使用的偏好提示词。
 
 **你需要逐步了解(不要一次全问，围绕用户回答自然追问):**
@@ -25,12 +25,13 @@ TALK_AGENT_PROMPT = f"""你是「行旅天下」的旅行偏好顾问。你的�
 5. 同行人员(独自 / 情侣 / 家庭带娃 / 朋友)等其他关键约束
 
 **变更判定与 ChangeSet 规则:**
-1. 询问、闲聊或咨询建议时，intent 填 "chat"，change_set 填 null。
-2. 用户表达改计划、重排、替换、增加、删除或调整时，intent 必须填 "replan"，并直接输出可执行的 change_set，禁止追问后停住。
+1. 询问、闲聊或咨询建议时，intent 填 “chat”，change_set 填 null。
+2. **关键：用户表达「改计划」「调整」「替换」「删除」「增加」「合并」「移到」等修改意图时，intent 必须填 “replan”，直接输出可执行的 change_set，禁止追问。**
 3. 只能使用以下 operation：add_attraction、delete_attraction、replace_attraction、update_day、full_replan。
-4. 删除一类地点时，把类别写在 selector.semantic，例如“删除寺庙”输出 delete_attraction + semantic="寺庙"。
-5. 替换地点时，selector 指向旧地点，target 指向新地点或类别；“马峦山改大学”应输出 target.semantic="大学"。
-6. 用户只说“我要改计划”时，输出 full_replan。禁止输出 SQL、正则表达式或自然语言操作说明。
+4. **删除一类地点或某个具体景点时**，把名称写在 selector.semantic，例如”删除寺庙” → delete_attraction + semantic=”寺庙”；”删除深圳自然博物馆” → delete_attraction + semantic=”深圳自然博物馆”。
+5. **替换地点时**，用 replace_attraction；selector 指向旧地点的 semantic，target 指向新地点或类别的 semantic。例如”把马峦山改为大学” → replace_attraction + selector.semantic=”马峦山” + target.semantic=”大学”。
+6. **合并多个景点到同一天时**，既删除旧地点，又在目标天添加新地点。例如”把第2天的博物馆移到第1天” → delete_attraction(semantic=”深圳自然博物馆”) + add_attraction(target_day=1, semantic=”深圳自然博物馆”)。
+7. **用户只说「我要改计划」且没有具体修改内容时，输出 full_replan**。禁止输出 SQL、正则表达式或自然语言操作说明。
 
 **对话规则:**
 1. 每轮只温和地追问 1-2 个问题，语气亲切自然，避免一次抛出一长串问题。
@@ -40,22 +41,27 @@ TALK_AGENT_PROMPT = f"""你是「行旅天下」的旅行偏好顾问。你的�
 
 **严格返回格式:**
 {{
-  "reply": "给用户看的自然语言回复",
-  "intent": "chat 或 replan",
-  "change_request": "给日志和用户看的简短变更摘要，普通聊天时为 null",
-  "change_set": {{
-    "operations": [
-      {{"operation": "delete_attraction", "selector": {{"semantic": "寺庙"}}}}
+  “reply”: “给用户看的自然语言回复”,
+  “intent”: “chat 或 replan”,
+  “change_request”: “给日志和用户看的简短变更摘要，普通聊天时为 null”,
+  “change_set”: {{
+    “operations”: [
+      {{“operation”: “delete_attraction”, “selector”: {{“semantic”: “寺庙”}}}}
     ]
   }} 或 null,
-  "top_suggestions": ["建议1", "建议2", "建议3"],
-  "preference": {{"prompt": "稳定的用户旅行偏好"}} 或 null,
-  "done": true 或 false
+  “top_suggestions”: [“建议1”, “建议2”, “建议3”],
+  “preference”: {{“prompt”: “稳定的用户旅行偏好”}} 或 null,
+  “done”: true 或 false
 }}
 
-**示例:**
-{{"reply":"我会移除寺庙景点。","intent":"replan","change_request":"移除寺庙景点","change_set":{{"operations":[{{"operation":"delete_attraction","selector":{{"semantic":"寺庙"}}}}]}},"top_suggestions":["增加校园附近餐饮","把第二天安排得更轻松","添加一处室内景点"],"preference":null,"done":true}}
-"""
+**示例 1 (删除):**
+用户：”把第2天的深圳自然博物馆删掉，改成技术大学校园”
+回复：{{“reply”:”好的，我来调整行程。删除第2天的深圳自然博物馆，添加深圳技术大学校园。”,”intent”:”replan”,”change_request”:”删除第2天博物馆，添加技术大学校园”,”change_set”:{{“operations”:[{{“operation”:”delete_attraction”,”selector”:{{“semantic”:”深圳自然博物馆”}}}},{{“operation”:”add_attraction”,”target_day”:2,”semantic”:”深圳技术大学校园”}}]}},”top_suggestions”:[“把校园参观安排在上午”,”添加附近餐饮”,”查看校园附近的景点”],”preference”:null,”done”:true}}
+
+**示例 2 (合并):**
+用户：”把第2天的博物馆调到第1天下午，和马峦山合一天”
+回复：{{“reply”:”好的，我把博物馆移到第1天下午。”,”intent”:”replan”,”change_request”:”把博物馆从第2天移到第1天下午”,”change_set”:{{“operations”:[{{“operation”:”delete_attraction”,”selector”:{{“semantic”:”深圳自然博物馆”}}}},{{“operation”:”add_attraction”,”target_day”:1,”semantic”:”深圳自然博物馆”}}]}},”top_suggestions”:[“第1天会不会太紧张了”,”把第2天安排得更轻松”,”增加第2天的其他景点”],”preference”:null,”done”:true}}
+“””
 
 SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
 根据提供的目的地、当前行程、对话历史和已知偏好，生成恰好 3 条彼此不同、可直接点击发送的中文建议。
@@ -220,27 +226,41 @@ class TalkAgent:
             data = json.loads(text[start:end + 1])
             intent = data.get("intent")
             if intent not in {"chat", "replan"}:
-                raise ValueError("intent 必须是 chat 或 replan")
+                raise ValueError(f"intent 必须是 chat 或 replan，得到: {intent}")
+
             preference_data = data.get("preference")
             preference = None
             if isinstance(preference_data, dict) and preference_data.get("prompt"):
                 preference = Preference(prompt=str(preference_data["prompt"]).strip())
             elif isinstance(preference_data, str) and preference_data.strip():
                 preference = Preference(prompt=preference_data.strip())
+
             change_request = data.get("change_request")
             change_set_data = data.get("change_set")
-            change_set = ChangeSet.model_validate(change_set_data) if change_set_data else None
+            change_set = None
+
+            if change_set_data:
+                try:
+                    change_set = ChangeSet.model_validate(change_set_data)
+                except Exception as e:
+                    print(f"⚠️ change_set 验证失败: {e}，原始数据: {change_set_data}")
+                    if intent == "replan":
+                        raise ValueError(f"replan 的 change_set 验证失败: {e}")
+
             if intent == "replan" and change_set is None:
-                raise ValueError("replan 缺少 change_set")
+                raise ValueError(f"replan 缺少有效的 change_set（原始数据: {change_set_data}）")
+
             if intent == "chat":
                 change_set = None
+
             raw_suggestions = data.get("top_suggestions") or []
             top_suggestions = []
             if isinstance(raw_suggestions, list):
                 top_suggestions = list(dict.fromkeys(
                     str(item).strip() for item in raw_suggestions if str(item).strip()
                 ))[:3]
-            return {
+
+            result = {
                 "reply": str(data.get("reply") or "好的，我记下了。"),
                 "intent": intent,
                 "change_request": str(change_request).strip() if change_request else None,
@@ -249,8 +269,14 @@ class TalkAgent:
                 "preference": preference,
                 "done": bool(data.get("done", preference is not None)),
             }
+
+            if intent == "replan":
+                print(f"✅ 识别为重规划意图: change_request={result['change_request']}, operations={len(change_set.operations) if change_set else 0}")
+
+            return result
         except (TypeError, ValueError, json.JSONDecodeError) as error:
-            print(f"talk_agent 结构化输出解析失败，按普通聊天处理: {error}")
+            print(f"⚠️ talk_agent 结构化输出解析失败，按普通聊天处理: {error}")
+            print(f"   原始输出: {text[:200]}")
             return {
                 "reply": text or "好的，我记下了。",
                 "intent": "chat",

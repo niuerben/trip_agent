@@ -145,12 +145,13 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         preference = result.preference
         done = result.done
         print(
-            "对话语义判断: "
-            f"intent={intent}; change_request={change_request or '无'}; "
-            f"operations={len(change_set.operations) if change_set else 0}"
+            f"✅ 对话语义判定完成: intent={intent}; "
+            f"change_request={repr(change_request or '无')}; "
+            f"operations={len(change_set.operations) if change_set else 0}; "
+            f"top_suggestions={len(top_suggestions)}"
         )
     except Exception as error:
-        print(f"偏好对话服务不可用，使用兜底回复: {type(error).__name__}: {error}")
+        print(f"❌ 偏好对话服务不可用，使用兜底回复: {type(error).__name__}: {error}")
         reply = "好的，我已经记下你的偏好啦，可以直接开始规划行程～"
         preference = Preference(prompt=(request.message or "").strip())
         intent = "chat"
