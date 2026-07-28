@@ -335,9 +335,14 @@ class TripPlannerAgent:
             # 再交给 validate 做最终闸门（修复失败才报错触发降级）。
             # 定向修改场景下跳过图片补齐（只需验证坐标），因为前端已有旧行程的图片，
             # 而图片补齐涉及多个高德 API 调用会导致超时。
+            # 预加载证据场景也跳过图片补齐，转为异步 /trip/enrich-images 在前端完成，
+            # 避免规划路径被多个图片 API 请求阻塞超时。
             is_targeted_modification = request.current_plan and (request.change_set or request.change_request)
-            if is_targeted_modification:
-                print("定向修改模式：跳过图片补齐，仅验证坐标有效性")
+            skip_image_enrichment = is_targeted_modification or preloaded
+
+            if skip_image_enrichment:
+                skip_reason = "定向修改" if is_targeted_modification else "预加载证据"
+                print(f"跳过图片补齐（{skip_reason}模式）：转为前端异步加载，仅验证坐标有效性")
                 TripPlannerAgent._enrich_meal_pois(
                     trip_plan,
                     city_center=city_center,
