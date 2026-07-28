@@ -53,6 +53,16 @@ def valid_plan() -> dict:
             "description": "校园与美食路线",
             "transportation": "公共交通",
             "accommodation": "经济型酒店",
+            "hotel": {
+                "name": "坪山中心酒店",
+                "address": "坪山大道1号",
+                "location": {"longitude": 114.401, "latitude": 22.700},
+                "price_range": "200-300元",
+                "rating": "4.5",
+                "distance": "当日路线起终点",
+                "type": "经济型酒店",
+                "poi_id": "HOTEL1",
+            },
             "attractions": [{
                 "name": "深圳技术大学",
                 "address": "兰田路3002号",
@@ -124,8 +134,9 @@ class ValidatedPlanningReActTest(unittest.TestCase):
             "name": "缓存客家餐厅",
             "address": "坪山路1号",
             "longitude": 114.401,
-            "latitude": 22.700,
-            "type": "餐饮服务;中餐厅",
+                    "latitude": 22.700,
+                    "adcode": "440310",
+                    "type": "餐饮服务;中餐厅",
             "cost": "36",
         }
         session = PlanningSession(
@@ -225,6 +236,7 @@ class ValidatedPlanningReActTest(unittest.TestCase):
                     "address": "坪山测试路1号",
                     "longitude": 114.4,
                     "latitude": 22.7,
+                    "adcode": "440310",
                     "type": "测试类型",
                     "cost": "36",
                     "distance": 0.1,
@@ -243,6 +255,163 @@ class ValidatedPlanningReActTest(unittest.TestCase):
         self.assertEqual(evidence["meal"][0]["cost"], "36")
         self.assertNotIn("distance", evidence["attraction"][0])
 
+    def test_empty_chroma_refills_all_evidence_before_react(self) -> None:
+        """空缓存应由后端一次预取补齐，不把三类搜索留给模型逐轮偿还。"""
+        request = TripRequest(
+            city="广州越秀",
+            start_date="2026-07-27",
+            end_date="2026-07-29",
+            travel_days=3,
+            transportation="公共交通",
+            accommodation="经济型酒店",
+        )
+        session = PlanningSession(
+            request=request,
+            city_center=Location(longitude=113.266835, latitude=23.128537),
+            radius_km=25,
+            target_adcode="440104",
+            amap_city="广州市",
+            cached_pois=[],
+        )
+        calls = []
+        persisted = []
+
+        class FakePhotoService:
+            def search_pois(self, keywords, city, offset, *, persist):
+                calls.append((keywords, city, offset, persist))
+                if "餐馆" in keywords or "餐厅" in keywords:
+                    return [
+                        {
+                            "id": f"meal-{index}",
+                            "name": f"越秀餐馆{index}",
+                            "address": f"越秀路{index}号",
+                            "location": f"113.{266000 + index},23.128537",
+                            "adcode": "440104",
+                            "type": "餐饮服务;中餐厅",
+                            "typecode": "050100",
+                            "biz_ext": {"cost": "38"},
+                        }
+                        for index in range(1, 10)
+                    ]
+                if "景点" in keywords:
+                    return [{
+                        "id": "attraction-1",
+                        "name": "越秀公园",
+                        "address": "解放北路988号",
+                        "location": "113.264200,23.141600",
+                        "adcode": "440104",
+                        "type": "风景名胜;公园",
+                        "typecode": "110101",
+                    }]
+                return [{
+                    "id": "hotel-1",
+                    "name": "越秀经济型酒店",
+                    "address": "越秀路1号",
+                    "location": "113.267000,23.129000",
+                    "adcode": "440104",
+                    "type": "住宿服务;宾馆酒店",
+                    "typecode": "100100",
+                }]
+
+        class FakeStore:
+            def upsert_pois(self, pois, city):
+                persisted.extend((poi["id"], city) for poi in pois)
+
+        with (
+            patch(
+                "backend.app.agents.planning_react_agent.get_amap_photo_service",
+                return_value=FakePhotoService(),
+            ),
+            patch(
+                "backend.app.agents.planning_react_agent.get_poi_vector_store",
+                return_value=FakeStore(),
+            ),
+        ):
+            prepared = PlanningToolset(session).prepare_required_evidence()
+
+        self.assertTrue(prepared)
+        self.assertTrue(session.evidence_preloaded)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(city == "广州市" and persist is False for _, city, _, persist in calls))
+        meal_call = next(call for call in calls if "餐馆" in call[0])
+        self.assertGreaterEqual(meal_call[2], 18)
+        self.assertEqual(len(persisted), 11)
+
+    def test_out_of_city_candidates_are_not_evidence_or_cache(self) -> None:
+        session = PlanningSession(
+            request=TripRequest(
+                city="广州越秀",
+                start_date="2026-07-27",
+                end_date="2026-07-27",
+                travel_days=1,
+                transportation="公共交通",
+                accommodation="经济型酒店",
+            ),
+            city_center=Location(longitude=113.266835, latitude=23.128537),
+            radius_km=25,
+            target_adcode="440104",
+            amap_city="广州市",
+            cached_pois=[{
+                "poi_group": "meal",
+                "poi_id": "wrong-cache",
+                "name": "外地餐馆",
+                "address": "河北省",
+                "longitude": 116.8,
+                "latitude": 38.5,
+                "adcode": "130900",
+                "distance": 0.1,
+            }],
+        )
+        persisted = []
+
+        class FakePhotoService:
+            def search_pois(self, *_args, **_kwargs):
+                return [
+                    {
+                        "id": "gz-meal",
+                        "name": "越秀餐馆",
+                        "address": "越秀路1号",
+                        "location": "113.267000,23.129000",
+                        "adcode": "440104",
+                        "type": "餐饮服务;中餐厅",
+                        "typecode": "050100",
+                    },
+                    {
+                        "id": "wrong-amap",
+                        "name": "五台山餐馆",
+                        "address": "山西省",
+                        "location": "113.590117,38.967437",
+                        "adcode": "140922",
+                        "type": "餐饮服务;中餐厅",
+                        "typecode": "050100",
+                    },
+                ]
+
+        class FakeStore:
+            def upsert_pois(self, pois, city):
+                persisted.extend((poi["id"], city) for poi in pois)
+
+        with (
+            patch(
+                "backend.app.agents.planning_react_agent.get_amap_photo_service",
+                return_value=FakePhotoService(),
+            ),
+            patch(
+                "backend.app.agents.planning_react_agent.get_poi_vector_store",
+                return_value=FakeStore(),
+            ),
+        ):
+            result = json.loads(PlanningToolset(session).search_poi(json.dumps({
+                "purpose": "meal",
+                "query": "广州越秀平价餐馆",
+                "category": "餐饮服务",
+            }, ensure_ascii=False)))
+
+        self.assertEqual(result["source"], "amap")
+        self.assertEqual([item["poi_id"] for item in result["candidates"]], ["gz-meal"])
+        self.assertEqual(persisted, [("gz-meal", "广州市")])
+        self.assertNotIn("wrong-cache", session.evidence_ids["meal"])
+
     def test_validator_rejects_duplicate_meal_poi_and_long_route_leg(self) -> None:
         payload = valid_plan()
         meals = payload["days"][0]["meals"]
@@ -260,6 +429,14 @@ class ValidatedPlanningReActTest(unittest.TestCase):
 
         self.assertIn("MEAL_POI_DUPLICATE", codes)
         self.assertIn("ROUTE_LEG_TOO_LONG", codes)
+
+    def test_validator_requires_hotel_as_daily_route_anchor(self) -> None:
+        payload = valid_plan()
+        payload["days"][0]["hotel"] = None
+
+        issues = collect_trip_plan_issues(TripPlan.model_validate(payload), trip_request())
+
+        self.assertIn("HOTEL_MISSING", {issue.code for issue in issues})
 
     def test_invalid_model_output_becomes_observation_and_recovers(self) -> None:
         plan_json = json.dumps(valid_plan(), ensure_ascii=False, separators=(",", ":"))

@@ -12,6 +12,12 @@ from ..config import get_settings
 POI_GROUPS = ("attraction", "hotel", "meal")
 
 
+def normalize_city_key(city: str) -> str:
+    """统一高德“广州市”和产品“广州”的 Chroma 分区键。"""
+    value = (city or "").strip()
+    return value[:-1] if len(value) > 2 and value.endswith("市") else value
+
+
 def classify_poi_group(poi: dict[str, Any]) -> str | None:
     """把高德 POI 归入规划需要的三类，大类之外保留原始 type 给 Agent 判断小类。"""
     accessory_text = " ".join(
@@ -84,6 +90,7 @@ class PoiVectorStore:
         )
 
     def upsert_pois(self, pois: list[dict[str, Any]], city: str) -> None:
+        city = normalize_city_key(city)
         ids: list[str] = []
         documents: list[str] = []
         metadatas: list[dict[str, Any]] = []
@@ -127,6 +134,7 @@ class PoiVectorStore:
         poi_group: str | None = None,
         distance_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
+        city = normalize_city_key(city)
         if poi_group is not None and poi_group not in POI_GROUPS:
             raise ValueError(f"poi_group 必须是 {', '.join(POI_GROUPS)} 之一")
         if self.collection.count() == 0:

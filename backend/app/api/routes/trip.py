@@ -12,9 +12,11 @@ from sqlalchemy import text
 
 from ...agents.trip_planner_agent import (
     TripPlannerAgent,
+    _is_district_adcode,
     _is_district_request,
     get_trip_planner_agent,
 )
+from ...agents.planning_react_agent import PlanningLoopError
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
@@ -24,6 +26,13 @@ from .conversations import user_id_from_request
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 _PLANNER_LOG_LOCK = threading.Lock()
 _BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+_BACKGROUND_PLANNER_TASKS: set[asyncio.Task] = set()
+
+
+def _retain_background_planner_task(task: asyncio.Task) -> None:
+    """保留超时后仍在运行的规划线程，避免任务对象被垃圾回收。"""
+    _BACKGROUND_PLANNER_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_PLANNER_TASKS.discard)
 
 
 def _write_planner_input_log(
@@ -209,10 +218,19 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     timeout=settings.planner_init_timeout_seconds,
                 )
                 print("开始生成旅行计划...")
-                trip_plan = await asyncio.wait_for(
-                    asyncio.to_thread(agent.plan_trip, request, preference),
+                planner_task = asyncio.create_task(
+                    asyncio.to_thread(agent.plan_trip, request, preference)
+                )
+                _retain_background_planner_task(planner_task)
+                completed, _ = await asyncio.wait(
+                    {planner_task},
                     timeout=settings.planner_execution_timeout_seconds,
                 )
+                if not completed:
+                    # 不取消线程：requests/LLM 等同步调用无法可靠中断，
+                    # 但 API 必须在用户预算内立即返回 504。
+                    raise asyncio.TimeoutError
+                trip_plan = planner_task.result()
             except asyncio.TimeoutError as timeout_error:
                 agent_error = RuntimeError(
                     f"旅行规划超过 {settings.planner_execution_timeout_seconds} 秒总预算"
@@ -233,6 +251,27 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     status_code=504,
                     detail=f"{message}: {agent_error}",
                 ) from timeout_error
+            except PlanningLoopError as agent_error:
+                # ReAct 已按内部上限停止但未得到可交付 Draft；对用户统一表现为
+                # 规划超时/未完成，避免把 Agent 循环细节暴露成 422。线程本身由
+                # asyncio.to_thread 继续运行，直到它自然结束，用户侧仍严格受
+                # planner_execution_timeout_seconds 控制。
+                message = (
+                    "定向重规划未完成，原计划保持不变"
+                    if request.current_plan
+                    else "旅行计划生成超时"
+                )
+                _write_planner_review_log(
+                    status="rejected",
+                    request=request,
+                    preference=preference,
+                    preference_source=preference_source,
+                    error=agent_error,
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"{message}: {agent_error}",
+                ) from agent_error
             except Exception as agent_error:
                 message = (
                     "定向重规划未完成，原计划保持不变"
@@ -291,18 +330,23 @@ async def enrich_trip_images(plan: TripPlan):
     settings = get_settings()
     city_center = None
     target_adcode = None
+    amap_city = plan.city
     try:
         from ...services.amap_service import get_amap_service
 
         amap_service = get_amap_service()
-        city_center = amap_service.get_city_center(plan.city)
-        if _is_district_request(plan.city):
-            target_adcode = amap_service.get_city_adcode(plan.city)
+        city_center = await asyncio.to_thread(amap_service.get_city_center, plan.city)
+        city_adcode = await asyncio.to_thread(amap_service.get_city_adcode, plan.city)
+        get_search_city = getattr(amap_service, "get_poi_search_city", None)
+        if callable(get_search_city):
+            amap_city = await asyncio.to_thread(get_search_city, plan.city) or amap_city
+        if _is_district_request(plan.city) or _is_district_adcode(city_adcode):
+            target_adcode = city_adcode
     except Exception as error:
         print(f"历史计划行政区解析失败: {type(error).__name__}: {error}")
     radius_km = (
         settings.district_geo_radius_km
-        if _is_district_request(plan.city)
+        if target_adcode
         else settings.city_geo_radius_km
     )
     requires_poi_enrichment = any(
@@ -321,6 +365,7 @@ async def enrich_trip_images(plan: TripPlan):
             city_center,
             radius_km,
             target_adcode,
+            amap_city,
         )
     else:
         # 仅补天气的历史会话不再重复执行 POI 图片/坐标查询。

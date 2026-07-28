@@ -43,24 +43,28 @@ class Settings(BaseSettings):
     llm_model_id: str = "gpt-4o-mini"
     planner_mode: str = "auto"
     planner_init_timeout_seconds: int = 180
-    # 单次规划超过 60 秒视为结构性失败，避免用延长等待掩盖规划链路问题。
-    planner_execution_timeout_seconds: int = 60
+    # 用户端预算为 60 秒；预留约 5 秒给 HTTP/前端收尾，后端在 55 秒
+    # 时就返回明确的超时响应。
+    planner_execution_timeout_seconds: int = 55
     planner_max_tool_iterations: int = 4
     planner_max_react_steps: int = 6
     planner_max_stalled_steps: int = 2
-    # 无效响应允许重试次数；超过后立即终止 ReAct，避免空响应循环。
-    planner_max_invalid_responses: int = 1
+    # 无效响应允许重试次数；模型偶发空响应时多给几轮恢复机会，整体
+    # 用户等待仍由 planner_execution_timeout_seconds 统一控制。
+    planner_max_invalid_responses: int = 3
     # 同一 purpose 最多执行几次 refresh=true 的高德补查。
     planner_max_refresh_per_purpose: int = 1
     required_meal_types: str = "breakfast,lunch,dinner"
     planner_candidate_limit: int = 10
+    # Chroma 冷启动/嵌入模型下载不可阻塞首次规划；超时后改走高德预取。
+    planner_vector_retrieval_timeout_seconds: int = 3
     mcp_log_path: str = "logs/mcp_calls.log"
     planner_input_log_path: str = "logs/planner_inputs.log"
     planner_review_log_path: str = "logs/planner_reviews.log"
     agent_loop_log_path: str = "logs/agent_loop.log"
     # 必须小于 API 的整体 60 秒预算。同步 HTTP 调用无法被
     # asyncio.wait_for 可靠中断，因此在 LLM 客户端层先结束请求。
-    llm_timeout_seconds: int = 55
+    llm_timeout_seconds: int = 50
     llm_max_tokens: int = 4096
     # 首次完整规划由后端预取三类 POI 证据，避免模型为每类证据各发起一次
     # 串行 ReAct 调用。仅把少量、字段最小化的候选交给模型。
@@ -71,7 +75,9 @@ class Settings(BaseSettings):
     planner_preloaded_candidate_limit: int = 4
     # 餐饮不能因候选过少而在三餐/多天中重复同一 POI；完整规划至少展示
     # 每个必需餐次一个候选。相邻日程节点超过该直线距离即要求重新编排。
-    planner_max_daily_route_leg_km: float = 5.0
+    # 公共交通场景允许约 7 公里相邻跨片区；5 公里会把南山等狭长城区的
+    # 合理地铁/公交行程误判为无可行计划。
+    planner_max_daily_route_leg_km: float = 7.0
     chroma_persist_directory: str = "data/chroma"
     chroma_collection_name: str = "amap_pois"
     poi_vector_top_k: int = 10

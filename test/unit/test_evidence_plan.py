@@ -55,13 +55,22 @@ class EvidencePlanTest(unittest.TestCase):
             }
             for district in range(3)
         ]
+        hotels = [{
+            "poi_id": "hotel-1",
+            "name": "测试中心酒店",
+            "address": "测试中心路1号",
+            "location": "114.402,22.702",
+            "type": "住宿服务;经济型酒店",
+        }]
         session.evidence_records = {
             "meal": {item["poi_id"]: item for item in reversed(meals)},
             "attraction": {item["poi_id"]: item for item in reversed(attractions)},
+            "hotel": {item["poi_id"]: item for item in hotels},
         }
         session.evidence_ids = {
             "meal": set(session.evidence_records["meal"]),
             "attraction": set(session.evidence_records["attraction"]),
+            "hotel": set(session.evidence_records["hotel"]),
         }
 
         plan = TripPlannerAgent._build_evidence_plan(request, session)
@@ -69,6 +78,7 @@ class EvidencePlanTest(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(len({meal.poi_id for day in plan.days for meal in day.meals}), 9)
         self.assertEqual(len({item.poi_id for day in plan.days for item in day.attractions}), 3)
+        self.assertTrue(all(day.hotel and day.hotel.poi_id == "hotel-1" for day in plan.days))
         self.assertFalse(collect_trip_plan_issues(plan, request))
         result = PlanningToolset(session).validate_draft(plan.model_dump_json())
         self.assertIn('"passed": true', result)

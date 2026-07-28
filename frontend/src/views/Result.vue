@@ -8,7 +8,7 @@
 
     <div class="map-toolbar" aria-label="地图状态">
       <span class="map-live-dot"></span>
-      <span>{{ routeNodes.length ? `${routeNodes.length} 个路线节点` : '等待旅行计划' }}</span>
+      <span>{{ mapRouteNodes.length ? `${mapRouteNodes.length} 个路线节点` : '等待旅行计划' }}</span>
       <span v-if="mapRouteStatus" class="map-route-status">{{ mapRouteStatus }}</span>
       <span v-if="plan?.days?.length" class="map-day-legend">
         <span v-for="(_, index) in plan.days" :key="index"><i :style="{ backgroundColor: routeDayColor(index) }"></i>第{{ index + 1 }}天</span>
@@ -110,11 +110,6 @@
           <button class="replan-button" type="button" @click="startNewPlan">重新规划</button>
         </header>
 
-        <div v-if="plan.overall_suggestions" class="route-note">
-          <span class="route-note-icon">i</span>
-          <p>{{ plan.overall_suggestions }}</p>
-        </div>
-
         <section class="route-summary">
           <div><span>路线节点</span><strong>{{ routeNodes.length }}</strong></div>
           <div><span>旅行天数</span><strong>{{ plan.days?.length || 0 }} 天</strong></div>
@@ -123,13 +118,22 @@
 
         <section class="route-days">
           <div class="section-heading">
-            <div>
-              <p class="eyebrow">可拖拽调整顺序</p>
-              <h2>每日路线</h2>
-            </div>
-            <span class="map-hint">拖动节点，地图路线会同步更新</span>
+            <button class="route-days-title" type="button" @click="showAllRouteDays">
+              每日路线
+            </button>
           </div>
-          <article v-for="(day, dayIndex) in plan.days" :key="day.day_index" class="day-route">
+          <article
+            v-for="(day, dayIndex) in plan.days"
+            :key="day.day_index"
+            class="day-route"
+            :class="{ 'day-route-selected': selectedRouteDay === dayIndex }"
+            role="button"
+            tabindex="0"
+            :aria-pressed="selectedRouteDay === dayIndex"
+            @click="showRouteDay(dayIndex)"
+            @keydown.enter.prevent="showRouteDay(dayIndex)"
+            @keydown.space.prevent="showRouteDay(dayIndex)"
+          >
             <div class="day-route-header">
               <span class="day-number">{{ dayIndex + 1 }}</span>
               <div>
@@ -143,19 +147,41 @@
                 v-for="node in routeNodesForDay(dayIndex)"
                 :key="node.id"
                 class="route-node"
-                :class="`route-node-${node.type}`"
-                draggable="true"
-                @dragstart="startNodeDrag(node.id)"
-                @dragover.prevent
-                @drop="dropNode(node.id)"
+                :class="[
+                  `route-node-${node.type}`,
+                  {
+                    'route-node-fixed': node.type === 'hotel',
+                    'route-node-drop-before': dragOverNodeId === node.id && dragOverPosition === 'before',
+                    'route-node-drop-after': dragOverNodeId === node.id && dragOverPosition === 'after',
+                  },
+                ]"
+                :draggable="node.type !== 'hotel'"
+                :data-node-id="node.id"
+                :data-node-type="node.type"
+                :data-route-role="node.routeRole"
+                @dragstart.stop="startNodeDrag(node.id)"
+                @dragover.stop.prevent="updateDropPosition(node.id, $event)"
+                @dragleave="clearDropPosition(node.id)"
+                @drop.stop="dropNode(node.id, $event)"
                 @dragend="finishNodeDrag"
-                @click="focusNodeOnMap(node)"
+                @click.stop="focusNodeOnMap(node)"
               >
                 <span class="node-marker">{{ nodeIcon(node.type) }}</span>
                 <div class="node-content">
                   <div class="node-title-row">
                     <strong>{{ node.name }}</strong>
-                    <span class="drag-handle" aria-hidden="true">⠿</span>
+                    <span class="node-actions">
+                      <button
+                        v-if="node.type !== 'hotel'"
+                        class="node-delete"
+                        type="button"
+                        :aria-label="`删除${node.name}`"
+                        title="删除节点"
+                        @click.stop="requestNodeDeletion(node)"
+                      >×</button>
+                      <span v-if="node.type !== 'hotel'" class="drag-handle" aria-hidden="true">⠿</span>
+                      <span v-else class="fixed-label">固定</span>
+                    </span>
                   </div>
                   <p>{{ node.description }}</p>
                   <small v-if="node.address">{{ node.address }}</small>
@@ -212,6 +238,12 @@ const manualPanel = ref<HTMLElement | null>(null)
 const mapContainer = ref<HTMLElement | null>(null)
 const mapReady = ref(false)
 const routeNodes = ref<RouteNode[]>([])
+const selectedRouteDay = ref<number | null>(null)
+const mapRouteNodes = computed(() => (
+  selectedRouteDay.value === null
+    ? routeNodes.value
+    : routeNodes.value.filter((node) => node.dayIndex === selectedRouteDay.value)
+))
 const pdfExporting = ref(false)
 const chatInput = ref('')
 const chatSending = ref(false)
@@ -249,6 +281,11 @@ let mapInstance: any = null
 let mapMarkers: any[] = []
 let mapPolylines: any[] = []
 let mapRouteServices: any[] = []
+let activeGuideMarker: any = null
+let activeGuideFrame: number | null = null
+let activeGuidePathId: string | null = null
+let activeGuidePolylines: any[] = []
+const routePolylineBaseStyles = new Map<any, { strokeWeight: number; strokeOpacity: number }>()
 let mapRenderVersion = 0
 let amapNamespace: any = null
 const mapRouteStatus = ref('')
@@ -268,6 +305,8 @@ interface RouteNode {
   price?: string
   mealType?: string
   hotelType?: string
+  sourceIndex?: number
+  routeRole?: 'start' | 'end'
 }
 
 function hasMapLocation(location?: Location): boolean {
@@ -289,10 +328,28 @@ function rebuildRouteNodes(value: TripPlan | null) {
   const nodes: RouteNode[] = []
   value.days.forEach((day, dayIndex) => {
     const dayNodes: RouteNode[] = []
-    const addMealNodes = (meals: typeof day.meals, offset: number) => {
-      meals.filter((meal) => hasMapLocation(meal.location)).forEach((meal, mealIndex) => {
+    const makeHotelNode = (routeRole: 'start' | 'end'): RouteNode | null => {
+      if (!day.hotel || !hasMapLocation(day.hotel.location)) return null
+      return {
+        id: `day-${dayIndex}-hotel-${routeRole}`,
+        dayIndex,
+        type: 'hotel',
+        name: `${routeRole === 'start' ? '出发' : '返程'} · ${day.hotel.name}`,
+        description: routeRole === 'start' ? '当天从酒店出发' : '当天返回酒店休息',
+        address: day.hotel.address,
+        location: day.hotel.location,
+        price: day.hotel.price_range,
+        hotelType: day.hotel.type,
+        routeRole,
+      }
+    }
+    const startHotel = makeHotelNode('start')
+    if (startHotel) dayNodes.push(startHotel)
+    const addMealNodes = (meals: typeof day.meals) => {
+      meals.filter((meal) => hasMapLocation(meal.location)).forEach((meal) => {
+        const sourceIndex = day.meals.indexOf(meal)
         dayNodes.push({
-          id: `day-${dayIndex}-meal-${offset + mealIndex}`,
+          id: `day-${dayIndex}-meal-${sourceIndex}`,
           dayIndex,
           type: 'meal',
           name: meal.name,
@@ -301,6 +358,7 @@ function rebuildRouteNodes(value: TripPlan | null) {
           location: meal.location,
           cost: meal.estimated_cost,
           mealType: meal.type,
+          sourceIndex,
         })
       })
     }
@@ -308,7 +366,7 @@ function rebuildRouteNodes(value: TripPlan | null) {
     const lunch = day.meals.filter((meal) => meal.type === 'lunch')
     const dinner = day.meals.filter((meal) => meal.type === 'dinner')
     const otherMeals = day.meals.filter((meal) => !['breakfast', 'lunch', 'dinner'].includes(meal.type))
-    addMealNodes(breakfast, 0)
+    addMealNodes(breakfast)
     const attractionNodes = day.attractions
       .filter((attraction) => hasMapLocation(attraction.location))
       .map((attraction, attractionIndex) => ({
@@ -319,6 +377,7 @@ function rebuildRouteNodes(value: TripPlan | null) {
         description: `${attraction.visit_duration} 分钟 · ${attraction.description}`,
         address: attraction.address,
         location: attraction.location,
+        sourceIndex: attractionIndex,
       } satisfies RouteNode))
     // 同日景点按与上一站的空间距离排序，并以午餐把上午/下午行程自然分开。
     const nearbyAttractions = orderNodesByProximity(
@@ -327,26 +386,15 @@ function rebuildRouteNodes(value: TripPlan | null) {
     )
     const morningCount = Math.ceil(nearbyAttractions.length / 2)
     dayNodes.push(...nearbyAttractions.slice(0, morningCount))
-    addMealNodes(lunch, breakfast.length)
+    addMealNodes(lunch)
     dayNodes.push(...orderNodesByProximity(
       nearbyAttractions.slice(morningCount),
       dayNodes[dayNodes.length - 1]?.location,
     ))
-    addMealNodes(dinner, breakfast.length + lunch.length)
-    addMealNodes(otherMeals, breakfast.length + lunch.length + dinner.length)
-    if (day.hotel && hasMapLocation(day.hotel.location)) {
-      dayNodes.push({
-        id: `day-${dayIndex}-hotel`,
-        dayIndex,
-        type: 'hotel',
-        name: day.hotel.name,
-        description: day.hotel.address || day.hotel.type,
-        address: day.hotel.address,
-        location: day.hotel.location,
-        price: day.hotel.price_range,
-        hotelType: day.hotel.type,
-      })
-    }
+    addMealNodes(dinner)
+    addMealNodes(otherMeals)
+    const endHotel = makeHotelNode('end')
+    if (endHotel) dayNodes.push(endHotel)
     nodes.push(...dayNodes)
   })
   routeNodes.value = nodes
@@ -391,6 +439,18 @@ function routeNodesForDay(dayIndex: number) {
   return routeNodes.value.filter((node) => node.dayIndex === dayIndex)
 }
 
+function showRouteDay(dayIndex: number) {
+  if (selectedRouteDay.value === dayIndex) return
+  selectedRouteDay.value = dayIndex
+  renderMap()
+}
+
+function showAllRouteDays() {
+  if (selectedRouteDay.value === null) return
+  selectedRouteDay.value = null
+  renderMap()
+}
+
 function routeDayColor(dayIndex: number): string {
   return routeDayColors[dayIndex % routeDayColors.length]
 }
@@ -420,16 +480,21 @@ function buildMarkerOffsets(nodes: RouteNode[]): Map<string, { x: number; y: num
 }
 
 function nodeIcon(type: RouteNode['type']) {
-  return type === 'hotel' ? '⌂' : type === 'meal' ? '♨' : '●'
+  return type === 'hotel' ? 'H' : type === 'meal' ? '♨' : '●'
 }
 
 let draggingNodeId: string | null = null
+const dragOverNodeId = ref<string | null>(null)
+const dragOverPosition = ref<'before' | 'after' | null>(null)
 function startNodeDrag(id: string) {
+  if (routeNodes.value.find((node) => node.id === id)?.type === 'hotel') return
   draggingNodeId = id
 }
 
 function finishNodeDrag() {
   draggingNodeId = null
+  dragOverNodeId.value = null
+  dragOverPosition.value = null
 }
 
 function focusNodeOnMap(node: RouteNode) {
@@ -443,16 +508,53 @@ function focusNodeOnMap(node: RouteNode) {
   mapInstance.setZoomAndCenter(16, [node.location.longitude, node.location.latitude], false, 500)
 }
 
-function dropNode(targetId: string) {
+function updateDropPosition(targetId: string, event: DragEvent) {
   if (!draggingNodeId || draggingNodeId === targetId) return
+  const target = routeNodes.value.find((node) => node.id === targetId)
+  if (!target || target.type === 'hotel') return
+  const element = event.currentTarget as HTMLElement | null
+  if (!element) return
+  const bounds = element.getBoundingClientRect()
+  dragOverNodeId.value = targetId
+  dragOverPosition.value = event.clientY >= bounds.top + bounds.height / 2 ? 'after' : 'before'
+}
+
+function clearDropPosition(targetId: string) {
+  if (dragOverNodeId.value !== targetId) return
+  dragOverNodeId.value = null
+  dragOverPosition.value = null
+}
+
+function dropNode(targetId: string, event: DragEvent) {
+  if (!draggingNodeId || draggingNodeId === targetId) return
+  updateDropPosition(targetId, event)
   const sourceIndex = routeNodes.value.findIndex((node) => node.id === draggingNodeId)
-  const targetIndex = routeNodes.value.findIndex((node) => node.id === targetId)
+  let targetIndex = routeNodes.value.findIndex((node) => node.id === targetId)
   if (sourceIndex < 0 || targetIndex < 0) return
-  if (routeNodes.value[sourceIndex].dayIndex !== routeNodes.value[targetIndex].dayIndex) return
+  const source = routeNodes.value[sourceIndex]
+  const target = routeNodes.value[targetIndex]
+  if (source.type === 'hotel' || target.type === 'hotel') return
+  if (source.dayIndex !== target.dayIndex) return
+  const insertAfter = dragOverPosition.value === 'after'
   const [moved] = routeNodes.value.splice(sourceIndex, 1)
-  routeNodes.value.splice(sourceIndex < targetIndex ? targetIndex - 1 : targetIndex, 0, moved)
-  draggingNodeId = null
+  targetIndex = routeNodes.value.findIndex((node) => node.id === targetId)
+  routeNodes.value.splice(targetIndex + (insertAfter ? 1 : 0), 0, moved)
+  finishNodeDrag()
   renderMap()
+}
+
+function requestNodeDeletion(node: RouteNode) {
+  if (!plan.value || node.type === 'hotel' || node.sourceIndex === undefined) return
+  if (!window.confirm(`确认从第 ${node.dayIndex + 1} 天路线中删除“${node.name}”吗？`)) return
+  const day = plan.value.days[node.dayIndex]
+  if (!day) return
+  if (node.type === 'meal') {
+    day.meals.splice(node.sourceIndex, 1)
+  } else {
+    day.attractions.splice(node.sourceIndex, 1)
+  }
+  if (focusedNode.value?.id === node.id) focusedNode.value = null
+  if (conversationId.value) updateConversation(conversationId.value, plan.value)
 }
 
 async function initMap() {
@@ -482,8 +584,10 @@ async function initMap() {
 }
 
 function clearRouteOverlays() {
+  stopRouteGuideCar()
   mapPolylines.forEach((polyline) => polyline.setMap(null))
   mapPolylines = []
+  routePolylineBaseStyles.clear()
   mapRouteServices.forEach((service) => service.clear?.())
   mapRouteServices = []
 }
@@ -495,7 +599,7 @@ async function renderMap() {
   mapMarkers = []
   clearRouteOverlays()
 
-  const locatedNodes = routeNodes.value.filter((node) => node.location)
+  const locatedNodes = mapRouteNodes.value.filter((node) => node.location)
   if (!locatedNodes.length) {
     mapRouteStatus.value = ''
     return
@@ -536,11 +640,12 @@ async function renderMap() {
   })
   mapInstance.setFitView(mapMarkers, false, [100, 100, 100, 100])
   const dailyRoutes = (plan.value?.days || [])
-    .map((day, dayIndex) => ({
-      dayIndex,
+    .filter((_, dayIndex) => selectedRouteDay.value === null || selectedRouteDay.value === dayIndex)
+    .map((day) => ({
+      dayIndex: day.day_index,
       city: plan.value?.city || '',
       useTransit: /公共交通|地铁|公交/.test(day.transportation || ''),
-      nodes: routeNodesForDay(dayIndex),
+      nodes: routeNodesForDay(day.day_index),
     }))
     .filter((route) => route.nodes.length >= 2)
   if (!dailyRoutes.length) {
@@ -558,30 +663,149 @@ async function renderMap() {
   const roadCount = completed.filter((result) => result.road).length
   const transitCount = completed.filter((result) => result.transit).length
   mapRouteStatus.value = roadCount
-    ? `已绘制 ${roadCount}/${routeLegs.length} 段道路${transitCount ? ` · ${transitCount} 段地铁/公交` : ''}`
+    ? `已绘制 ${roadCount}/${routeLegs.length} 段道路${transitCount ? ` · ${transitCount} 段地铁/公交` : ''} · 点击路线查看行进方向`
     : '道路路线暂不可用，仅显示地点标记'
 }
 
-function addGeometrySegments(segments: RouteGeometrySegment[], layer: 'road' | 'transit', dayIndex: number) {
+function addGeometrySegments(
+  segments: RouteGeometrySegment[],
+  layer: 'road' | 'transit',
+  dayIndex: number,
+  onClick?: () => void,
+): any[] {
+  const polylines: any[] = []
   segments.forEach((segment) => {
     if (segment.points.length < 2) return
+    const strokeWeight = layer === 'road' ? 8 : (segment.kind === 'subway' ? 10 : 7)
+    const strokeOpacity = layer === 'road' ? 0.78 : 0.92
     const polyline = new amapNamespace.Polyline({
       path: segment.points,
-      // 颜色仅表达日期；道路实线、公共交通虚线和线宽表达交通层。
+      // 颜色仅表达日期；所有路线均用实线与连续箭头表达行进方向。
       strokeColor: routeDayColor(dayIndex),
-      strokeWeight: layer === 'road' ? 8 : (segment.kind === 'subway' ? 10 : 7),
-      strokeOpacity: layer === 'road' ? 0.78 : 0.92,
-      strokeStyle: layer === 'road' ? 'solid' : 'dashed',
+      strokeWeight,
+      strokeOpacity,
+      strokeStyle: 'solid',
+      showDir: true,
       isOutline: true,
       borderWeight: layer === 'road' ? 2 : 3,
       outlineColor: '#ffffff',
       lineJoin: 'round',
       lineCap: 'round',
+      cursor: 'pointer',
       zIndex: layer === 'road' ? 20 : 30,
     })
+    routePolylineBaseStyles.set(polyline, { strokeWeight, strokeOpacity })
+    polyline.on('click', () => onClick?.())
     polyline.setMap(mapInstance)
     mapPolylines.push(polyline)
+    polylines.push(polyline)
   })
+  return polylines
+}
+
+function routeGuideCarContent(dayIndex: number): string {
+  const color = routeDayColor(dayIndex)
+  return `<span style="display:block;width:34px;height:44px;filter:drop-shadow(0 3px 4px rgba(28,46,63,.35))" title="第${dayIndex + 1}天路线方向"><svg width="34" height="44" viewBox="0 0 34 44" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M10 4.5C10.8 2.2 13 1 15.4 1h3.2C21 1 23.2 2.2 24 4.5l2.5 7.3c2.2 1 3.5 3.1 3.5 5.5v17.2c0 2.5-2 4.5-4.5 4.5h-17C6 39 4 37 4 34.5V17.3c0-2.4 1.3-4.5 3.5-5.5L10 4.5Z" fill="${color}" stroke="#fff" stroke-width="2"/><path d="m11.2 7.2-1.5 6.1h14.6l-1.5-6.1c-.4-1.3-1.5-2.2-2.9-2.2h-5.8c-1.4 0-2.5.9-2.9 2.2Z" fill="#dff3ff"/><rect x="9" y="18" width="16" height="10" rx="3" fill="#fff" fill-opacity=".2"/><circle cx="10" cy="33" r="2.3" fill="#fff"/><circle cx="24" cy="33" r="2.3" fill="#fff"/><rect x="8" y="39" width="6" height="3" rx="1.5" fill="#24384a"/><rect x="20" y="39" width="6" height="3" rx="1.5" fill="#24384a"/><text x="17" y="25.5" text-anchor="middle" fill="#fff" font-size="9" font-family="system-ui,sans-serif" font-weight="700">${dayIndex + 1}</text></svg></span>`
+}
+
+function normalizeRoutePath(points: [number, number][]): [number, number][] {
+  return points.filter((point, index) => {
+    const previous = points[index - 1]
+    return !previous || previous[0] !== point[0] || previous[1] !== point[1]
+  })
+}
+
+function routePathLengthKm(path: [number, number][]): number {
+  return path.slice(1).reduce((total, point, index) => {
+    const previous = path[index]
+    const latitudeScale = Math.cos(((previous[1] + point[1]) / 2) * Math.PI / 180)
+    const longitudeKm = (point[0] - previous[0]) * 111.32 * latitudeScale
+    const latitudeKm = (point[1] - previous[1]) * 110.57
+    return total + Math.hypot(longitudeKm, latitudeKm)
+  }, 0)
+}
+
+function stopRouteGuideCar() {
+  if (activeGuideFrame !== null) {
+    window.cancelAnimationFrame(activeGuideFrame)
+    activeGuideFrame = null
+  }
+  activeGuideMarker?.setMap(null)
+  activeGuideMarker = null
+  activeGuidePathId = null
+  activeGuidePolylines.forEach((polyline) => {
+    const baseStyle = routePolylineBaseStyles.get(polyline)
+    if (baseStyle) polyline.setOptions(baseStyle)
+  })
+  activeGuidePolylines = []
+}
+
+function playRouteGuideCar(target: {
+  id: string
+  dayIndex: number
+  origin: RouteNode
+  destination: RouteNode
+  path: [number, number][]
+  polylines: any[]
+}) {
+  const path = normalizeRoutePath(target.path)
+  if (!mapInstance || !amapNamespace || path.length < 2) return
+
+  stopRouteGuideCar()
+  activeGuidePathId = target.id
+  activeGuidePolylines = target.polylines
+  activeGuidePolylines.forEach((polyline) => {
+    const baseStyle = routePolylineBaseStyles.get(polyline)
+    if (!baseStyle) return
+    polyline.setOptions({
+      strokeWeight: baseStyle.strokeWeight + 3,
+      strokeOpacity: 1,
+    })
+  })
+
+  const marker = new amapNamespace.Marker({
+    position: path[0],
+    title: `${target.origin.name} → ${target.destination.name}`,
+    anchor: 'center',
+    content: routeGuideCarContent(target.dayIndex),
+    zIndex: 90,
+  })
+  marker.setMap(mapInstance)
+  activeGuideMarker = marker
+  mapRouteStatus.value = `正在演示：${target.origin.name} → ${target.destination.name}`
+
+  const cumulativeDistances = [0]
+  for (let index = 1; index < path.length; index += 1) {
+    cumulativeDistances.push(cumulativeDistances[index - 1] + routePathLengthKm([path[index - 1], path[index]]))
+  }
+  const totalDistance = cumulativeDistances[cumulativeDistances.length - 1]
+  // 车辆演示速度降为原来的一半，给用户足够时间辨认路线方向。
+  const duration = Math.round(Math.max(3200, Math.min(6400, routePathLengthKm(path) * 840)))
+  const startedAt = performance.now()
+
+  const animate = (now: number) => {
+    if (activeGuidePathId !== target.id || activeGuideMarker !== marker) return
+    const progress = ((now - startedAt) % duration) / duration
+    const distance = totalDistance * progress
+    let segmentIndex = 1
+    while (segmentIndex < cumulativeDistances.length && cumulativeDistances[segmentIndex] < distance) {
+      segmentIndex += 1
+    }
+    const startIndex = Math.max(0, segmentIndex - 1)
+    const segmentStart = cumulativeDistances[startIndex]
+    const segmentEnd = cumulativeDistances[segmentIndex] || segmentStart
+    const segmentProgress = segmentEnd === segmentStart ? 0 : (distance - segmentStart) / (segmentEnd - segmentStart)
+    const start = path[startIndex]
+    const end = path[segmentIndex] || start
+    const heading = Math.atan2(end[0] - start[0], end[1] - start[1]) * 180 / Math.PI
+    marker.setAngle?.(heading)
+    marker.setPosition([
+      start[0] + (end[0] - start[0]) * segmentProgress,
+      start[1] + (end[1] - start[1]) * segmentProgress,
+    ])
+    activeGuideFrame = window.requestAnimationFrame(animate)
+  }
+  activeGuideFrame = window.requestAnimationFrame(animate)
 }
 
 async function drawRouteLeg(
@@ -600,9 +824,35 @@ async function drawRouteLeg(
     if (renderVersion !== mapRenderVersion) return { road: false, transit: false }
     const roadSegments = roadResponse.data?.segments || []
     const transitSegments = transitResponse?.data?.segments || []
-    addGeometrySegments(roadSegments, 'road', leg.dayIndex)
-    addGeometrySegments(transitSegments, 'transit', leg.dayIndex)
-    return { road: roadSegments.length > 0, transit: transitSegments.length > 0 }
+    const roadPath = normalizeRoutePath(roadSegments.flatMap((segment) => segment.points))
+    const transitPath = normalizeRoutePath(transitSegments.flatMap((segment) => segment.points))
+    let roadPolylines: any[] = []
+    let transitPolylines: any[] = []
+    const routeId = `${leg.dayIndex}:${leg.origin.id}:${leg.destination.id}`
+    roadPolylines = addGeometrySegments(roadSegments, 'road', leg.dayIndex, () => {
+      playRouteGuideCar({
+        id: `${routeId}:road`,
+        dayIndex: leg.dayIndex,
+        origin: leg.origin,
+        destination: leg.destination,
+        path: roadPath,
+        polylines: roadPolylines,
+      })
+    })
+    transitPolylines = addGeometrySegments(transitSegments, 'transit', leg.dayIndex, () => {
+      playRouteGuideCar({
+        id: `${routeId}:transit`,
+        dayIndex: leg.dayIndex,
+        origin: leg.origin,
+        destination: leg.destination,
+        path: transitPath,
+        polylines: transitPolylines,
+      })
+    })
+    return {
+      road: roadSegments.length > 0,
+      transit: transitSegments.length > 0,
+    }
   } catch (error) {
     console.warn('路线几何加载失败:', error)
     return { road: false, transit: false }
@@ -777,6 +1027,7 @@ function loadConversation() {
   conversationId.value = null
   chatMessages.value = []
   topKSuggestions.value = []
+  selectedRouteDay.value = null
 
   try {
     const routeConversationId = typeof route.query.conversation === 'string'
@@ -940,19 +1191,17 @@ function needsPlanEnrichment(value: TripPlan) {
 .route-collapse-button:hover, .route-expand-button:hover { border-color: #8bb6e8; background: #f1f7ff; color: #1768d4; }
 .route-panel-collapsed { width: 48px; min-width: 48px; height: 48px; top: 16px; right: 18px; overflow: hidden; border-radius: 14px; }
 .route-expand-button { width: 100%; height: 100%; border: 0; font-size: 27px; line-height: 1; }
-.route-panel .result-header, .route-panel .route-note, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 22px; margin-right: 22px; }
+.route-panel .result-header, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 22px; margin-right: 22px; }
 .route-panel .result-header { margin-top: 22px; margin-bottom: 16px; }
 .route-panel .result-header h1 { font-size: 29px; line-height: 1.15; }.route-panel .eyebrow { margin-bottom: 5px; }
 .replan-button { padding: 8px 13px; border: 1px solid #1768d4; border-radius: 9px; background: #fff; color: #1768d4; cursor: pointer; white-space: nowrap; }
-.route-note { display: flex; gap: 10px; margin-bottom: 14px; padding: 12px 14px; border: 1px solid #c8e0fa; border-radius: 12px; background: #eef7ff; color: #52667d; font-size: 12px; line-height: 1.6; }
-.route-note p { margin: 0; }.route-note-icon { flex: 0 0 19px; width: 19px; height: 19px; display: grid; place-items: center; border: 1px solid #2779dd; border-radius: 50%; color: #2779dd; font-weight: 700; }
 .route-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-bottom: 22px; }
 .route-summary > div { display: flex; flex-direction: column; gap: 4px; padding: 11px 12px; border: 1px solid #e4ebf2; border-radius: 11px; background: rgba(249,251,253,.84); }.route-summary span { color: #8492a1; font-size: 11px; }.route-summary strong { color: #25384c; font-size: 16px; }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }.section-heading h2 { margin: 0; color: #23384e; font-size: 20px; }.map-hint { color: #8a98a7; font-size: 11px; white-space: nowrap; }
-.day-route { margin-bottom: 16px; padding: 15px 15px 16px; border: 1px solid #e1eaf1; border-radius: 14px; background: rgba(255,255,255,.8); }.day-route-header { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #edf1f5; }.day-route-header h3 { margin: 0 0 3px; color: #263b51; font-size: 15px; }.day-route-header p { margin: 0; color: #8492a1; font-size: 11px; line-height: 1.45; }.day-route-header .transport { margin-left: auto; color: #637589; font-size: 11px; }
+.route-days .section-heading { margin-bottom: 10px; }.route-days-title { padding: 0; border: 0; background: transparent; color: #263b51; font-size: 21px; font-weight: 700; cursor: pointer; }.route-days-title:hover { color: #1768d4; }.day-route { margin-bottom: 16px; padding: 15px 15px 16px; border: 1px solid #e1eaf1; border-radius: 14px; background: rgba(255,255,255,.8); cursor: pointer; transition: border-color .16s, box-shadow .16s; }.day-route-selected { border-color: #68a5eb; box-shadow: 0 0 0 2px rgba(23,104,212,.12); }.day-route-header { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #edf1f5; }.day-route-header h3 { margin: 0 0 3px; color: #263b51; font-size: 15px; }.day-route-header p { margin: 0; color: #8492a1; font-size: 11px; line-height: 1.45; }.day-route-header .transport { margin-left: auto; color: #637589; font-size: 11px; }
 .day-number { width: 31px; height: 31px; display: grid; place-items: center; flex: 0 0 31px; border-radius: 9px; background: #1768d4; color: #fff; font-weight: 700; }
-.route-track { position: relative; display: flex; flex-direction: column; gap: 8px; padding: 13px 0 0 16px; }.route-track::before { content: ''; position: absolute; top: 16px; bottom: 16px; left: 28px; width: 2px; background: linear-gradient(#75a9e9, #c7d8e8); }.route-node { position: relative; z-index: 1; display: flex; align-items: flex-start; gap: 10px; min-height: 54px; padding: 9px 10px; border: 1px solid transparent; border-radius: 10px; background: rgba(247,250,253,.9); cursor: grab; transition: border-color .16s, background .16s, transform .16s; }.route-node:hover { border-color: #a7c9ef; background: #f3f8ff; transform: translateX(2px); }.route-node:active { cursor: grabbing; }.node-marker { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 25px; border-radius: 50%; background: #1768d4; color: #fff; font-size: 12px; font-weight: 700; box-shadow: 0 0 0 4px #fff; }.route-node-hotel .node-marker { background: #8b5cf6; }.route-node-meal .node-marker { background: #e58a35; }.node-content { min-width: 0; flex: 1; }.node-title-row { display: flex; align-items: center; gap: 8px; }.node-title-row strong { overflow: hidden; color: #2d4054; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }.drag-handle { margin-left: auto; color: #9aabb9; font-size: 17px; line-height: 1; }.node-content p { margin: 3px 0; overflow: hidden; color: #617487; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.node-content small { display: block; overflow: hidden; color: #93a0ad; font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.route-empty { padding: 12px; color: #99a6b2; font-size: 12px; }
+.route-track { position: relative; display: flex; flex-direction: column; gap: 8px; padding: 13px 0 0 16px; }.route-track::before { content: ''; position: absolute; top: 16px; bottom: 16px; left: 28px; width: 2px; background: linear-gradient(#75a9e9, #c7d8e8); }.route-node { position: relative; z-index: 1; display: flex; align-items: flex-start; gap: 10px; min-height: 54px; padding: 9px 10px; border: 1px solid transparent; border-radius: 10px; background: rgba(247,250,253,.9); cursor: grab; transition: border-color .16s, background .16s, transform .16s; }.route-node:hover { border-color: #a7c9ef; background: #f3f8ff; transform: translateX(2px); }.route-node:active { cursor: grabbing; }.route-node-fixed { background: rgba(246,243,255,.92); cursor: default; }.route-node-drop-before::before,.route-node-drop-after::after { content: ''; position: absolute; left: 8px; right: 8px; height: 3px; border-radius: 99px; background: #1768d4; box-shadow: 0 0 0 2px #fff; }.route-node-drop-before::before { top: -6px; }.route-node-drop-after::after { bottom: -6px; }.node-marker { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 25px; border-radius: 50%; background: #1768d4; color: #fff; font-size: 12px; font-weight: 700; box-shadow: 0 0 0 4px #fff; }.route-node-hotel .node-marker { background: #8b5cf6; }.route-node-meal .node-marker { background: #e58a35; }.node-content { min-width: 0; flex: 1; }.node-title-row { display: flex; align-items: center; gap: 8px; }.node-title-row strong { overflow: hidden; color: #2d4054; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }.node-actions { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; }.drag-handle { color: #9aabb9; font-size: 17px; line-height: 1; }.node-delete { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #a1adba; font: 18px/1 system-ui,sans-serif; cursor: pointer; }.node-delete:hover { border-color: #ffc9c9; background: #fff1f0; color: #d9363e; }.fixed-label { color: #8b78b8; font-size: 10px; font-weight: 600; }.node-content p { margin: 3px 0; overflow: hidden; color: #617487; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.node-content small { display: block; overflow: hidden; color: #93a0ad; font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }.route-empty { padding: 12px; color: #99a6b2; font-size: 12px; }
 .weather-section { margin-top: 24px; }.weather-section .section-heading { align-items: center; }.weather-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px; }.weather-item { display: flex; flex-direction: column; gap: 5px; padding: 11px; border: 1px solid #e4ebf2; border-radius: 10px; background: rgba(249,251,253,.82); }.weather-item strong { color: #344b62; font-size: 11px; }.weather-item span, .weather-item small { color: #718397; font-size: 10px; }.weather-unavailable { color: #8a98a7 !important; }
 @media (max-width: 1100px) { .route-panel { width: min(510px, calc(100% - 350px)); min-width: 350px; }.conversation-float { width: 315px; } }
-@media (max-width: 760px) { .map-toolbar { top: 10px; left: 10px; }.conversation-float { left: 10px; bottom: 10px; width: calc(100% - 20px); height: 275px; }.conversation-float .conversation-messages { padding: 12px 14px; }.route-panel { top: 10px; right: 10px; width: calc(100% - 20px); min-width: 0; height: calc(100% - 295px); border-radius: 14px; }.route-panel .manual-toolbar { padding: 13px 16px 11px; }.route-panel .result-header, .route-panel .route-note, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 16px; margin-right: 16px; }.route-panel .result-header h1 { font-size: 23px; }.route-summary { grid-template-columns: repeat(2, 1fr); }.route-summary > div:last-child { grid-column: 1 / -1; }.map-hint { display: none; } }
+@media (max-width: 760px) { .map-toolbar { top: 10px; left: 10px; }.conversation-float { left: 10px; bottom: 10px; width: calc(100% - 20px); height: 275px; }.conversation-float .conversation-messages { padding: 12px 14px; }.route-panel { top: 10px; right: 10px; width: calc(100% - 20px); min-width: 0; height: calc(100% - 295px); border-radius: 14px; }.route-panel .manual-toolbar { padding: 13px 16px 11px; }.route-panel .result-header, .route-panel .route-summary, .route-panel .route-days, .route-panel .weather-section, .route-panel > .ant-empty { margin-left: 16px; margin-right: 16px; }.route-panel .result-header h1 { font-size: 23px; }.route-summary { grid-template-columns: repeat(2, 1fr); }.route-summary > div:last-child { grid-column: 1 / -1; }.map-hint { display: none; } }
 </style>

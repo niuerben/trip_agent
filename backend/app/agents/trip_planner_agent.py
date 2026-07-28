@@ -3,8 +3,8 @@
 import json
 import math
 import re
-from itertools import permutations
-from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations, permutations, product
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, timedelta
 from typing import Optional
 from ..services.llm_service import get_llm
@@ -13,6 +13,7 @@ from ..models.schemas import (
     ChangeOperation,
     ChangeSet,
     DayPlan,
+    Hotel,
     Location,
     Meal,
     Preference,
@@ -83,6 +84,12 @@ def _is_district_request(city: str) -> bool:
     return bool(_district_keyword(city))
 
 
+def _is_district_adcode(adcode: Optional[str]) -> bool:
+    """高德六位 adcode 末两位非 00 时表示区县级行政区。"""
+    value = str(adcode or "").strip()
+    return len(value) == 6 and value.isdigit() and not value.endswith("00")
+
+
 class TripPlannerAgent:
     """准备规划上下文并委托给受 Validator 约束的 ReAct Agent。"""
 
@@ -121,26 +128,56 @@ class TripPlannerAgent:
             settings = get_settings()
             city_center = None
             city_adcode = None
+            amap_city = _normalize_city_for_amap(request.city)
             try:
                 from ..services.amap_service import get_amap_service
 
                 amap_service = get_amap_service()
                 city_center = amap_service.get_city_center(request.city)
                 city_adcode = amap_service.get_city_adcode(request.city)
+                get_search_city = getattr(amap_service, "get_poi_search_city", None)
+                if callable(get_search_city):
+                    amap_city = get_search_city(request.city) or amap_city
             except Exception as error:
                 print(f"⚠️ 目标行政区解析失败: {type(error).__name__}: {error}")
 
+            district_scope = (
+                _is_district_request(request.city)
+                or _is_district_adcode(city_adcode)
+            )
             radius_km = (
                 settings.district_geo_radius_km
-                if _is_district_request(request.city)
+                if district_scope
                 else settings.city_geo_radius_km
             )
-            scope_adcode = city_adcode if _is_district_request(request.city) else None
-            vector_pois = self._retrieve_cached_pois(
-                request,
-                preference,
-                adcode=scope_adcode,
-            )
+            scope_adcode = city_adcode if district_scope else None
+            # Chroma 首次 query 可能触发嵌入模型初始化，不能让它吞掉
+            # 用户侧 60 秒预算。超出短预算时直接使用高德预取 POI，完成后
+            # 的向量查询仍可自然结束并为后续请求热身。
+            vector_pois = []
+            if scope_adcode is None:
+                # 市级缓存跨越整个行政区，语义相似不等于路线相近；并且首次
+                # Chroma query 会初始化嵌入模型。五大城市完整规划直接围绕
+                # 核心景点预取高德 POI，既快又能形成紧凑片区。
+                print("市级完整规划跳过全城 Chroma 召回，使用核心景点附近高德 POI。")
+            else:
+                vector_executor = ThreadPoolExecutor(max_workers=1)
+                vector_future = vector_executor.submit(
+                    self._retrieve_cached_pois,
+                    request,
+                    preference,
+                    adcode=scope_adcode,
+                    amap_city=amap_city,
+                )
+                try:
+                    vector_pois = vector_future.result(timeout=getattr(
+                        settings, "planner_vector_retrieval_timeout_seconds", 3
+                    ))
+                except FuturesTimeoutError:
+                    print("Chroma 召回超过 3 秒预算，直接预取高德 POI。")
+                    vector_executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    vector_executor.shutdown(wait=True)
             change_set = request.change_set
             requires_full_replan = bool(
                 change_set
@@ -190,7 +227,7 @@ class TripPlannerAgent:
                 city_center=city_center,
                 radius_km=radius_km,
                 target_adcode=scope_adcode,
-                amap_city=_normalize_city_for_amap(request.city),
+                amap_city=amap_city,
                 cached_pois=vector_pois,
             )
             planning_tools = PlanningToolset(planning_session)
@@ -209,11 +246,55 @@ class TripPlannerAgent:
                     validation = json.loads(planning_tools.validate_draft(
                         draft.model_dump_json()
                     ))
+                    # 候选数量足够并不代表能排出满足相邻距离约束的路线。
+                    # 先各 refresh 一次餐馆/景点，给高德和 Chroma 一个补充
+                    # 局部片区候选的机会，再把扩充后的证据重新交给确定性排程。
+                    if (
+                        not validation.get("passed")
+                        and any(
+                            issue.get("code") == "ROUTE_LEG_TOO_LONG"
+                            for issue in validation.get("issues", [])
+                        )
+                    ):
+                        refreshed = False
+                        for purpose, query, category in (
+                            ("meal", f"{request.city} 平价餐馆", "餐饮服务"),
+                            ("attraction", f"{request.city} 景点", "风景名胜"),
+                        ):
+                            result = json.loads(planning_tools.search_poi(json.dumps({
+                                "purpose": purpose,
+                                "query": query,
+                                "category": category,
+                                "refresh": True,
+                            }, ensure_ascii=False)))
+                            refreshed = refreshed or result.get("source") == "amap"
+                        if refreshed:
+                            retry_draft = self._build_evidence_plan(
+                                request, planning_session
+                            )
+                            if retry_draft is not None:
+                                retry_validation = json.loads(
+                                    planning_tools.validate_draft(
+                                        retry_draft.model_dump_json()
+                                    )
+                                )
+                                if retry_validation.get("passed"):
+                                    draft = retry_draft
+                                    validation = retry_validation
+                                    print("已扩充高德餐馆/景点证据，重新排程通过 Validator。")
                     if validation.get("passed"):
                         trip_plan = planning_session.validated_plan
                         print("POI 证据近邻排程已通过 Validator；跳过长 JSON 模型调用。")
                     else:
-                        print("确定性排程未通过 Validator，回退到 ReAct。")
+                        issues = validation.get("issues") or []
+                        issue_text = "；".join(
+                            str(issue.get("message") or issue.get("code") or issue)
+                            for issue in issues
+                        )
+                        print(
+                            "确定性排程未通过 Validator，回退到 ReAct。"
+                            + (f" 原因: {issue_text}" if issue_text else "")
+                        )
             if trip_plan is None:
                 planner_response = ValidatedPlanningReActAgent(
                     llm=self.llm,
@@ -235,7 +316,7 @@ class TripPlannerAgent:
                     from ..services.amap_service import get_amap_service
 
                     weather_facts = get_amap_service().get_weather(
-                        _normalize_city_for_amap(request.city)
+                        amap_city
                     )
                 except Exception as weather_error:
                     print(f"高德短期天气查询失败，改为按缺失日期补查: {weather_error}")
@@ -257,6 +338,7 @@ class TripPlannerAgent:
                 city_center=city_center,
                 radius_km=radius_km,
                 target_adcode=scope_adcode,
+                amap_city=amap_city,
             )
             validate_trip_plan(
                 trip_plan,
@@ -315,6 +397,7 @@ class TripPlannerAgent:
         """
         meal_records = list(session.evidence_records.get("meal", {}).values())
         attraction_records = list(session.evidence_records.get("attraction", {}).values())
+        hotel_records = list(session.evidence_records.get("hotel", {}).values())
         if not attraction_records:
             return None
         required_types = [
@@ -340,104 +423,120 @@ class TripPlannerAgent:
         if len(meals) < required_meal_count:
             return None
 
-        # 先按地理邻近把餐馆分成每日 3 个一组。这样每一天自然围绕一个
-        # 小片区展开，不会出现模型常见的“东边午餐、西边景点、再回东边”。
-        remaining = list(meals)
-        meal_groups: list[list[dict]] = []
-        while len(meal_groups) < request.travel_days:
-            seed = min(
-                remaining,
-                key=lambda item: (
-                    cls._parse_poi_location(item).latitude,
-                    cls._parse_poi_location(item).longitude,
-                ),
-            )
-            seed_location = cls._parse_poi_location(seed)
-            group = sorted(
-                remaining,
-                key=lambda item: cls._geo_distance_squared(
-                    seed_location, cls._parse_poi_location(item)
-                ),
-            )[:len(required_types)]
-            meal_groups.append(group)
-            used = {str(item["poi_id"]) for item in group}
-            remaining = [item for item in remaining if str(item["poi_id"]) not in used]
+        # 先按地理投影排序，再切成每日固定数量。旧的“从剩余集合取最近邻”
+        # 会在南山这类南北狭长区域把一个中部餐馆塞进西丽组，造成
+        # 景点→午餐超过路段阈值的 Validator 失败。经纬度排序形成连续片区，
+        # 再由下面的排列搜索决定当天的早餐/午餐/晚餐顺序。
+        ordered_meals = sorted(
+            meals,
+            key=lambda item: (
+                cls._parse_poi_location(item).latitude,
+                cls._parse_poi_location(item).longitude,
+            ),
+        )
+        meals_per_day = len(required_types)
 
         attractions = [record for record in attraction_records if valid_record(record)]
-        if not attractions:
+        hotels = [record for record in hotel_records if valid_record(record)]
+        if not attractions or not hotels:
             return None
+        # 同一行程默认住同一家酒店，避免每天搬运行李。市级酒店检索已围绕
+        # 核心景点执行，这里再选择离餐饮片区质心最近的一家作为每日锚点。
+        route_meals = ordered_meals[:required_meal_count]
+        meal_locations = [cls._parse_poi_location(item) for item in route_meals]
+        meal_center = Location(
+            longitude=sum(item.longitude for item in meal_locations) / len(meal_locations),
+            latitude=sum(item.latitude for item in meal_locations) / len(meal_locations),
+        )
+        selected_hotel = min(
+            hotels,
+            key=lambda item: cls._geo_distance_squared(
+                meal_center, cls._parse_poi_location(item)
+            ),
+        )
+        selected_hotel_location = cls._parse_poi_location(selected_hotel)
         start = date.fromisoformat(request.start_date)
         days: list[DayPlan] = []
-        # POI 证据足够时每个片区展示两个不同景点，既保留旅行计划的丰富度，
-        # 也避免同一景点因跨日重复而在地图上叠成难以辨认的编号。
-        attractions_per_day = 2 if len(attractions) >= request.travel_days * 2 else 1
-        unused_attractions = list(attractions)
-        for day_index, group in enumerate(meal_groups):
-            group_locations = [cls._parse_poi_location(item) for item in group]
-            centroid = Location(
-                longitude=sum(item.longitude for item in group_locations) / len(group_locations),
-                latitude=sum(item.latitude for item in group_locations) / len(group_locations),
-            )
-            candidate_attractions = unused_attractions or attractions
-            selected_attractions = sorted(
-                candidate_attractions,
-                key=lambda item: cls._geo_distance_squared(
-                    centroid, cls._parse_poi_location(item)
-                ),
-            )[:attractions_per_day]
-            if not selected_attractions:
-                return None
-            selected_ids = {str(item["poi_id"]) for item in selected_attractions}
-            unused_attractions = [
-                item for item in unused_attractions
-                if str(item["poi_id"]) not in selected_ids
-            ]
-            attraction_locations = [
-                cls._parse_poi_location(item) for item in selected_attractions
-            ]
+        # 每天选择一个真实景点，保证景点证据在多日计划中不重复。
 
-            # 对同一组餐厅枚举早餐、午餐、晚餐的排列，最小化最远相邻腿，
-            # 再最小化总距离。路线结构与 Validator 完全一致：
-            # 早→景点1→午→景点2→晚。
-            ordered_group = min(
-                permutations(group),
-                key=lambda ordered: (
-                    max(
-                        cls._geo_distance_squared(left, right)
-                        for left, right in zip(
-                            (
-                                cls._parse_poi_location(ordered[0]),
-                                attraction_locations[0],
-                                cls._parse_poi_location(ordered[1]),
-                                *attraction_locations[1:],
-                            ),
-                            (
-                                attraction_locations[0],
-                                cls._parse_poi_location(ordered[1]),
-                                *attraction_locations[1:],
-                                cls._parse_poi_location(ordered[2]),
-                            ),
-                        )
-                    ),
-                    sum(
-                        cls._geo_distance_squared(left, right)
-                        for left, right in zip(
-                            (
-                                cls._parse_poi_location(ordered[0]),
-                                attraction_locations[0],
-                                cls._parse_poi_location(ordered[1]),
-                                *attraction_locations[1:],
-                            ),
-                            (
-                                attraction_locations[0],
-                                cls._parse_poi_location(ordered[1]),
-                                *attraction_locations[1:],
-                                cls._parse_poi_location(ordered[2]),
-                            ),
-                        )
-                    ),
-                ),
-            )
+        def route_score(group: list[dict], selected: list[dict]):
+            """返回“酒店出发并返回酒店”路线的最坏腿和总距离。"""
+            attraction_locations = [cls._parse_poi_location(item) for item in selected]
+            best = None
+            for ordered in permutations(group):
+                sequence = [selected_hotel_location, cls._parse_poi_location(ordered[0])]
+                for index, attraction_location in enumerate(attraction_locations):
+                    sequence.append(attraction_location)
+                    if index + 1 < len(ordered):
+                        sequence.append(cls._parse_poi_location(ordered[index + 1]))
+                sequence.extend(
+                    cls._parse_poi_location(item)
+                    for item in ordered[len(attraction_locations) + 1:]
+                )
+                sequence.append(selected_hotel_location)
+                legs = [
+                    cls._geo_distance_squared(left, right)
+                    for left, right in zip(sequence, sequence[1:])
+                ]
+                score = (max(legs), sum(legs), ordered)
+                if best is None or score[:2] < best[:2]:
+                    best = score
+            return best
+
+        def partitions(items: list[dict], groups_left: int):
+            """枚举小规模餐馆分组；三天九餐最多约 280 种分法。"""
+            if groups_left == 1:
+                if items:
+                    yield [items]
+                return
+            # 固定每层的第一个元素属于当前组，消除仅因组顺序不同的
+            # 重复分支（9 餐/3 天从 1680 个排列降为约 280 个分组）。
+            anchor = items[0]
+            for tail in combinations(items[1:], meals_per_day - 1):
+                picked = (anchor, *tail)
+                picked_ids = {id(item) for item in picked}
+                rest = [item for item in items if id(item) not in picked_ids]
+                for tail in partitions(rest, groups_left - 1):
+                    yield [list(picked), *tail]
+
+        # 同时优化“餐馆分组”和“景点归属”。单独先分餐馆再按质心选景点，
+        # 无法处理景点位于两个餐馆片区之间的情况，容易制造一条超长路线。
+        best_assignment = None
+        available_attractions = attractions
+        for groups in partitions(
+            ordered_meals[: request.travel_days * meals_per_day],
+            request.travel_days,
+        ):
+            if len(available_attractions) >= request.travel_days:
+                attraction_assignments = permutations(
+                    available_attractions, request.travel_days
+                )
+            else:
+                # 证据只有一个景点时允许跨日复用；Validator 只要求每天有
+                # 景点，不把真实景点不足误判为模型格式错误。
+                attraction_assignments = product(
+                    available_attractions, repeat=request.travel_days
+                )
+            for assigned in attraction_assignments:
+                scores = [
+                    route_score(group, [attraction])
+                    for group, attraction in zip(groups, assigned)
+                ]
+                rank = (
+                    max(score[0] for score in scores),
+                    sum(score[1] for score in scores),
+                )
+                if best_assignment is None or rank < best_assignment[0]:
+                    best_assignment = (rank, groups, assigned, scores)
+        if best_assignment is None:
+            return None
+        _, meal_groups, assigned_attractions, route_scores = best_assignment
+
+        for day_index, (group, attraction, score) in enumerate(
+            zip(meal_groups, assigned_attractions, route_scores)
+        ):
+            selected_attractions = [attraction]
+            ordered_group = score[2]
             day_meals = [
                 Meal(
                     type=meal_type,
@@ -456,6 +555,16 @@ class TripPlannerAgent:
                 description="围绕同一片区安排景点与三餐，减少往返。",
                 transportation=request.transportation,
                 accommodation=request.accommodation,
+                hotel=Hotel(
+                    name=str(selected_hotel.get("name") or ""),
+                    address=str(selected_hotel.get("address") or ""),
+                    location=selected_hotel_location,
+                    price_range=str(selected_hotel.get("cost") or "到店询价"),
+                    rating=str(selected_hotel.get("rating") or ""),
+                    distance="当日路线起终点",
+                    type=str(selected_hotel.get("type") or request.accommodation),
+                    poi_id=str(selected_hotel.get("poi_id") or ""),
+                ),
                 attractions=[
                     Attraction(
                         name=str(attraction.get("name") or ""),
@@ -562,6 +671,7 @@ class TripPlannerAgent:
         city_center: Optional[Location] = None,
         radius_km: Optional[float] = None,
         target_adcode: Optional[str] = None,
+        amap_city: Optional[str] = None,
     ) -> TripPlan:
         """用高德 POI 校正景点坐标并补齐图片。
 
@@ -595,7 +705,7 @@ class TripPlannerAgent:
             return plan
 
         # 标准化城市名给高德，避免区县名搜出外地结果；区县 adcode 负责二次硬过滤。
-        city_normalized = _normalize_city_for_amap(plan.city)
+        city_normalized = amap_city or _normalize_city_for_amap(plan.city)
         district_keyword = _district_keyword(plan.city)
         broad_keyword = f"{district_keyword} 景点" if district_keyword else "景点"
         try:
@@ -784,6 +894,11 @@ class TripPlannerAgent:
         meals = [meal for day in plan.days for meal in day.meals]
         if not meals:
             return plan
+        # 新生成的确定性计划已经使用本轮 POI 证据，名称、ID、坐标和地址均
+        # 完整；不应再次启动一次 Chroma 嵌入查询。该查询只服务于历史计划
+        # 的占位餐饮回填，并且在 Chroma 冷启动时会浪费数十秒。
+        if all(meal.poi_id and meal.location and meal.address for meal in meals):
+            return plan
         try:
             from ..services.poi_vector_store import get_poi_vector_store
 
@@ -798,7 +913,7 @@ class TripPlannerAgent:
                 poi_group="meal",
             )
         except Exception as error:
-            print(f"⚠️ Chroma 餐馆回填跳过: {type(error).__name__}: {error}")
+            print(f"Chroma 餐馆回填跳过: {type(error).__name__}: {error}")
             return plan
 
         def normalise(value: object) -> str:
@@ -1051,14 +1166,19 @@ class TripPlannerAgent:
         if preference and preference.prompt and preference.prompt != request.free_text_input:
             query += f"\n**用户偏好:** {preference.prompt}"
 
+        max_leg_km = getattr(
+            get_settings(), "planner_max_daily_route_leg_km", 7.0
+        )
         query += (
             "\n\n**路线顺序要求:** 同一天的景点必须位于彼此相近的片区，并按地理邻近顺序安排；"
             "不得在同一天内先去城区东侧、再去西侧、随后又回到东侧。"
-            "早餐、午餐和晚餐必须与相邻景点同片区；相邻节点直线距离不得超过 5 公里。"
+            f"早餐、午餐和晚餐必须与相邻景点同片区；相邻节点直线距离不得超过 {max_leg_km:g} 公里。"
+            "每天必须选择一个带真实 POI ID、地址和坐标的酒店，并按“酒店出发→当日节点→返回酒店”闭环安排。"
             "同一餐馆 POI 整个行程只能使用一次，禁止重复同一美食城。"
             "\n\n**Draft 最小契约:** 顶层包含 city、start_date、end_date、days、weather_info、"
             "overall_suggestions；每个 day 包含 date、day_index、description、transportation、"
-            "accommodation、attractions、meals。景点必须包含 name、address、location、"
+            "accommodation、hotel、attractions、meals。hotel 必须包含 name、address、location、"
+            "price_range、type、poi_id。景点必须包含 name、address、location、"
             "visit_duration、description、poi_id。每餐必须包含 type、name、address、location、"
             "description、estimated_cost、poi_id。"
         )
@@ -1320,6 +1440,7 @@ class TripPlannerAgent:
         request: TripRequest,
         preference: Optional[Preference],
         adcode: Optional[str] = None,
+        amap_city: Optional[str] = None,
     ) -> list[dict]:
         """先按景点、酒店、餐馆三大类从 Chroma 召回，天气和路线仍实时查询。"""
         try:
@@ -1337,7 +1458,7 @@ class TripPlannerAgent:
                     preference.prompt if preference else "",
                 ) if value
             )
-            city = _normalize_city_for_amap(request.city)
+            city = amap_city or _normalize_city_for_amap(request.city)
             results = []
             group_queries = {
                 "attraction": f"{query} 景点",

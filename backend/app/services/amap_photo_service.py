@@ -104,9 +104,18 @@ class AmapPhotoService:
                 return photos
         return []
 
-    def search_pois(self, keywords: str, city: str = "", offset: int = 10) -> List[dict]:
+    def search_pois(
+        self,
+        keywords: str,
+        city: str = "",
+        offset: int = 10,
+        *,
+        persist: bool = True,
+    ) -> List[dict]:
         """返回带图片扩展字段的高德 POI 原始结果。"""
         pois = self._fetch_pois(keywords, city=city, offset=offset)
+        if not persist:
+            return pois
         try:
             from .poi_vector_store import get_poi_vector_store
 

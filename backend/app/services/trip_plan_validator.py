@@ -100,6 +100,38 @@ def collect_trip_plan_issues(
     }
     used_meal_pois: dict[str, tuple[int, str]] = {}
     for index, day in enumerate(plan.days):
+        if day.hotel is None:
+            add(
+                "HOTEL_MISSING",
+                f"第{index + 1}天没有酒店，路线无法从酒店出发并返回酒店",
+                day_index=index,
+                entity_type="hotel",
+            )
+        else:
+            if not day.hotel.poi_id:
+                add(
+                    "HOTEL_POI_MISSING",
+                    f"酒店“{day.hotel.name}”缺少真实高德 POI ID",
+                    day_index=index,
+                    entity_type="hotel",
+                    entity_name=day.hotel.name,
+                )
+            if not day.hotel.address:
+                add(
+                    "HOTEL_ADDRESS_MISSING",
+                    f"酒店“{day.hotel.name}”缺少地址",
+                    day_index=index,
+                    entity_type="hotel",
+                    entity_name=day.hotel.name,
+                )
+            if day.hotel.location is None:
+                add(
+                    "HOTEL_LOCATION_MISSING",
+                    f"酒店“{day.hotel.name}”缺少坐标",
+                    day_index=index,
+                    entity_type="hotel",
+                    entity_name=day.hotel.name,
+                )
         if not day.attractions:
             add("ATTRACTIONS_MISSING", f"第{index + 1}天没有景点安排", day_index=index)
         for attraction in day.attractions:
@@ -151,7 +183,8 @@ def collect_trip_plan_issues(
                     used_meal_pois[meal.poi_id] = (index, meal.name)
 
         # 以实际展示顺序检查当日相邻节点，拦截“早餐在西边、景点在东边、午餐又回西边”
-        # 这类虽然 POI 真实但体验很差的计划。酒店只作为当天结束点，不跨天相连。
+        # 这类虽然 POI 真实但体验很差的计划。每天必须从酒店出发并返回同一酒店，
+        # 但不同天之间不额外绘制跨日连线。
         breakfast = [meal for meal in day.meals if meal.type == "breakfast"]
         lunch = [meal for meal in day.meals if meal.type == "lunch"]
         dinner = [meal for meal in day.meals if meal.type == "dinner"]
@@ -159,6 +192,7 @@ def collect_trip_plan_issues(
         attractions = list(day.attractions)
         split = (len(attractions) + 1) // 2
         route_entities = [
+            *([day.hotel] if day.hotel else []),
             *breakfast,
             *attractions[:split],
             *lunch,

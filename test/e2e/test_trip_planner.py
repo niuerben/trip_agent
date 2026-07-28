@@ -313,6 +313,91 @@ def login(page: Page, username: str, password: str) -> None:
     )
 
 
+def assert_hotel_route_and_editing(page: Page, travel_days: int) -> None:
+    """确认每日路线以酒店闭环，并覆盖向下拖拽和删除确认交互。"""
+    day_routes = page.locator(".route-days .day-route")
+    day_routes.first.wait_for(state="visible", timeout=10_000)
+    if day_routes.count() != travel_days:
+        raise AssertionError(
+            f"结果页应展示 {travel_days} 天路线，实际为 {day_routes.count()} 天"
+        )
+
+    for day_index in range(travel_days):
+        nodes = day_routes.nth(day_index).locator(".route-node")
+        if nodes.count() < 3:
+            raise AssertionError(f"第 {day_index + 1} 天路线节点不足，无法形成酒店闭环")
+        first = nodes.first
+        last = nodes.last
+        if first.get_attribute("data-node-type") != "hotel":
+            raise AssertionError(f"第 {day_index + 1} 天首节点不是酒店")
+        if first.get_attribute("data-route-role") != "start":
+            raise AssertionError(f"第 {day_index + 1} 天酒店首节点未标记为出发点")
+        if last.get_attribute("data-node-type") != "hotel":
+            raise AssertionError(f"第 {day_index + 1} 天末节点不是酒店")
+        if last.get_attribute("data-route-role") != "end":
+            raise AssertionError(f"第 {day_index + 1} 天酒店末节点未标记为返程点")
+        if day_routes.nth(day_index).locator('.route-node[data-node-type="hotel"]').count() != 2:
+            raise AssertionError(f"第 {day_index + 1} 天应恰好展示酒店出发和返程两个节点")
+
+    if page.locator(".route-note").count() != 0:
+        raise AssertionError("路线面板仍展示已要求删除的提示条")
+    route_heading = page.locator(".route-days .section-heading")
+    if route_heading.inner_text().strip() != "每日路线":
+        raise AssertionError("每日路线标题区应只保留“每日路线”")
+
+    total_node_count = page.locator(".route-node").count()
+    first_day_node_count = day_routes.first.locator(".route-node").count()
+    day_routes.first.locator(".day-route-header").click()
+    if "day-route-selected" not in (day_routes.first.get_attribute("class") or ""):
+        raise AssertionError("单击第一天卡片后没有进入单日地图模式")
+    page.locator(".map-toolbar").get_by_text(
+        f"{first_day_node_count} 个路线节点", exact=True
+    ).wait_for(timeout=5_000)
+    page.get_by_role("button", name="每日路线", exact=True).click()
+    if page.locator(".day-route-selected").count() != 0:
+        raise AssertionError("单击每日路线后没有恢复全部日期汇总模式")
+    page.locator(".map-toolbar").get_by_text(
+        f"{total_node_count} 个路线节点", exact=True
+    ).wait_for(timeout=5_000)
+
+    # 取第一天两个普通节点，把第一个明确拖到第二个下方，防止只能向上插入。
+    first_day = day_routes.first
+    movable = first_day.locator('.route-node:not([data-node-type="hotel"])')
+    if movable.count() < 2:
+        raise AssertionError("第一天普通节点不足，无法验证向下拖拽")
+    source = movable.nth(0)
+    target = movable.nth(1)
+    source_id = source.get_attribute("data-node-id")
+    target_id = target.get_attribute("data-node-id")
+    target_box = target.bounding_box()
+    if not source_id or not target_id or not target_box:
+        raise AssertionError("无法读取拖拽节点信息")
+    source.drag_to(target, target_position={
+        "x": max(1, target_box["width"] / 2),
+        "y": max(1, target_box["height"] - 2),
+    })
+    ordered_ids = first_day.locator(".route-node").evaluate_all(
+        "nodes => nodes.map(node => node.dataset.nodeId)"
+    )
+    if ordered_ids.index(source_id) <= ordered_ids.index(target_id):
+        raise AssertionError("节点向下拖拽后没有插入目标节点下方")
+
+    # 删除必须先出现确认框；接受后节点才真正消失，酒店固定节点不受影响。
+    source_after_drag = first_day.locator(f'[data-node-id="{source_id}"]')
+    with page.expect_dialog() as dialog_info:
+        source_after_drag.locator(".node-delete").click()
+    dialog_info.value.accept()
+    page.wait_for_timeout(100)
+    if first_day.locator(f'[data-node-id="{source_id}"]').count() != 0:
+        raise AssertionError("确认删除后路线节点仍然存在")
+    remaining_nodes = first_day.locator(".route-node")
+    if (
+        remaining_nodes.first.get_attribute("data-route-role") != "start"
+        or remaining_nodes.last.get_attribute("data-route-role") != "end"
+    ):
+        raise AssertionError("删除普通节点后酒店起终点被破坏")
+
+
 def run_trip_planner_test(
     case: TripTestCase | None = None,
     base_url: str = "http://localhost:5173",
@@ -404,6 +489,8 @@ def run_trip_planner_test(
                         f"截图已保存到: {screenshot_path}"
                     ) from error
 
+                travel_days = (case.end_date - case.start_date).days + 1
+                assert_hotel_route_and_editing(page, travel_days)
                 page.screenshot(path=str(screenshot_path), full_page=True)
                 result_url = page.url
                 status = "success"
@@ -447,13 +534,13 @@ def run_trip_planner_test(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="使用 Microsoft Edge 测试旅行规划")
-    parser.add_argument("--city", default="深圳坪山")
-    parser.add_argument("--start-date", default="2026-07-27")
+    parser.add_argument("--city", default="深圳南山")
+    parser.add_argument("--start-date", default="2026-07-29")
     parser.add_argument("--end-date", default="2026-07-29")
     parser.add_argument("--preferences", nargs="+", default=["美食","休闲"])
     parser.add_argument("--transportation", default="公共交通")
     parser.add_argument("--accommodation", default="经济型酒店")
-    parser.add_argument("--free-text", default="三人行，吃好吃的，玩好玩的，每餐预算人均不超过 40 元")
+    parser.add_argument("--free-text", default="一人行，吃好吃的，玩好玩的，每餐预算人均不超过 40 元")
     parser.add_argument("--base-url", default="http://localhost:5173")
     parser.add_argument("--headless", action="store_true")
     return parser.parse_args()

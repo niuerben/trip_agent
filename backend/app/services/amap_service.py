@@ -286,7 +286,7 @@ class AmapService:
         normalized = (city or "").strip()
         if not normalized:
             return None
-        center, _ = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
+        center, _, _ = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
         return center
 
     def get_city_adcode(self, city: str) -> Optional[str]:
@@ -294,8 +294,24 @@ class AmapService:
         normalized = (city or "").strip()
         if not normalized:
             return None
-        _, adcode = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
+        _, adcode, _ = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
         return adcode
+
+    def get_poi_search_city(self, city: str) -> str:
+        """返回高德 POI city 参数应使用的地级市名。
+
+        区县请求如“广州越秀”会被地理编码为越秀区，但 POI 搜索的 citylimit
+        应传父级“广州市”；直接传组合文本会导致 citylimit 失效并返回全国 POI。
+        """
+        normalized = (city or "").strip()
+        if not normalized:
+            return ""
+        _, _, search_city = _get_city_geocode_cached(
+            normalized,
+            self.api_key,
+            self.timeout,
+        )
+        return search_city or normalized
 
     def plan_route(
         self,
@@ -541,10 +557,10 @@ def _get_city_geocode_cached(
     city: str,
     api_key: str,
     timeout: tuple,
-) -> tuple[Optional[Location], Optional[str]]:
-    """缓存高德行政区中心和 adcode，避免同一次规划重复请求地理编码。"""
+) -> tuple[Optional[Location], Optional[str], Optional[str]]:
+    """缓存行政区中心、adcode 和 POI 搜索应使用的父级城市。"""
     if not api_key:
-        return None, None
+        return None, None, None
     try:
         response = requests.get(
             AmapService.GEOCODE_URL,
@@ -559,14 +575,14 @@ def _get_city_geocode_cached(
         payload = response.json()
     except Exception as error:
         print(f"⚠️ 高德城市中心解析跳过({city}): {type(error).__name__}: {error}")
-        return None, None
+        return None, None, None
 
     if str(payload.get("status")) != "1":
         print(
             f"⚠️ 高德城市中心解析返回非成功状态({city}): "
             f"{payload.get('info')} (infocode={payload.get('infocode')})"
         )
-        return None, None
+        return None, None, None
 
     geocodes = payload.get("geocodes") or []
     for item in geocodes:
@@ -577,8 +593,19 @@ def _get_city_geocode_cached(
             continue
         if -180 <= longitude <= 180 and -90 <= latitude <= 90:
             adcode = str(item.get("adcode") or item.get("citycode") or "").strip() or None
-            return Location(longitude=longitude, latitude=latitude), adcode
-    return None, None
+            raw_city = item.get("city")
+            search_city = (
+                str(raw_city).strip()
+                if isinstance(raw_city, str) and raw_city.strip()
+                else None
+            )
+            # 直辖市 geocode 的 city 可能是空数组，省字段才是可用 citylimit。
+            if not search_city:
+                raw_province = item.get("province")
+                if isinstance(raw_province, str) and raw_province.strip().endswith("市"):
+                    search_city = raw_province.strip()
+            return Location(longitude=longitude, latitude=latitude), adcode, search_city
+    return None, None, None
 
 
 # 创建全局服务实例

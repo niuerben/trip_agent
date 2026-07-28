@@ -53,8 +53,8 @@ async def search_poi(
         # 获取服务实例
         service = get_amap_service()
         
-        # 搜索POI
-        pois = service.search_poi(keywords, city, citylimit)
+        # AmapService 使用 requests；放到工作线程，避免阻塞 FastAPI event loop。
+        pois = await asyncio.to_thread(service.search_poi, keywords, city, citylimit)
         
         return POISearchResponse(
             success=True,
@@ -92,8 +92,8 @@ async def get_weather(
         # 获取服务实例
         service = get_amap_service()
         
-        # 查询天气
-        weather_info = service.get_weather(city)
+        # AmapService 使用 requests；放到工作线程，避免阻塞 FastAPI event loop。
+        weather_info = await asyncio.to_thread(service.get_weather, city)
         
         return WeatherResponse(
             success=True,
@@ -129,13 +129,14 @@ async def plan_route(request: RouteRequest):
         # 获取服务实例
         service = get_amap_service()
         
-        # 规划路线
-        route_info = service.plan_route(
+        # 路线规划可能启动同步 MCP/HTTP 客户端，不能直接运行在 event loop。
+        route_info = await asyncio.to_thread(
+            service.plan_route,
             origin_address=request.origin_address,
             destination_address=request.destination_address,
             origin_city=request.origin_city,
             destination_city=request.destination_city,
-            route_type=request.route_type
+            route_type=request.route_type,
         )
         return RouteResponse(
             success=True,

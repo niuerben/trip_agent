@@ -18,7 +18,12 @@ from ..config import get_settings
 from ..models.schemas import Location, TripPlan, TripRequest
 from ..services.agent_loop_logging import _summary, log_agent_loop
 from ..services.amap_photo_service import get_amap_photo_service
-from ..services.trip_plan_validator import ValidationIssue, collect_trip_plan_issues
+from ..services.poi_vector_store import classify_poi_group, get_poi_vector_store
+from ..services.trip_plan_validator import (
+    ValidationIssue,
+    collect_trip_plan_issues,
+    is_within_city,
+)
 
 
 PLANNING_REACT_PROMPT = """你是行旅天下旅行规划 Agent。
@@ -225,6 +230,8 @@ class PlanningToolset:
         for poi in self.session.cached_pois:
             if poi.get("poi_group") != purpose:
                 continue
+            if not self._poi_in_scope(poi):
+                continue
             distance = poi.get("distance")
             if distance is not None and float(distance) > threshold:
                 continue
@@ -251,6 +258,129 @@ class PlanningToolset:
             )
         )
         return candidates[: get_settings().poi_vector_top_k]
+
+    def _poi_in_scope(self, poi: dict) -> bool:
+        """按区县 adcode 和规划中心半径拒绝错误城市的缓存/高德 POI。"""
+        if self.session.target_adcode:
+            if str(poi.get("adcode") or "").strip() != self.session.target_adcode:
+                return False
+        raw_location = poi.get("location")
+        if not raw_location:
+            longitude = poi.get("longitude")
+            latitude = poi.get("latitude")
+            raw_location = f"{longitude},{latitude}"
+        try:
+            longitude, latitude = (
+                float(value) for value in str(raw_location).split(",", 1)
+            )
+        except (TypeError, ValueError):
+            return False
+        location = Location(longitude=longitude, latitude=latitude)
+        return bool(
+            not self.session.city_center
+            or is_within_city(
+                location,
+                self.session.city_center,
+                self.session.radius_km,
+            )
+        )
+
+    def _amap_result_limit(self, purpose: str) -> int:
+        settings = get_settings()
+        if purpose == "meal":
+            required_types = [
+                item for item in settings.required_meal_types.split(",")
+                if item.strip()
+            ]
+            return min(
+                25,
+                max(
+                    settings.planner_candidate_limit,
+                    self.session.request.travel_days * len(required_types) * 2,
+                ),
+            )
+        if purpose == "attraction":
+            return min(
+                25,
+                max(
+                    settings.planner_candidate_limit,
+                    self.session.request.travel_days * 2,
+                ),
+            )
+        return settings.planner_candidate_limit
+
+    def _minimum_evidence_count(self, purpose: str) -> int:
+        if purpose != "meal":
+            return 1
+        required_types = [
+            item for item in get_settings().required_meal_types.split(",")
+            if item.strip()
+        ]
+        return self.session.request.travel_days * len(required_types)
+
+    def _broad_amap_query(self, purpose: str) -> str:
+        suffix = {
+            "meal": "餐厅",
+            "attraction": "景点",
+            "hotel": "酒店",
+        }[purpose]
+        return f"{self.session.request.city} {suffix}"
+
+    def _nearby_meal_query(self) -> str:
+        """围绕已召回的城市核心景点补齐紧凑餐饮候选。
+
+        直辖市/省会的市级检索范围非常大；仅用“北京平价餐馆”会返回昌平、
+        大兴等相距几十公里的随机 POI，九餐虽足却无法组成可验证的路线。
+        先以离城市中心最近的景点为锚点，向高德要“附近小吃”，可一次取得
+        多家地理相邻且价格更低的真实候选。
+        """
+        attractions = list(self.session.evidence_records.get("attraction", {}).values())
+        center = self.session.city_center
+        if not attractions or center is None:
+            return f"{self.session.request.city} 平价餐馆"
+
+        def distance_squared(candidate: dict) -> float:
+            try:
+                longitude, latitude = (
+                    float(value) for value in str(candidate["location"]).split(",", 1)
+                )
+            except (KeyError, TypeError, ValueError):
+                return float("inf")
+            longitude_delta = (longitude - center.longitude) * 0.8
+            latitude_delta = latitude - center.latitude
+            return longitude_delta * longitude_delta + latitude_delta * latitude_delta
+
+        anchor = min(attractions, key=distance_squared)
+        name = str(anchor.get("name") or "").strip()
+        return (
+            f"{self.session.request.city} {name}附近小吃"
+            if name else f"{self.session.request.city} 平价餐馆"
+        )
+
+    def _nearby_hotel_query(self) -> str:
+        """围绕核心景点检索酒店，使每日路线能从酒店出发并返回酒店。"""
+        attractions = list(self.session.evidence_records.get("attraction", {}).values())
+        center = self.session.city_center
+        if not attractions or center is None:
+            return f"{self.session.request.city} 经济型酒店"
+
+        def distance_squared(candidate: dict) -> float:
+            try:
+                longitude, latitude = (
+                    float(value) for value in str(candidate["location"]).split(",", 1)
+                )
+            except (KeyError, TypeError, ValueError):
+                return float("inf")
+            longitude_delta = (longitude - center.longitude) * 0.8
+            latitude_delta = latitude - center.latitude
+            return longitude_delta * longitude_delta + latitude_delta * latitude_delta
+
+        anchor = min(attractions, key=distance_squared)
+        name = str(anchor.get("name") or "").strip()
+        return (
+            f"{self.session.request.city} {name}附近经济型酒店"
+            if name else f"{self.session.request.city} 经济型酒店"
+        )
 
     def _record_evidence(self, purpose: str, candidates: list[dict]) -> None:
         self.session.evidence_ids.setdefault(purpose, set()).update(
@@ -279,17 +409,35 @@ class PlanningToolset:
         触发 refresh，而不是把空证据误标成已准备完成。
         """
         request = self.session.request
+        meal_query = (
+            self._nearby_meal_query
+            if self.session.target_adcode is None
+            else f"{request.city} 平价餐馆"
+        )
         searches = (
-            ("meal", f"{request.city} 平价餐馆", "餐饮服务"),
             ("attraction", f"{request.city} 景点", "风景名胜"),
-            ("hotel", f"{request.city} 经济型酒店", "住宿服务"),
+            ("meal", meal_query, "餐饮服务"),
+            (
+                "hotel",
+                self._nearby_hotel_query if self.session.target_adcode is None
+                else f"{request.city} 经济型酒店",
+                "住宿服务",
+            ),
         )
         evidence: dict[str, list[dict]] = {}
-        for purpose, query, category in searches:
+        for purpose, query_or_factory, category in searches:
+            query = query_or_factory() if callable(query_or_factory) else query_or_factory
+            # 市级缓存的语义相似度不能表达地理邻近。首次计划时，对餐饮用
+            # 锚点附近的高德候选替换散落全城的 Chroma 结果；区县请求仍优先
+            # 复用本地缓存，避免无谓网络调用。
+            force_local_refresh = (
+                purpose in {"meal", "hotel"} and self.session.target_adcode is None
+            )
             result = json.loads(self.search_poi(json.dumps({
                 "purpose": purpose,
                 "query": query,
                 "category": category,
+                "refresh": force_local_refresh,
             }, ensure_ascii=False)))
             candidates = result.get("candidates", [])
             required_meal_count = self.session.request.travel_days * len(
@@ -423,17 +571,43 @@ class PlanningToolset:
                     ),
                 }, ensure_ascii=False)
 
-        keywords = " ".join(item for item in (self.session.request.city, query, category) if item)
-        raw_pois = get_amap_photo_service().search_pois(
-            keywords,
+        # query 通常已经包含目的地；category 再拼进关键词会让高德返回空结果。
+        # citylimit 单独使用地理编码得到的父级城市约束搜索范围。
+        photo_service = get_amap_photo_service()
+        result_limit = self._amap_result_limit(purpose)
+        raw_pois = photo_service.search_pois(
+            query,
             city=self.session.amap_city,
-            offset=get_settings().planner_candidate_limit,
+            offset=result_limit,
+            persist=False,
         )
+
+        def accepted(items: list[dict]) -> list[dict]:
+            return [
+                poi for poi in items
+                if classify_poi_group(poi) == purpose and self._poi_in_scope(poi)
+            ]
+
+        accepted_raw_pois = accepted(raw_pois)
+        broad_query = self._broad_amap_query(purpose)
+        used_broad_fallback = False
+        if len(accepted_raw_pois) < self._minimum_evidence_count(purpose):
+            broad_pois = photo_service.search_pois(
+                broad_query,
+                city=self.session.amap_city,
+                offset=result_limit,
+                persist=False,
+            )
+            accepted_raw_pois.extend(accepted(broad_pois))
+            used_broad_fallback = True
+
+        accepted_raw_pois = list({
+            str(poi.get("id") or poi.get("name")): poi
+            for poi in accepted_raw_pois
+            if poi.get("id") or poi.get("name")
+        }.values())
         candidates = []
-        for poi in raw_pois:
-            adcode = str(poi.get("adcode") or "").strip()
-            if self.session.target_adcode and adcode and adcode != self.session.target_adcode:
-                continue
+        for poi in accepted_raw_pois:
             biz_ext = poi.get("biz_ext") if isinstance(poi.get("biz_ext"), dict) else {}
             candidates.append({
                 "poi_id": poi.get("id") or "",
@@ -445,20 +619,27 @@ class PlanningToolset:
                 "rating": biz_ext.get("rating") or "",
                 "cost": biz_ext.get("cost") or "",
             })
+        if accepted_raw_pois:
+            store = get_poi_vector_store()
+            if store is not None:
+                store.upsert_pois(accepted_raw_pois, self.session.amap_city)
         self._record_evidence(purpose, candidates)
-        self.session.searched_purposes.add(purpose)
+        all_candidates = list(self.session.evidence_records.get(purpose, {}).values())
+        if len(all_candidates) >= self._minimum_evidence_count(purpose):
+            self.session.searched_purposes.add(purpose)
         return json.dumps({
             "query": query,
             "purpose": purpose,
             "category": category,
             "source": "amap",
-            "candidates": candidates,
+            "candidates": all_candidates,
             "distance_threshold": get_settings().poi_vector_distance_threshold,
             "fallback_reason": (
                 "refresh=true，强制高德搜索"
                 if refresh
                 else "Chroma 没有达到相关性阈值的候选"
             ),
+            "broad_fallback_query": broad_query if used_broad_fallback else None,
             "instruction": "候选已返回；请直接生成 Draft 并调用 validate_draft。只有没有任何合格候选时才 refresh。",
         }, ensure_ascii=False)
 
