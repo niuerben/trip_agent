@@ -245,7 +245,9 @@ class TalkAgent:
 
             if change_set_data:
                 try:
+                    print(f"🔍 解析 change_set，原始数据: {json.dumps(change_set_data, ensure_ascii=False)}")
                     change_set = ChangeSet.model_validate(change_set_data)
+                    print(f"✅ change_set 解析成功: operations={len(change_set.operations)}")
                 except Exception as e:
                     print(f"⚠️ change_set 验证失败: {e}，原始数据: {change_set_data}")
                     if intent == "replan":
