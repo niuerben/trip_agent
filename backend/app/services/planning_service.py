@@ -1,4 +1,4 @@
-"""带最终校验闸门的旅行规划 ReAct Agent。"""
+"""旅行规划服务：检索证据、工具编排和最终校验闸门。"""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ from hello_agents.core.message import Message
 
 from ..config import get_settings
 from ..models.schemas import Location, TripPlan, TripRequest
-from ..services.agent_loop_logging import _summary, log_agent_loop
-from ..services.amap_photo_service import get_amap_photo_service
-from ..services.poi_vector_store import classify_poi_group, get_poi_vector_store
-from ..services.trip_plan_validator import (
+from .agent_loop_logging import _summary, log_agent_loop
+from .amap_photo_service import get_amap_photo_service
+from .poi_vector_store import classify_poi_group, get_poi_vector_store
+from .trip_plan_validator import (
     ValidationIssue,
     collect_trip_plan_issues,
     is_within_city,

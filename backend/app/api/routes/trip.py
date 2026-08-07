@@ -16,7 +16,7 @@ from ...agents.trip_planner_agent import (
     _is_district_request,
     get_trip_planner_agent,
 )
-from ...agents.planning_react_agent import PlanningLoopError
+from ...services.planning_service import PlanningLoopError
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest

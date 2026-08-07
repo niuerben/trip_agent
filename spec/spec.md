@@ -1,3 +1,9 @@
+## 项目规范
+
+AI 不得擅自修改./spec
+AI 不得擅自更改 Agent 提示词，修改前需征求主人同意
+test 接口向backend 适配，backend 接口不得向 test 适配
+
 ## api 规范
 
 ## 数据库规范

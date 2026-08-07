@@ -1,33 +1,33 @@
 # 单元测试
 
-## test_agent_loop_logging.py，Agent 循环与日志
+## test_observable_function_call_agent_logging.py，Agent 循环与日志
 
 ```powershell
-python unit/test_agent_loop_logging.py
+python unit/test_observable_function_call_agent_logging.py
 ```
 
-## test_directed_replan.py，定向重规划
+## test_trip_planner_agent_directed_replan.py，定向重规划
 
 ```powershell
-python unit/test_directed_replan.py
+python unit/test_trip_planner_agent_directed_replan.py
 ```
 
-## test_evidence_plan.py，POI 近邻排程
+## test_planning_service_evidence_plan.py，POI 近邻排程
 
 ```powershell
-python unit/test_evidence_plan.py
+python unit/test_planning_service_evidence_plan.py
 ```
 
-## test_planner_review_logging.py，规划审查日志
+## test_trip_routes_review_logging.py，规划审查日志
 
 ```powershell
-python unit/test_planner_review_logging.py
+python unit/test_trip_routes_review_logging.py
 ```
 
-## test_planning_react.py，ReAct 规划与校验
+## test_planning_service_react.py，ReAct 规划与校验
 
 ```powershell
-python unit/test_planning_react.py
+python unit/test_planning_service_react.py
 ```
 
 ## test_poi_vector_store.py，POI 向量库
@@ -36,28 +36,28 @@ python unit/test_planning_react.py
 python unit/test_poi_vector_store.py
 ```
 
-## test_route_geometry.py，道路与公共交通路线几何
+## test_amap_service_route_geometry.py，道路与公共交通路线几何
 
 ```powershell
-python unit/test_route_geometry.py
+python unit/test_amap_service_route_geometry.py
 ```
 
-## test_route_ordering.py，景点近邻排序
+## test_trip_planner_agent_route_ordering.py，景点近邻排序
 
 ```powershell
-python unit/test_route_ordering.py
+python unit/test_trip_planner_agent_route_ordering.py
 ```
 
-## test_talk_replan.py，对话重规划意图
+## test_talk_agent_replan.py，对话重规划意图
 
 ```powershell
-python unit/test_talk_replan.py
+python unit/test_talk_agent_replan.py
 ```
 
-## test_weather_dates.py，旅行日期天气筛选
+## test_trip_planner_agent_weather_dates.py，旅行日期天气筛选
 
 ```powershell
-python unit/test_weather_dates.py
+python unit/test_trip_planner_agent_weather_dates.py
 ```
 
 # 集成测试

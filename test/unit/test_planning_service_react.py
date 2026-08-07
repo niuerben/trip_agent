@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from backend.app.agents.planning_react_agent import (
+from backend.app.services.planning_service import (
     PlanningSession,
     PlanningToolset,
     ValidatedPlanningReActAgent,
@@ -95,7 +95,7 @@ class ValidatedPlanningReActTest(unittest.TestCase):
         # 测试使用假 POI；禁止把它们写进真实运行的 agent_loop.log。
         self.events = []
         self.log_patcher = patch(
-            "backend.app.agents.planning_react_agent.log_agent_loop",
+            "backend.app.services.planning_service.log_agent_loop",
             side_effect=lambda event, _run_id, **fields: self.events.append((event, fields)),
         )
         self.log_patcher.start()
@@ -319,11 +319,11 @@ class ValidatedPlanningReActTest(unittest.TestCase):
 
         with (
             patch(
-                "backend.app.agents.planning_react_agent.get_amap_photo_service",
+                "backend.app.services.planning_service.get_amap_photo_service",
                 return_value=FakePhotoService(),
             ),
             patch(
-                "backend.app.agents.planning_react_agent.get_poi_vector_store",
+                "backend.app.services.planning_service.get_poi_vector_store",
                 return_value=FakeStore(),
             ),
         ):
@@ -393,11 +393,11 @@ class ValidatedPlanningReActTest(unittest.TestCase):
 
         with (
             patch(
-                "backend.app.agents.planning_react_agent.get_amap_photo_service",
+                "backend.app.services.planning_service.get_amap_photo_service",
                 return_value=FakePhotoService(),
             ),
             patch(
-                "backend.app.agents.planning_react_agent.get_poi_vector_store",
+                "backend.app.services.planning_service.get_poi_vector_store",
                 return_value=FakeStore(),
             ),
         ):

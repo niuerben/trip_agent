@@ -29,11 +29,12 @@ from ..services.trip_plan_validator import (
     validate_trip_plan,
 )
 from ..services.poi_vector_store import classify_poi_group
-from .planning_react_agent import (
+from ..services.planning_service import (
     PlanningSession,
     PlanningToolset,
     ValidatedPlanningReActAgent,
 )
+from .plan_agent import PlanAgent
 
 def _normalize_city_for_amap(city: str) -> str:
     """标准化城市名给高德 API，避免区县名导致 citylimit 失效搜出外地结果。
@@ -296,10 +297,13 @@ class TripPlannerAgent:
                             + (f" 原因: {issue_text}" if issue_text else "")
                         )
             if trip_plan is None:
-                planner_response = ValidatedPlanningReActAgent(
+                planner_response = PlanAgent(
                     llm=self.llm,
-                    session=planning_session,
-                ).run(planner_query)
+                    runner=lambda prompt, _preference: ValidatedPlanningReActAgent(
+                        llm=self.llm,
+                        session=planning_session,
+                    ).run(prompt),
+                ).plan(planner_query, preference.prompt)
                 print(f"规划 Agent 返回: {planner_response[:300]}...\n")
                 trip_plan = planning_session.validated_plan
                 if trip_plan is None:

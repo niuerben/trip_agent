@@ -1,5 +1,7 @@
 # HelloAgents框架
 hello-agents[protocols]>=0.2.4,<=0.2.9
+trio>=0.26.0
+socksio>=1.0.0
 
 # FastAPI和相关依赖
 fastapi>=0.115.0

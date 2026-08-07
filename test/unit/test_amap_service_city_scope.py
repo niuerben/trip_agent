@@ -31,7 +31,7 @@ class _Response:
         }
 
 
-class AmapCityScopeTest(unittest.TestCase):
+class AmapServiceCityScopeTest(unittest.TestCase):
     def tearDown(self) -> None:
         _get_city_geocode_cached.cache_clear()
 

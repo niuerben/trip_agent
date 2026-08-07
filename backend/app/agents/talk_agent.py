@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from ..models.schemas import ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
+from .plan_agent import PlanAgent
 
 from hello_agents import SimpleAgent
 
@@ -81,10 +82,11 @@ SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
 class TalkAgent:
     """旅行偏好对话智能体"""
 
-    def __init__(self):
+    def __init__(self, plan_agent: PlanAgent | None = None):
         """初始化对话 Agent(无 MCP 工具)"""
         print("🔄 初始化偏好对话智能体...")
         self.llm = get_llm()
+        self.plan_agent = plan_agent or PlanAgent(llm=self.llm)
         self.agent = SimpleAgent(
             name="旅行偏好顾问",
             llm=self.llm,
@@ -96,6 +98,31 @@ class TalkAgent:
             system_prompt=SUGGESTION_AGENT_PROMPT,
         )
         print("✅ 偏好对话智能体初始化成功")
+
+    def create_prompt(self, requirement: Any) -> str:
+        if isinstance(requirement, TalkRequest):
+            return self._build_prompt(requirement)
+        if hasattr(requirement, "model_dump"):
+            payload = requirement.model_dump()
+        elif isinstance(requirement, dict):
+            payload = requirement
+        else:
+            return str(requirement or "").strip()
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _preference_prompt(requirement: Any) -> str:
+        preference = getattr(requirement, "preference", None)
+        if isinstance(preference, Preference):
+            return preference.prompt
+        if isinstance(preference, dict):
+            return str(preference.get("prompt") or "")
+        return str(getattr(requirement, "free_text_input", "") or "")
+
+    def talk(self, requirement: Any) -> Any:
+        requirement_prompt = self.create_prompt(requirement)
+        preference_prompt = self._preference_prompt(requirement)
+        return self.plan_agent.plan(requirement_prompt, preference_prompt)
 
     def chat(self, request: TalkRequest) -> TalkResponse:
         """处理一轮对话。
@@ -311,3 +338,7 @@ def get_talk_agent() -> TalkAgent:
         _talk_agent = TalkAgent()
 
     return _talk_agent
+
+
+def talk(requirement: Any, plan_agent: PlanAgent | None = None) -> Any:
+    return TalkAgent(plan_agent=plan_agent).talk(requirement)

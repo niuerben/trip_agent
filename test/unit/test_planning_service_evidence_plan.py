@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.planning_react_agent import PlanningSession, PlanningToolset
+from backend.app.services.planning_service import PlanningSession, PlanningToolset
 from backend.app.agents.trip_planner_agent import TripPlannerAgent
 from backend.app.models.schemas import Location, TripRequest
 from backend.app.services.trip_plan_validator import collect_trip_plan_issues
