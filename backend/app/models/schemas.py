@@ -1,14 +1,74 @@
 """数据模型定义"""
 
-from typing import List, Optional, Union
-from pydantic import BaseModel, Field, field_validator
+from typing import Any, List, Literal, Optional, Union
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import date
 
 
 # ============ 请求模型 ============
 
+class Preference(BaseModel):
+    """用户偏好，由 talk_agent 对话产出。"""
+    prompt: str = Field(default="", description="用户偏好提示词")
+
+
+class ChangeSelector(BaseModel):
+    """LLM 指向当前计划节点的结构化选择器。"""
+    name: Optional[str] = Field(default=None, description="节点名称或名称片段")
+    semantic: Optional[str] = Field(default=None, description="节点语义类别，如寺庙、大学")
+    day_index: Optional[int] = Field(default=None, ge=0, description="从 0 开始的行程日索引")
+
+
+class ChangeTarget(BaseModel):
+    """新增或替换时需要查询的真实 POI 目标。"""
+    name: Optional[str] = Field(default=None, description="目标 POI 名称")
+    semantic: Optional[str] = Field(default=None, description="目标 POI 类别，如大学、博物馆")
+
+
+class ChangeOperation(BaseModel):
+    """由 talk LLM 决定、由后端白名单执行的一项旅行计划操作。"""
+    operation: Literal[
+        "add_attraction",
+        "delete_attraction",
+        "replace_attraction",
+        "update_day",
+        "update_dates",
+        "full_replan",
+    ]
+    selector: Optional[ChangeSelector] = None
+    target: Optional[ChangeTarget] = None
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_date_update(self):
+        if self.operation == "update_dates":
+            for field in ("start_date", "end_date"):
+                value = self.fields.get(field)
+                if not isinstance(value, str) or len(value) != 10:
+                    raise ValueError(f"update_dates.{field} 必须是 YYYY-MM-DD 字符串")
+                try:
+                    date.fromisoformat(value)
+                except ValueError as error:
+                    raise ValueError(f"update_dates.{field} 不是有效日期") from error
+        return self
+
+
+class ChangeSet(BaseModel):
+    """一次对话产生的受控计划变更集合，禁止包含 SQL。"""
+    operations: List[ChangeOperation] = Field(min_length=1)
+
 class TripRequest(BaseModel):
-    """旅行规划请求"""
+    """
+        旅行规划请求
+        city: 目的城市
+        start_date: 开始日期 YYYY-MM-DD
+        end_date: 结束日期 YYYY-MM-DD
+        travel_days: 旅行天数
+        transportation: 交通方式
+        accommodation: 住宿偏好
+        preferences: 旅行偏好标签
+        free_text_input: 额外要求
+    """
     city: str = Field(..., description="目的地城市", example="北京")
     start_date: str = Field(..., description="开始日期 YYYY-MM-DD", example="2025-06-01")
     end_date: str = Field(..., description="结束日期 YYYY-MM-DD", example="2025-06-03")
@@ -17,6 +77,11 @@ class TripRequest(BaseModel):
     accommodation: str = Field(..., description="住宿偏好", example="经济型酒店")
     preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
+    conversation_id: Optional[str] = Field(default=None, description="关联的行程对话ID")
+    preference: Optional[Preference] = Field(default=None, description="talk_agent 提炼的用户偏好")
+    current_plan: Optional[dict] = Field(default=None, description="当前旅行计划，用于定向修改")
+    change_request: Optional[str] = Field(default="", description="用户要求修改的内容")
+    change_set: Optional[ChangeSet] = Field(default=None, description="talk LLM 输出的结构化计划操作")
     
     class Config:
         json_schema_extra = {
@@ -28,9 +93,69 @@ class TripRequest(BaseModel):
                 "transportation": "公共交通",
                 "accommodation": "经济型酒店",
                 "preferences": ["历史文化", "美食"],
-                "free_text_input": "希望多安排一些博物馆"
+                "free_text_input": "希望多安排一些博物馆",
+                "conversation_id": "conversation_demo",
+                "preference": {"prompt": "偏好自然风光和当地美食，节奏悠闲"},
+                "change_request": "将第二天改为自然风光路线"
             }
         }
+
+
+class TalkMessage(BaseModel):
+    """单条对话消息"""
+    role: str = Field(..., description="角色: user / assistant")
+    content: str = Field(..., description="消息内容")
+
+
+class TalkRequest(BaseModel):
+    """talk_agent 对话请求"""
+    conversation_id: Optional[str] = Field(default=None, description="所属行程对话ID，用于持久化聊天记录")
+    city: Optional[str] = Field(default=None, description="当前旅行计划目的地，用于消解大学、公园等模糊地点")
+    plan_context: Optional[str] = Field(default=None, description="当前行程摘要，供对话记忆和建议生成使用")
+    preference: Optional[Preference] = Field(default=None, description="当前会话已持久化的长期偏好")
+    messages: List[TalkMessage] = Field(default=[], description="历史对话")
+    message: str = Field(..., description="用户本轮输入")
+
+
+class ChatMessage(BaseModel):
+    """持久化的聊天消息"""
+    id: int = Field(..., description="消息ID")
+    conversation_id: str = Field(..., description="所属行程对话ID")
+    role: str = Field(..., description="角色: user / assistant")
+    content: str = Field(..., description="消息内容")
+    created_at: str = Field(..., description="创建时间(北京时间)")
+
+
+class TalkResponse(BaseModel):
+    """talk_agent 对话响应"""
+    success: bool = Field(default=True, description="是否成功")
+    reply: str = Field(default="", description="assistant 回复")
+    intent: str = Field(default="chat", description="语义意图: chat / replan")
+    change_request: Optional[str] = Field(default=None, description="提炼后的行程修改要求")
+    change_set: Optional[ChangeSet] = Field(default=None, description="LLM 输出的结构化计划操作")
+    top_suggestions: List[str] = Field(default_factory=list, description="基于当前会话记忆生成的 3 条后续建议")
+    preference: Optional["Preference"] = Field(default=None, description="提炼出的偏好")
+    done: bool = Field(default=False, description="偏好是否收集完成")
+    messages: List[ChatMessage] = Field(default=[], description="持久化后的完整聊天记录")
+
+
+class ChatHistoryResponse(BaseModel):
+    """聊天历史响应"""
+    success: bool = Field(default=True, description="是否成功")
+    messages: List[ChatMessage] = Field(default=[], description="聊天记录")
+
+
+class TalkSuggestionsRequest(BaseModel):
+    """为已存在的会话恢复基于记忆的后续建议。"""
+    conversation_id: str = Field(..., min_length=1, description="所属行程对话 ID")
+    city: Optional[str] = Field(default=None, description="当前旅行计划目的地")
+    plan_context: Optional[str] = Field(default=None, description="当前行程摘要")
+
+
+class TalkSuggestionsResponse(BaseModel):
+    """会话记忆生成的可点击建议。"""
+    success: bool = Field(default=True, description="是否成功")
+    top_suggestions: List[str] = Field(default_factory=list, description="3 条基于会话记忆的后续建议")
 
 
 class POISearchRequest(BaseModel):
@@ -80,6 +205,7 @@ class Meal(BaseModel):
     location: Optional[Location] = Field(default=None, description="经纬度坐标")
     description: Optional[str] = Field(default=None, description="描述")
     estimated_cost: int = Field(default=0, description="预估费用(元)")
+    poi_id: Optional[str] = Field(default="", description="真实餐馆的高德 POI ID")
 
 
 class Hotel(BaseModel):
@@ -92,6 +218,7 @@ class Hotel(BaseModel):
     distance: str = Field(default="", description="距离景点距离")
     type: str = Field(default="", description="酒店类型")
     estimated_cost: int = Field(default=0, description="预估费用(元/晚)")
+    poi_id: Optional[str] = Field(default="", description="真实酒店的高德 POI ID")
 
 
 class DayPlan(BaseModel):
@@ -115,6 +242,7 @@ class WeatherInfo(BaseModel):
     night_temp: Union[int, str] = Field(default=0, description="夜间温度")
     wind_direction: str = Field(default="", description="风向")
     wind_power: str = Field(default="", description="风力")
+    source: str = Field(default="高德", description="天气数据来源")
 
     @field_validator('day_temp', 'night_temp', mode='before')
     @classmethod
