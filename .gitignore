@@ -19,6 +19,7 @@ backend/venv/
 test/*.png
 test/**/*.png
 test/logs/
+todo.md
 
 # Local Chroma persistence (rebuildable POI cache)
 backend/data/chroma/
