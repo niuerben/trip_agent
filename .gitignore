@@ -20,6 +20,8 @@ test/*.png
 test/**/*.png
 test/logs/
 todo.md
+spec/
+role/
 
 # Local Chroma persistence (rebuildable POI cache)
 backend/data/chroma/
