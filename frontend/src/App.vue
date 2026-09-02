@@ -92,6 +92,7 @@ const userInitial = computed(() => {
 
 onMounted(() => {
   authUser.value = getCurrentUser()
+  window.addEventListener('trip-planner-login-required', openLogin)
   refreshConversations()
   unsubscribeConversationChanges = subscribeToConversationChanges(refreshConversations)
   void syncConversations().then(refreshConversations)
@@ -110,6 +111,10 @@ onMounted(() => {
 function refreshConversations() {
   conversations.value = listConversations()
   currentConversationId.value = getCurrentConversationId()
+}
+
+function openLogin() {
+  loginVisible.value = true
 }
 
 function startNewChat() {
@@ -202,7 +207,10 @@ function logout() {
   message.success('已退出登录')
 }
 
-onBeforeUnmount(() => unsubscribeConversationChanges?.())
+onBeforeUnmount(() => {
+  window.removeEventListener('trip-planner-login-required', openLogin)
+  unsubscribeConversationChanges?.()
+})
 </script>
 
 <style>
