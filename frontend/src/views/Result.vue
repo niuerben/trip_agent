@@ -229,7 +229,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Location, TripFormData, TripPlan } from '@/types'
 import { enrichTripPlanImages, generateTripPlan, getChatHistory, getChatSuggestions, getRouteGeometry, sendChatMessage, type RouteGeometrySegment } from '@/services/api'
-import { clearCurrentConversationId, clearLegacyPlan, createConversation, getConversation, getCurrentConversationId, loadLegacyPlan, setCurrentConversationId, updateConversation } from '@/services/conversations'
+import { clearLegacyPlan, createConversation, getConversation, getCurrentConversationId, loadLegacyPlan, setCurrentConversationId, updateConversation } from '@/services/conversations'
 
 const router = useRouter()
 const route = useRoute()
@@ -273,7 +273,7 @@ const planContext = computed(() => {
     const attractions = day.attractions.map((item) => item.name).join('、') || '暂无景点'
     return `第${day.day_index + 1}天：${attractions}`
   }).join('；')
-  return `${plan.value.city}，行程日期：${plan.value.start_date} 至 ${plan.value.end_date}；${days}`
+  return `${plan.value.city}，${days}`
 })
 let nextMessageId = 1
 let loadVersion = 0
@@ -907,17 +907,10 @@ async function sendMessage() {
     })
 
     const firstDay = currentPlan.days?.[0]
-    const dateUpdate = response.change_set?.operations?.find((operation) => operation.operation === 'update_dates')
-    const updatedStartDate = typeof dateUpdate?.fields?.start_date === 'string'
-      ? dateUpdate.fields.start_date
-      : currentPlan.start_date
-    const updatedEndDate = typeof dateUpdate?.fields?.end_date === 'string'
-      ? dateUpdate.fields.end_date
-      : currentPlan.end_date
     const replanRequest: TripFormData = {
       city: currentPlan.city,
-      start_date: updatedStartDate,
-      end_date: updatedEndDate,
+      start_date: currentPlan.start_date,
+      end_date: currentPlan.end_date,
       travel_days: currentPlan.days?.length || 1,
       transportation: firstDay?.transportation || '公共交通',
       accommodation: firstDay?.accommodation || '经济型酒店',
@@ -1135,7 +1128,7 @@ async function enrichPlanLocationsAndImages(
 
 function startNewPlan() {
   clearLegacyPlan()
-  clearCurrentConversationId()
+  localStorage.removeItem('trip_planner_current_conversation')
   router.push('/')
 }
 

@@ -93,7 +93,7 @@ export interface ChangeTarget {
 }
 
 export interface ChangeOperation {
-  operation: 'add_attraction' | 'delete_attraction' | 'replace_attraction' | 'update_day' | 'update_dates' | 'full_replan'
+  operation: 'add_attraction' | 'delete_attraction' | 'replace_attraction' | 'update_day' | 'full_replan'
   selector?: ChangeSelector
   target?: ChangeTarget
   fields?: Record<string, unknown>

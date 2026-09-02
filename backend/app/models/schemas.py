@@ -1,7 +1,7 @@
 """数据模型定义"""
 
 from typing import Any, List, Literal, Optional, Union
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import date
 
 
@@ -32,25 +32,11 @@ class ChangeOperation(BaseModel):
         "delete_attraction",
         "replace_attraction",
         "update_day",
-        "update_dates",
         "full_replan",
     ]
     selector: Optional[ChangeSelector] = None
     target: Optional[ChangeTarget] = None
     fields: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_date_update(self):
-        if self.operation == "update_dates":
-            for field in ("start_date", "end_date"):
-                value = self.fields.get(field)
-                if not isinstance(value, str) or len(value) != 10:
-                    raise ValueError(f"update_dates.{field} 必须是 YYYY-MM-DD 字符串")
-                try:
-                    date.fromisoformat(value)
-                except ValueError as error:
-                    raise ValueError(f"update_dates.{field} 不是有效日期") from error
-        return self
 
 
 class ChangeSet(BaseModel):

@@ -1,11 +1,23 @@
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <div class="topbar-title">行旅天下</div>
+      <div class="topbar-title">
+        <span class="topbar-logo" aria-hidden="true">✈️</span>
+        行旅天下
+      </div>
       <button v-if="!authUser" class="login-button" type="button" @click="loginVisible = true">登录</button>
       <button v-else class="user-button" type="button" @click="logout">{{ authUser.name }} · 退出</button>
     </header>
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+      <button
+        class="sidebar-toggle"
+        type="button"
+        :aria-label="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'"
+        :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'"
+        @click="sidebarCollapsed = !sidebarCollapsed"
+      >
+        <span aria-hidden="true">◧</span>
+      </button>
       <button class="new-chat" type="button" @click="startNewChat">
         <span>✎</span> 新行程 <kbd>Ctrl K</kbd>
       </button>
@@ -84,6 +96,7 @@ const loginForm = reactive({ username: '', password: '', confirmPassword: '' })
 const conversations = ref<ConversationRecord[]>([])
 const currentConversationId = ref<string | null>(null)
 const openConversationMenuId = ref<string | null>(null)
+const sidebarCollapsed = ref(false)
 let unsubscribeConversationChanges: (() => void) | undefined
 const userInitial = computed(() => {
   const name = authUser.value?.name?.trim() || 'U'
@@ -246,6 +259,54 @@ body { font-family: system-ui, -apple-system, sans-serif; }
   border-right: 1px solid #f0f0f0;
   background: #fbfbfc;
 }
+.sidebar-toggle {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #6f747c;
+  cursor: pointer;
+  font-size: 19px;
+  line-height: 1;
+}
+.sidebar-toggle:hover { background: #eef0f3; color: #25272b; }
+.sidebar-collapsed {
+  padding-left: 10px;
+  padding-right: 10px;
+  align-items: center;
+}
+.sidebar-collapsed .sidebar-toggle { position: static; margin-bottom: 22px; }
+.sidebar-collapsed .new-chat,
+.sidebar-collapsed .nav-links button,
+.sidebar-collapsed .sidebar-bottom button { font-size: 0; }
+.sidebar-collapsed .new-chat > span,
+.sidebar-collapsed .nav-links button > span { font-size: 18px; }
+.sidebar-collapsed .new-chat,
+.sidebar-collapsed .nav-links button,
+.sidebar-collapsed .sidebar-bottom button { justify-content: center; padding: 0; }
+.sidebar-collapsed .new-chat { margin-top: 0; }
+.sidebar-collapsed .new-chat > :not(:first-child),
+.sidebar-collapsed .nav-links button > :not(:first-child),
+.sidebar-collapsed .sidebar-bottom button > :not(.user-avatar) { display: none; }
+.sidebar-collapsed .history-label,
+.sidebar-collapsed .history-title,
+.sidebar-collapsed .history-more,
+.sidebar-collapsed .history-menu,
+.sidebar-collapsed .user-profile-name,
+.sidebar-collapsed .user-profile-action,
+.sidebar-collapsed .history-empty { display: none; }
+.sidebar-collapsed .history-list { width: 100%; }
+.sidebar-collapsed .history-item,
+.sidebar-collapsed .history-select { justify-content: center; padding: 0; }
+.sidebar-collapsed .history-dot { font-size: 10px; }
+.sidebar-collapsed .sidebar-bottom { width: 100%; }
 .brand {
   height: 38px;
   display: flex;
@@ -272,7 +333,7 @@ body { font-family: system-ui, -apple-system, sans-serif; }
 .new-chat {
   height: 44px;
   padding: 0 13px;
-  margin: 16px 0 10px;
+  margin: 28px 0 10px;
   background: #fff;
   box-shadow: 0 4px 15px rgba(30,30,30,.06);
   font-weight: 600;
@@ -313,6 +374,7 @@ kbd { margin-left: auto; color: #a5a7aa; font-size: 11px; font-weight: 400; }
   background: #f7f8fa;
   overflow: hidden;
 }
+.app-shell:has(.sidebar-collapsed) { grid-template-columns: 64px minmax(0, 1fr); }
 .main-content:has(.result-page) { overflow-y: auto; }
 .main-content:has(.home-page) { padding: 0; background: #fff; }
 @media (max-width: 1400px) {
@@ -320,5 +382,6 @@ kbd { margin-left: auto; color: #a5a7aa; font-size: 11px; font-weight: 400; }
   .main-content { padding: 16px 0 0; }
   .topbar-title { left: 18px; }
 }
+.main-content:has(.result-page) { padding: 0; }
 @media (max-width: 600px) { .topbar { padding: 0 12px; }.topbar-title { left: 16px; transform: none; font-size: 13px; }.oauth-actions { grid-template-columns: 1fr; } }
 </style>

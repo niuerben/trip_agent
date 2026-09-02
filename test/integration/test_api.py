@@ -1,8 +1,8 @@
 """项目 API 连通性检查。
 
 运行：
-    backend\\venv\\Scripts\\python.exe test\\test_api.py
-    backend\\venv\\Scripts\\python.exe test\\test_api.py --skip-trip
+    python integration/test_api.py
+    python integration/test_api.py --skip-trip
 
 脚本只打印状态、耗时和错误摘要，不打印任何 API Key、JWT 或数据库密码。
 """
@@ -21,7 +21,7 @@ import requests
 from dotenv import load_dotenv
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BACKEND_DIR = ROOT / "backend"
 load_dotenv(BACKEND_DIR / ".env")
 
@@ -187,6 +187,8 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--skip-trip", action="store_true", help="跳过会实际调用模型/高德的旅行规划接口")
     args = parser.parse_args()
+    print(f"【集成测试】test_api | {args.base_url}")
+    print("说明：检查后端 API、数据库、高德和模型服务是否可用。")
 
     checks = [
         ("health", lambda: check_health(args.base_url)),
@@ -200,13 +202,13 @@ def main() -> int:
         checks.append(("trip.plan", lambda: check_trip_plan(args.base_url)))
 
     results = [run_check(name, callback) for name, callback in checks]
-    print("API 检查结果")
-    print("=" * 72)
+    print("结果：")
     for result in results:
-        status = "PASS" if result.ok else "FAIL"
+        status = "通过" if result.ok else "失败"
         print(f"[{status:4}] {result.name:<18} {result.elapsed_ms:>6} ms  {result.detail}")
-    print("=" * 72)
-    return 0 if all(result.ok for result in results) else 1
+    passed = sum(result.ok for result in results)
+    print(f"汇总：{passed}/{len(results)} 项通过")
+    return 0 if passed == len(results) else 1
 
 
 if __name__ == "__main__":

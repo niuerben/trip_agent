@@ -17,3 +17,8 @@ backend/venv/
 **/*.log
 **/.DS_Store
 test/*.png
+test/**/*.png
+test/logs/
+
+# Local Chroma persistence (rebuildable POI cache)
+backend/data/chroma/

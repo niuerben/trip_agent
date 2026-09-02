@@ -1,17 +1,18 @@
 """高德地图MCP服务封装"""
 
+from functools import lru_cache
 from typing import List, Dict, Any, Optional
 
 import requests
-from hello_agents.tools import MCPTool
 from ..config import get_settings
 from ..models.schemas import Location, POIInfo, WeatherInfo
+from .mcp_logging import LoggingMCPTool
 
 # 全局MCP工具实例
 _amap_mcp_tool = None
 
 
-def get_amap_mcp_tool() -> MCPTool:
+def get_amap_mcp_tool() -> LoggingMCPTool:
     """
     获取高德地图MCP工具实例(单例模式)
     
@@ -27,7 +28,7 @@ def get_amap_mcp_tool() -> MCPTool:
             raise ValueError("高德地图API Key未配置,请在.env文件中设置AMAP_API_KEY")
         
         # 创建MCP工具
-        _amap_mcp_tool = MCPTool(
+        _amap_mcp_tool = LoggingMCPTool(
             name="amap",
             description="高德地图服务,支持POI搜索、路线规划、天气查询等功能",
             server_command=["uvx", "amap-mcp-server"],
@@ -54,13 +55,22 @@ class AmapService:
 
     PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
     WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
+    DAILY_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+    GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
+    DRIVING_DIRECTION_URL = "https://restapi.amap.com/v5/direction/driving"
+    TRANSIT_DIRECTION_URL = "https://restapi.amap.com/v5/direction/transit/integrated"
 
     def __init__(self):
         """初始化服务。MCP 仅在路线和详情接口使用时按需启动。"""
-        self.api_key = get_settings().amap_api_key
-        self.mcp_tool: Optional[MCPTool] = None
+        settings = get_settings()
+        self.api_key = settings.amap_api_key
+        self.timeout = (
+            settings.amap_connect_timeout_seconds,
+            settings.amap_read_timeout_seconds,
+        )
+        self.mcp_tool: Optional[LoggingMCPTool] = None
 
-    def _get_mcp_tool(self) -> MCPTool:
+    def _get_mcp_tool(self) -> LoggingMCPTool:
         """按需初始化 MCP，避免简单查询依赖 uvx/MCP 进程。"""
         if self.mcp_tool is None:
             self.mcp_tool = get_amap_mcp_tool()
@@ -94,7 +104,7 @@ class AmapService:
                     "page": 1,
                     "output": "json",
                 },
-                timeout=10,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             payload = response.json()
@@ -153,7 +163,7 @@ class AmapService:
                     "extensions": "all",
                     "output": "json",
                 },
-                timeout=10,
+                timeout=self.timeout,
             )
             response.raise_for_status()
             payload = response.json()
@@ -180,7 +190,129 @@ class AmapService:
         except Exception as e:
             print(f"❌ 天气查询失败: {str(e)}")
             raise
+
+    def get_weather_for_date(
+        self,
+        city: str,
+        target_date: str,
+        location: Optional[Location] = None,
+    ) -> WeatherInfo:
+        """仅查询一个缺失旅行日的逐日预报。
+
+        高德天气接口不能传日期且只返回有限窗口，因此仅在高德结果缺少某个
+        旅行日时，使用 Open-Meteo 的 start_date=end_date 精确补查该日期。
+        """
+        center = location or self.get_city_center(city)
+        if center is None:
+            raise ValueError(f"无法解析 {city} 的天气查询坐标")
+
+        response = requests.get(
+            self.DAILY_FORECAST_URL,
+            params={
+                "latitude": center.latitude,
+                "longitude": center.longitude,
+                "daily": (
+                    "weather_code,temperature_2m_max,temperature_2m_min,"
+                    "wind_direction_10m_dominant,wind_speed_10m_max"
+                ),
+                "timezone": "Asia/Shanghai",
+                "start_date": target_date,
+                "end_date": target_date,
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        daily = response.json().get("daily") or {}
+        dates = daily.get("time") or []
+        if target_date not in dates:
+            raise RuntimeError(f"逐日天气未返回目标日期 {target_date}")
+        index = dates.index(target_date)
+
+        weather_code = self._daily_value(daily, "weather_code", index, 0)
+        weather_text = self._weather_code_text(int(weather_code))
+        wind_degrees = float(self._daily_value(daily, "wind_direction_10m_dominant", index, 0))
+        wind_speed = round(float(self._daily_value(daily, "wind_speed_10m_max", index, 0)))
+        return WeatherInfo(
+            date=target_date,
+            day_weather=weather_text,
+            night_weather=weather_text,
+            day_temp=round(float(self._daily_value(daily, "temperature_2m_max", index, 0))),
+            night_temp=round(float(self._daily_value(daily, "temperature_2m_min", index, 0))),
+            wind_direction=self._wind_direction(wind_degrees),
+            wind_power=f"{wind_speed} km/h",
+            source="Open-Meteo",
+        )
+
+    @staticmethod
+    def _daily_value(daily: dict, key: str, index: int, default: Any) -> Any:
+        values = daily.get(key) or []
+        return values[index] if index < len(values) else default
+
+    @staticmethod
+    def _weather_code_text(code: int) -> str:
+        if code == 0:
+            return "晴"
+        if code in {1, 2}:
+            return "多云"
+        if code == 3:
+            return "阴"
+        if code in {45, 48}:
+            return "雾"
+        if 51 <= code <= 57:
+            return "毛毛雨"
+        if 61 <= code <= 67:
+            return "雨"
+        if 71 <= code <= 77:
+            return "雪"
+        if 80 <= code <= 82:
+            return "阵雨"
+        if 85 <= code <= 86:
+            return "阵雪"
+        if code in {95, 96, 99}:
+            return "雷雨"
+        return "天气变化"
+
+    @staticmethod
+    def _wind_direction(degrees: float) -> str:
+        directions = ("北风", "东北风", "东风", "东南风", "南风", "西南风", "西风", "西北风")
+        return directions[round((degrees % 360) / 45) % 8]
     
+    def get_city_center(self, city: str) -> Optional[Location]:
+        """通过高德 REST 地理编码获取城市中心点(GCJ-02)。
+
+        用作景点坐标越界判定的基准：任何距该中心超过阈值的坐标都视为跨城/跨省错误。
+        走 REST 通道(不依赖 MCP/uvx)，结果按城市名做进程内缓存，避免每次规划重复请求。
+        """
+        normalized = (city or "").strip()
+        if not normalized:
+            return None
+        center, _, _ = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
+        return center
+
+    def get_city_adcode(self, city: str) -> Optional[str]:
+        """返回高德行政区 adcode，用于区县级 POI 硬过滤。"""
+        normalized = (city or "").strip()
+        if not normalized:
+            return None
+        _, adcode, _ = _get_city_geocode_cached(normalized, self.api_key, self.timeout)
+        return adcode
+
+    def get_poi_search_city(self, city: str) -> str:
+        """返回高德 POI city 参数应使用的地级市名。
+
+        区县请求如“广州越秀”会被地理编码为越秀区，但 POI 搜索的 citylimit
+        应传父级“广州市”；直接传组合文本会导致 citylimit 失效并返回全国 POI。
+        """
+        normalized = (city or "").strip()
+        if not normalized:
+            return ""
+        _, _, search_city = _get_city_geocode_cached(
+            normalized,
+            self.api_key,
+            self.timeout,
+        )
+        return search_city or normalized
+
     def plan_route(
         self,
         origin_address: str,
@@ -246,6 +378,110 @@ class AmapService:
         except Exception as e:
             print(f"❌ 路线规划失败: {str(e)}")
             return {}
+
+    def get_route_geometry(
+        self,
+        origin: Location,
+        destination: Location,
+        city: str,
+        route_type: str,
+    ) -> Dict[str, Any]:
+        """返回可直接绘制的高德道路/公共交通折线，不依赖浏览器 JS 插件。
+
+        ``driving`` 提供道路几何；``transit`` 同时返回步行、公交与地铁的真实
+        分段几何，前端可用不同颜色叠加展示，而不是以两点直线代替路线。
+        """
+        if not self.api_key:
+            raise ValueError("AMAP_API_KEY未配置")
+        origin_text = f"{origin.longitude},{origin.latitude}"
+        destination_text = f"{destination.longitude},{destination.latitude}"
+        if route_type == "transit":
+            # v5 公共交通接口要求 city1/city2 为 adcode；中文城市名会返回
+            # INVALID_PARAMS。地理编码结果已做进程缓存，不会重复命中网络。
+            transit_city = self.get_city_adcode(city) or city
+            url = self.TRANSIT_DIRECTION_URL
+            params = {
+                "key": self.api_key,
+                "origin": origin_text,
+                "destination": destination_text,
+                "city1": transit_city,
+                "city2": transit_city,
+                "strategy": 0,
+                "show_fields": "polyline",
+                "output": "json",
+            }
+        else:
+            url = self.DRIVING_DIRECTION_URL
+            params = {
+                "key": self.api_key,
+                "origin": origin_text,
+                "destination": destination_text,
+                "strategy": 32,
+                "show_fields": "cost,navi,polyline",
+                "output": "json",
+            }
+        response = requests.get(url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if str(payload.get("status")) != "1":
+            raise RuntimeError(
+                f"高德{route_type}路线查询失败: {payload.get('info')} "
+                f"(infocode={payload.get('infocode')})"
+            )
+        segments = (
+            self._extract_transit_geometry(payload)
+            if route_type == "transit"
+            else self._extract_driving_geometry(payload)
+        )
+        return {"route_type": route_type, "segments": segments}
+
+    @staticmethod
+    def _parse_polyline(value: object) -> list[list[float]]:
+        points: list[list[float]] = []
+        for point in str(value or "").split(";"):
+            try:
+                longitude, latitude = (float(item) for item in point.split(",", 1))
+            except (TypeError, ValueError):
+                continue
+            if -180 <= longitude <= 180 and -90 <= latitude <= 90:
+                points.append([longitude, latitude])
+        return points
+
+    @classmethod
+    def _extract_driving_geometry(cls, payload: dict) -> list[dict]:
+        paths = (payload.get("route") or {}).get("paths") or []
+        steps = paths[0].get("steps") if paths and isinstance(paths[0], dict) else []
+        segments = []
+        for step in steps or []:
+            points = cls._parse_polyline(step.get("polyline") if isinstance(step, dict) else "")
+            if len(points) >= 2:
+                segments.append({"kind": "road", "points": points})
+        return segments
+
+    @classmethod
+    def _extract_transit_geometry(cls, payload: dict) -> list[dict]:
+        transits = (payload.get("route") or {}).get("transits") or []
+        segments = transits[0].get("segments") if transits and isinstance(transits[0], dict) else []
+        result: list[dict] = []
+        for segment in segments or []:
+            if not isinstance(segment, dict):
+                continue
+            walking = segment.get("walking") or {}
+            for step in walking.get("steps") or []:
+                points = cls._parse_polyline(step.get("polyline") if isinstance(step, dict) else "")
+                if len(points) >= 2:
+                    result.append({"kind": "walk", "points": points})
+            bus = segment.get("bus") or {}
+            for line in bus.get("buslines") or []:
+                if not isinstance(line, dict):
+                    continue
+                points = cls._parse_polyline(line.get("polyline"))
+                if len(points) < 2:
+                    continue
+                text = " ".join(str(line.get(key) or "") for key in ("name", "type"))
+                kind = "subway" if any(word in text for word in ("地铁", "轨道", "城际")) else "bus"
+                result.append({"kind": kind, "points": points})
+        return result
     
     def geocode(self, address: str, city: Optional[str] = None) -> Optional[Location]:
         """
@@ -316,6 +552,62 @@ class AmapService:
             return {}
 
 
+@lru_cache(maxsize=256)
+def _get_city_geocode_cached(
+    city: str,
+    api_key: str,
+    timeout: tuple,
+) -> tuple[Optional[Location], Optional[str], Optional[str]]:
+    """缓存行政区中心、adcode 和 POI 搜索应使用的父级城市。"""
+    if not api_key:
+        return None, None, None
+    try:
+        response = requests.get(
+            AmapService.GEOCODE_URL,
+            params={
+                "key": api_key,
+                "address": city,
+                "output": "json",
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as error:
+        print(f"⚠️ 高德城市中心解析跳过({city}): {type(error).__name__}: {error}")
+        return None, None, None
+
+    if str(payload.get("status")) != "1":
+        print(
+            f"⚠️ 高德城市中心解析返回非成功状态({city}): "
+            f"{payload.get('info')} (infocode={payload.get('infocode')})"
+        )
+        return None, None, None
+
+    geocodes = payload.get("geocodes") or []
+    for item in geocodes:
+        raw_location = str(item.get("location") or "") if isinstance(item, dict) else ""
+        try:
+            longitude, latitude = (float(value) for value in raw_location.split(",", 1))
+        except (TypeError, ValueError):
+            continue
+        if -180 <= longitude <= 180 and -90 <= latitude <= 90:
+            adcode = str(item.get("adcode") or item.get("citycode") or "").strip() or None
+            raw_city = item.get("city")
+            search_city = (
+                str(raw_city).strip()
+                if isinstance(raw_city, str) and raw_city.strip()
+                else None
+            )
+            # 直辖市 geocode 的 city 可能是空数组，省字段才是可用 citylimit。
+            if not search_city:
+                raw_province = item.get("province")
+                if isinstance(raw_province, str) and raw_province.strip().endswith("市"):
+                    search_city = raw_province.strip()
+            return Location(longitude=longitude, latitude=latitude), adcode, search_city
+    return None, None, None
+
+
 # 创建全局服务实例
 _amap_service = None
 
@@ -328,4 +620,3 @@ def get_amap_service() -> AmapService:
         _amap_service = AmapService()
     
     return _amap_service
-

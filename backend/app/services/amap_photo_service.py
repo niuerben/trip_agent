@@ -8,6 +8,8 @@ from functools import lru_cache
 from typing import List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from ..config import get_settings
 
@@ -20,6 +22,24 @@ class AmapPhotoService:
     def __init__(self):
         settings = get_settings()
         self.api_key = settings.amap_api_key
+        self.timeout = (
+            settings.amap_connect_timeout_seconds,
+            settings.amap_read_timeout_seconds,
+        )
+        self.session = requests.Session()
+        retry = Retry(
+            total=max(0, settings.amap_request_retries),
+            connect=max(0, settings.amap_request_retries),
+            read=max(0, settings.amap_request_retries),
+            status=max(0, settings.amap_request_retries),
+            backoff_factor=0.2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _fetch_pois(self, keywords: str, city: str = "", offset: int = 3) -> List[dict]:
         """调用高德关键词搜索, 返回 pois 列表 (可能为空)"""
@@ -40,11 +60,14 @@ class AmapPhotoService:
             params["citylimit"] = "true"
 
         try:
-            resp = requests.get(self.BASE_URL, params=params, timeout=10)
+            resp = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            print(f"❌ 高德关键词搜索失败: {e}")
+            print(
+                "⚠️ 高德关键词搜索跳过: "
+                f"{type(e).__name__}: {e}"
+            )
             return []
 
         # status "1" 表示成功
@@ -81,9 +104,27 @@ class AmapPhotoService:
                 return photos
         return []
 
-    def search_pois(self, keywords: str, city: str = "", offset: int = 10) -> List[dict]:
+    def search_pois(
+        self,
+        keywords: str,
+        city: str = "",
+        offset: int = 10,
+        *,
+        persist: bool = True,
+    ) -> List[dict]:
         """返回带图片扩展字段的高德 POI 原始结果。"""
-        return self._fetch_pois(keywords, city=city, offset=offset)
+        pois = self._fetch_pois(keywords, city=city, offset=offset)
+        if not persist:
+            return pois
+        try:
+            from .poi_vector_store import get_poi_vector_store
+
+            store = get_poi_vector_store()
+            if store:
+                store.upsert_pois(pois, city)
+        except Exception as error:
+            print(f"⚠️ POI 写入 Chroma 跳过: {type(error).__name__}: {error}")
+        return pois
 
     def get_photo_url(self, keywords: str, city: str = "") -> Optional[str]:
         """获取单张图片 URL(命中缓存, 找不到返回 None)"""
