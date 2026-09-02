@@ -157,6 +157,10 @@ export async function registerUser(username: string, password: string): Promise<
   return response.data
 }
 
+export function isAuthenticated(): boolean {
+  return Boolean(localStorage.getItem(TOKEN_KEY))
+}
+
 export function saveSession(token: string, user: { id?: string; name: string; avatar?: string }) {
   localStorage.setItem(TOKEN_KEY, token)
   localStorage.setItem(USER_KEY, JSON.stringify(user))

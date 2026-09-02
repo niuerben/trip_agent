@@ -48,6 +48,14 @@ def user_id_from_request(request: Request) -> str:
     return "local:guest"
 
 
+def authenticated_user_id(request: Request) -> str:
+    """会话接口必须绑定真实登录用户，禁止 guest 读写历史记录。"""
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    return user_id_from_request(request)
+
+
 def parse_client_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:

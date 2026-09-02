@@ -149,7 +149,7 @@
 import { reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { message } from "ant-design-vue";
-import { generateTripPlan } from "@/services/api";
+import { generateTripPlan, isAuthenticated } from "@/services/api";
 import type { TripFormData, TripFormState } from "@/types";
 import { createConversation } from "@/services/conversations";
 const router = useRouter();
@@ -227,6 +227,12 @@ function resetLoading() {
 }
 
 async function handleSubmit() {
+  if (!isAuthenticated()) {
+    message.warning("请先登录后再生成旅行计划");
+    window.dispatchEvent(new CustomEvent("trip-planner-login-required"));
+    return;
+  }
+
   const requestData = buildRequestData();
   if (!requestData) return;
 
