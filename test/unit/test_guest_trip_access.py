@@ -1,66 +1,60 @@
-"""验证未登录 guest 无法访问旅行规划接口。
-
-需要先启动后端：
-    python backend/run.py
-
-运行：
-    python test/unit/test_guest_trip_access.py
-"""
+"""Verify that travel planning requires an authenticated JWT."""
 
 from __future__ import annotations
 
+import asyncio
+import sys
 import unittest
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-import json
+from pathlib import Path
+
+import jwt
+from fastapi import HTTPException
+from starlette.requests import Request
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from backend.app.api.routes import trip
+from backend.app.config import get_settings
+from backend.app.models.schemas import TripRequest
 
 
-BASE_URL = "http://localhost:8000"
-TRIP_PAYLOAD = json.dumps({
-    "city": "深圳",
-    "start_date": "2026-09-05",
-    "end_date": "2026-09-07",
-    "travel_days": 3,
-    "transportation": "公共交通",
-    "accommodation": "经济型酒店",
-    "preferences": [],
-    "free_text_input": "",
-}).encode("utf-8")
+REQUEST = TripRequest(
+    city="深圳",
+    start_date="2026-09-05",
+    end_date="2026-09-07",
+    travel_days=3,
+    transportation="公共交通",
+    accommodation="经济型酒店",
+)
+
+
+def request_with_authorization(value: str | None = None) -> Request:
+    headers = [] if value is None else [(b"authorization", value.encode("utf-8"))]
+    return Request({"type": "http", "headers": headers})
 
 
 class GuestTripAccessTest(unittest.TestCase):
-    def request_as_guest(self, authorization: str | None = None):
-        headers = {"Content-Type": "application/json"}
-        if authorization is not None:
-            headers["Authorization"] = authorization
-        request = Request(
-            f"{BASE_URL}/api/trip/plan",
-            data=TRIP_PAYLOAD,
-            headers=headers,
-            method="POST",
-        )
-        try:
-            return urlopen(request, timeout=10)
-        except HTTPError as error:
-            return error
-        except (TimeoutError, URLError) as error:  # 后端未启动或无法连接
-            return error
+    def test_request_without_authorization_is_rejected_before_planning(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(trip.plan_trip(REQUEST, request_with_authorization()))
 
-    def assert_guest_rejected(self, authorization: str | None) -> None:
-        response = self.request_as_guest(authorization)
-        if isinstance(response, URLError) and not hasattr(response, "code"):
-            self.skipTest(f"后端未启动：{response}")
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_invalid_bearer_token_is_rejected_before_planning(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(trip.plan_trip(REQUEST, request_with_authorization("Bearer local:guest")))
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_valid_jwt_is_accepted_by_the_authentication_boundary(self) -> None:
+        settings = get_settings()
+        token = jwt.encode({"sub": "test-user"}, settings.jwt_secret, algorithm="HS256")
+
         self.assertEqual(
-            getattr(response, "code", None),
-            401,
-            f"guest 请求未被拒绝，响应={response}",
+            trip.authenticated_user_id(request_with_authorization(f"Bearer {token}")),
+            "test-user",
         )
-
-    def test_request_without_authorization_is_rejected(self) -> None:
-        self.assert_guest_rejected(None)
-
-    def test_local_guest_bearer_is_rejected(self) -> None:
-        self.assert_guest_rejected("Bearer local:guest")
 
 
 if __name__ == "__main__":

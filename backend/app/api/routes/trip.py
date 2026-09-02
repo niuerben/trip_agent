@@ -21,7 +21,7 @@ from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
 from ...services.trip_plan_validator import validate_trip_plan
-from .conversations import user_id_from_request
+from .conversations import authenticated_user_id
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 _PLANNER_LOG_LOCK = threading.Lock()
@@ -162,7 +162,8 @@ async def _persist_changed_plan(conversation_id: str | None, user_id: str, plan:
     description="根据用户输入的旅行需求，生成详细的旅行计划",
 )
 async def plan_trip(request: TripRequest, http_request: Request):
-    """生成旅行计划；只有通过 ReAct Validator 的计划才允许出站。"""
+    """生成旅行计划；必须先登录。"""
+    user_id = authenticated_user_id(http_request)
     try:
         print(f"\n{'=' * 60}")
         print("收到旅行规划请求:")
@@ -177,7 +178,6 @@ async def plan_trip(request: TripRequest, http_request: Request):
             and bool(settings.llm_api_key or settings.openai_api_key)
         )
 
-        user_id = user_id_from_request(http_request)
         preference = request.preference
         preference_source = "request.preference"
         if preference is None:

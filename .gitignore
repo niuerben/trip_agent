@@ -24,5 +24,10 @@ todo.md
 spec/
 role/
 
+# Local test artifacts and live-service outputs
+test-artifacts/
+test/integration/results/
+test/integration/results/
+
 # Local Chroma persistence (rebuildable POI cache)
 backend/data/chroma/

@@ -95,7 +95,7 @@ Remove-Item Env:RUN_REAL_SERVICE_TESTS
 - `LLM_API_KEY`、`AMAP_API_KEY` 有效；若使用 MCP，还需配置 `AMAP_MAPS_API_KEY` 和安装 `uvx`。
 - 测试应通过 `RUN_REAL_SERVICE_TESTS=1` 显式启用。
 
-运行真实规划 Agent：
+真实规划 Agent 的结果默认写入仓库根目录下被 Git 忽略的 `test-artifacts/plan_agent_real/`，也可通过 `TEST_ARTIFACT_DIR` 指定目录。
 
 ```powershell
 $env:RUN_REAL_SERVICE_TESTS = "1"

@@ -13,6 +13,7 @@ from hello_agents import ReActAgent
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from test._gates import require_real_service_tests, test_artifact_dir
 from backend.app.agents.plan_agent import plan
 
 
@@ -29,11 +30,16 @@ PLAN_AGENT_CASES = [
     # ("规划青岛夏日旅行", "偏好海鲜和轻松路线"),
 ]
 
-RESULT_FILE = Path(__file__).resolve().parent / "results" / "plan_agent_real_results.jsonl"
-TEXT_RESULT_FILE = Path(__file__).resolve().parent / "results" / "plan_agent_real_results.txt"
+RESULTS_DIR = test_artifact_dir() / "plan_agent_real"
+RESULT_FILE = RESULTS_DIR / "results.jsonl"
+TEXT_RESULT_FILE = RESULTS_DIR / "results.txt"
 
 
 class PlanAgentRealTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        require_real_service_tests("This test calls the real LLM")
+
     def test_each_input_is_recorded_independently(self) -> None:
         RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with (
@@ -89,8 +95,15 @@ class PlanAgentRealTest(unittest.TestCase):
                 )
                 text_output.flush()
 
-        self.assertEqual(len(PLAN_AGENT_CASES), len(RESULT_FILE.read_text(encoding="utf-8").splitlines()))
+        records = [json.loads(line) for line in RESULT_FILE.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(PLAN_AGENT_CASES), len(records))
         self.assertTrue(TEXT_RESULT_FILE.exists())
+        failures = [
+            f"{record['requirement_prompt']}: {record['error']}"
+            for record in records
+            if not record["passed"]
+        ]
+        self.assertEqual([], failures, "\\n".join(failures))
 
 
 if __name__ == "__main__":
