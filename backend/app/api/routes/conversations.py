@@ -49,7 +49,7 @@ def user_id_from_request(request: Request) -> str:
 
 
 def authenticated_user_id(request: Request) -> str:
-    """会话接口必须绑定真实登录用户，禁止 guest 读写历史记录。"""
+    """返回已登录用户 ID；没有有效 Bearer JWT 时拒绝请求。"""
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="请先登录")

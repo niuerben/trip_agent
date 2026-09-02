@@ -4,10 +4,10 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ...agents.trip_planner_agent import MultiAgentTripPlanner, get_trip_planner_agent
+from ...services.trip_planning_service import TripPlanningService, get_trip_planning_service
 from ...config import get_settings
 from ...models.schemas import TripPlan, TripPlanResponse, TripRequest
-from .conversations import authenticated_user_id
+from ..routes.conversations import authenticated_user_id
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 
@@ -37,15 +37,15 @@ async def plan_trip(request: TripRequest, http_request: Request):
 
         if not has_llm_key:
             print("未配置模型密钥，直接使用基础计划")
-            trip_plan = MultiAgentTripPlanner._create_fallback_plan(
+            trip_plan = TripPlanningService._create_fallback_plan(
                 request,
                 "未配置模型密钥",
             )
-            trip_plan = MultiAgentTripPlanner._enrich_attraction_images(trip_plan)
+            trip_plan = TripPlanningService._enrich_attraction_images(trip_plan)
         else:
             try:
                 agent = await asyncio.wait_for(
-                    asyncio.to_thread(get_trip_planner_agent),
+                    asyncio.to_thread(get_trip_planning_service),
                     timeout=settings.planner_init_timeout_seconds,
                 )
                 print("开始生成旅行计划...")
@@ -58,11 +58,11 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     "模型服务不可用，使用基础计划: "
                     f"{type(agent_error).__name__}: {agent_error}"
                 )
-                trip_plan = MultiAgentTripPlanner._create_fallback_plan(
+                trip_plan = TripPlanningService._create_fallback_plan(
                     request,
                     "模型或高德服务响应超时/不可用",
                 )
-                trip_plan = MultiAgentTripPlanner._enrich_attraction_images(trip_plan)
+                trip_plan = TripPlanningService._enrich_attraction_images(trip_plan)
 
         print("旅行计划生成成功，准备返回响应\n")
         return TripPlanResponse(
@@ -89,7 +89,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
 async def enrich_trip_images(plan: TripPlan):
     """为历史计划中缺少 image_url 的景点补充高德 POI 图片。"""
     enriched_plan = await asyncio.to_thread(
-        MultiAgentTripPlanner._enrich_attraction_images,
+        TripPlanningService._enrich_attraction_images,
         plan,
     )
     return TripPlanResponse(
@@ -108,14 +108,14 @@ async def health_check():
     """检查规划 Agent 是否可以初始化。"""
     try:
         agent = await asyncio.wait_for(
-            asyncio.to_thread(get_trip_planner_agent),
+            asyncio.to_thread(get_trip_planning_service),
             timeout=get_settings().planner_init_timeout_seconds,
         )
         return {
             "status": "healthy",
             "service": "trip-planner",
-            "agent_name": agent.agent.name,
-            "tools_count": len(agent.agent.list_tools()),
+            "agent_name": agent.agent_name,
+            "tools_count": agent.tools_count,
         }
     except Exception as error:
         raise HTTPException(status_code=503, detail=f"服务不可用: {error}") from error
