@@ -26,6 +26,7 @@ export interface Meal {
   location?: Location
   description?: string
   estimated_cost?: number
+  poi_id?: string
 }
 
 export interface Hotel {
@@ -37,6 +38,7 @@ export interface Hotel {
   distance: string
   type: string
   estimated_cost?: number
+  poi_id?: string
 }
 
 export interface Budget {
@@ -66,6 +68,7 @@ export interface WeatherInfo {
   night_temp: number
   wind_direction: string
   wind_power: string
+  source?: string
 }
 
 export interface TripPlan {
@@ -78,6 +81,28 @@ export interface TripPlan {
   budget?: Budget
 }
 
+export interface ChangeSelector {
+  name?: string
+  semantic?: string
+  day_index?: number
+}
+
+export interface ChangeTarget {
+  name?: string
+  semantic?: string
+}
+
+export interface ChangeOperation {
+  operation: 'add_attraction' | 'delete_attraction' | 'replace_attraction' | 'update_day' | 'update_dates' | 'full_replan'
+  selector?: ChangeSelector
+  target?: ChangeTarget
+  fields?: Record<string, unknown>
+}
+
+export interface ChangeSet {
+  operations: ChangeOperation[]
+}
+
 export interface TripFormData {
   city: string
   start_date: string
@@ -87,6 +112,11 @@ export interface TripFormData {
   accommodation: string
   preferences: string[]
   free_text_input: string
+  conversation_id?: string
+  preference?: Preference
+  current_plan?: TripPlan
+  change_request?: string
+  change_set?: ChangeSet
 }
 
 export type TripFormState = Omit<TripFormData, 'start_date' | 'end_date'> & {
@@ -98,5 +128,58 @@ export interface TripPlanResponse {
   success: boolean
   message: string
   data?: TripPlan
+}
+
+export interface Preference {
+  prompt: string
+}
+
+export interface TalkMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatMessage {
+  id: number
+  conversation_id: string
+  role: 'user' | 'assistant'
+  content: string
+  created_at: string
+}
+
+export interface TalkRequest {
+  conversation_id?: string
+  city?: string
+  plan_context?: string
+  messages?: TalkMessage[]
+  message: string
+}
+
+export interface TalkResponse {
+  success: boolean
+  reply: string
+  intent: 'chat' | 'replan'
+  change_request?: string
+  change_set?: ChangeSet
+  top_suggestions: string[]
+  preference?: Preference
+  done: boolean
+  messages: ChatMessage[]
+}
+
+export interface TalkSuggestionsRequest {
+  conversation_id: string
+  city?: string
+  plan_context?: string
+}
+
+export interface TalkSuggestionsResponse {
+  success: boolean
+  top_suggestions: string[]
+}
+
+export interface ChatHistoryResponse {
+  success: boolean
+  messages: ChatMessage[]
 }
 
