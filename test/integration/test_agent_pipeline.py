@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.agents.talk_agent import TalkAgent
-from backend.app.agents.trip_planner_agent import TripPlannerAgent
+from backend.app.services.trip_planning_service import TripPlanningService
 from backend.app.models.schemas import (
     Attraction,
     ChangeSet,
@@ -63,7 +63,7 @@ def _plan() -> TripPlan:
     )
 
 
-class TripPlannerAgentIntegrationTest(unittest.TestCase):
+class TripPlanningServiceIntegrationTest(unittest.TestCase):
     def test_plan_trip_delivers_react_validated_response(self) -> None:
         request = _request()
         delivered = _plan()
@@ -98,16 +98,16 @@ class TripPlannerAgentIntegrationTest(unittest.TestCase):
             planner_preload_poi_evidence=False,
             planner_preloaded_deterministic_plan=False,
         )
-        agent = object.__new__(TripPlannerAgent)
+        agent = object.__new__(TripPlanningService)
         agent.llm = object()
         with (
-            patch("backend.app.agents.trip_planner_agent.get_settings", return_value=settings),
+            patch("backend.app.services.trip_planning_service.get_settings", return_value=settings),
             patch("backend.app.services.amap_service.get_amap_service", return_value=FakeAmap()),
             patch.object(agent, "_retrieve_cached_pois", return_value=[]),
-            patch("backend.app.agents.trip_planner_agent.ValidatedPlanningReActAgent", FakeReAct),
-            patch.object(TripPlannerAgent, "_complete_weather_for_travel_dates", side_effect=lambda facts, *_: facts),
-            patch.object(TripPlannerAgent, "_enrich_attraction_images", side_effect=lambda plan, **_: plan),
-            patch("backend.app.agents.trip_planner_agent.validate_trip_plan") as validate,
+            patch("backend.app.services.trip_planning_service.ValidatedPlanningReActAgent", FakeReAct),
+            patch.object(TripPlanningService, "_complete_weather_for_travel_dates", side_effect=lambda facts, *_: facts),
+            patch.object(TripPlanningService, "_enrich_attraction_images", side_effect=lambda plan, **_: plan),
+            patch("backend.app.services.trip_planning_service.validate_trip_plan") as validate,
         ):
             result = agent.plan_trip(request, Preference(prompt="偏好校园和轻松节奏"))
 
@@ -154,17 +154,17 @@ class TripPlannerAgentIntegrationTest(unittest.TestCase):
             change_request=talk_response.change_request,
             change_set=talk_response.change_set,
         )
-        planner = object.__new__(TripPlannerAgent)
+        planner = object.__new__(TripPlanningService)
         planner.llm = object()
         settings = SimpleNamespace(district_geo_radius_km=25, city_geo_radius_km=80)
         with (
-            patch("backend.app.agents.trip_planner_agent.get_settings", return_value=settings),
+            patch("backend.app.services.trip_planning_service.get_settings", return_value=settings),
             patch("backend.app.services.amap_service.get_amap_service", return_value=SimpleNamespace(
                 get_city_center=lambda _city: Location(longitude=114.4, latitude=22.7),
                 get_city_adcode=lambda _city: "440300",
             )),
             patch.object(planner, "_retrieve_cached_pois", return_value=[]),
-            patch("backend.app.agents.trip_planner_agent.validate_trip_plan"),
+            patch("backend.app.services.trip_planning_service.validate_trip_plan"),
         ):
             result = planner.plan_trip(request)
 

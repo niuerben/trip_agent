@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.agents.plan_agent import plan
+from hello_agents import ReActAgent,HelloAgentsLLM
 
 
 PLAN_AGENT_CASES = [
@@ -49,7 +50,11 @@ class PlanAgentRealTest(unittest.TestCase):
                 }
                 try:
                     case_started = time.perf_counter()
-                    response = plan(requirement_prompt, preference_prompt)
+                    # response = plan(requirement_prompt, preference_prompt)
+                    
+                    plan_agent = PlanAgent()
+                    q = "\n".join(["需求："+requirement_prompt,"偏好/修改意见："+preference_prompt])
+                    response = plan_agent.run(q)
 
                     loop_prompt = str(response.get("loop_prompt", "")) if isinstance(response, dict) else ""
                     record.update({

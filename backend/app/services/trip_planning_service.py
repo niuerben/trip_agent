@@ -7,7 +7,7 @@ from itertools import combinations, permutations, product
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, timedelta
 from typing import Optional
-from ..services.llm_service import get_llm
+from .llm_service import get_llm
 from ..models.schemas import (
     Attraction,
     ChangeOperation,
@@ -22,19 +22,19 @@ from ..models.schemas import (
     WeatherInfo,
 )
 from ..config import get_settings
-from ..services.amap_photo_service import AmapPhotoService, get_amap_photo_service
-from ..services.trip_plan_validator import (
+from .amap_photo_service import AmapPhotoService, get_amap_photo_service
+from .trip_plan_validator import (
     TripPlanValidationError,
     is_within_city,
     validate_trip_plan,
 )
-from ..services.poi_vector_store import classify_poi_group
-from ..services.planning_service import (
+from .poi_vector_store import classify_poi_group
+from .planning_service import (
     PlanningSession,
     PlanningToolset,
     ValidatedPlanningReActAgent,
 )
-from .plan_agent import PlanAgent
+from ..agents.plan_agent import PlanAgent
 
 def _normalize_city_for_amap(city: str) -> str:
     """标准化城市名给高德 API，避免区县名导致 citylimit 失效搜出外地结果。
@@ -91,7 +91,7 @@ def _is_district_adcode(adcode: Optional[str]) -> bool:
     return len(value) == 6 and value.isdigit() and not value.endswith("00")
 
 
-class TripPlannerAgent:
+class TripPlanningService:
     """准备规划上下文并委托给受 Validator 约束的 ReAct Agent。"""
 
     def __init__(self):
@@ -131,7 +131,7 @@ class TripPlannerAgent:
             city_adcode = None
             amap_city = _normalize_city_for_amap(request.city)
             try:
-                from ..services.amap_service import get_amap_service
+                from .amap_service import get_amap_service
 
                 amap_service = get_amap_service()
                 city_center = amap_service.get_city_center(request.city)
@@ -317,7 +317,7 @@ class TripPlannerAgent:
             weather_facts = trip_plan.weather_info
             if not weather_facts:
                 try:
-                    from ..services.amap_service import get_amap_service
+                    from .amap_service import get_amap_service
 
                     weather_facts = get_amap_service().get_weather(
                         amap_city
@@ -347,7 +347,7 @@ class TripPlannerAgent:
             if skip_image_enrichment:
                 skip_reason = "定向修改" if is_targeted_modification else "预加载证据"
                 print(f"跳过图片补齐（{skip_reason}模式）：转为前端异步加载，仅验证坐标有效性")
-                TripPlannerAgent._enrich_meal_pois(
+                TripPlanningService._enrich_meal_pois(
                     trip_plan,
                     city_center=city_center,
                     radius_km=radius_km,
@@ -657,7 +657,7 @@ class TripPlannerAgent:
         city_center: Optional[Location] = None,
     ) -> list[WeatherInfo]:
         """保留已有旅行日预报，并且只精确补查缺失的旅行日期。"""
-        selected = TripPlannerAgent._weather_for_travel_dates(weather_info, request)
+        selected = TripPlanningService._weather_for_travel_dates(weather_info, request)
         start = date.fromisoformat(request.start_date)
         ordered_dates = [
             (start + timedelta(days=index)).isoformat()
@@ -668,7 +668,7 @@ class TripPlannerAgent:
         if not missing_dates:
             return [weather_by_date[item] for item in ordered_dates]
 
-        from ..services.amap_service import get_amap_service
+        from .amap_service import get_amap_service
 
         service = get_amap_service()
         for missing_date in missing_dates:
@@ -705,7 +705,7 @@ class TripPlannerAgent:
         """
         # 历史计划可能只有“第1天早餐”等占位餐饮；先从 Chroma 回填真实餐馆，
         # 这条路径不依赖高德图片 API，确保已有缓存坐标能进入每日路线。
-        TripPlannerAgent._enrich_meal_pois(
+        TripPlanningService._enrich_meal_pois(
             plan,
             city_center=city_center,
             radius_km=radius_km,
@@ -752,7 +752,7 @@ class TripPlannerAgent:
             if not city_center or not radius_km:
                 # 历史图片补齐接口未传入地理基准时，保持原有补图行为。
                 return True
-            location = TripPlannerAgent._parse_poi_location(poi)
+            location = TripPlanningService._parse_poi_location(poi)
             return bool(
                 location
                 and city_center
@@ -823,9 +823,9 @@ class TripPlannerAgent:
                 continue
             exact_match = exact_matches.get(attraction.name)
             if exact_match:
-                TripPlannerAgent._apply_poi_data(attraction, exact_match)
+                TripPlanningService._apply_poi_data(attraction, exact_match)
                 photos = AmapPhotoService._extract_photos(exact_match)
-                if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
+                if photos and not TripPlanningService._is_amap_image_url(attraction.image_url):
                     attraction.image_url = photos[0]["url"]
                 continue
 
@@ -836,7 +836,7 @@ class TripPlannerAgent:
                 None,
             )
             if exact_from_broad:
-                TripPlannerAgent._apply_poi_data(attraction, exact_from_broad)
+                TripPlanningService._apply_poi_data(attraction, exact_from_broad)
                 photos = AmapPhotoService._extract_photos(exact_from_broad)
                 if photos and not TripPlannerAgent._is_amap_image_url(attraction.image_url):
                     attraction.image_url = photos[0]["url"]
@@ -845,7 +845,7 @@ class TripPlannerAgent:
         # （如深圳计划里的北京故宫）。用高德在该城市搜到的真实 POI 整条替换，
         # 候选池耗尽则丢弃，避免把外地坐标画到地图上。
         if city_center is not None and radius_km and radius_km > 0:
-            TripPlannerAgent._repair_out_of_city_attractions(
+            TripPlanningService._repair_out_of_city_attractions(
                 plan, pois, city_center, radius_km, normalize, target_adcode
             )
 
@@ -889,7 +889,7 @@ class TripPlannerAgent:
                     if target_name and poi_name and (
                         target_name in poi_name or poi_name in target_name
                     ):
-                        location = TripPlannerAgent._parse_poi_location(poi)
+                        location = TripPlanningService._parse_poi_location(poi)
                         if location:
                             target.location = location
                         break
@@ -921,7 +921,7 @@ class TripPlannerAgent:
         if all(meal.poi_id and meal.location and meal.address for meal in meals):
             return plan
         try:
-            from ..services.poi_vector_store import get_poi_vector_store
+            from .poi_vector_store import get_poi_vector_store
 
             store = get_poi_vector_store()
             if not store:
@@ -943,7 +943,7 @@ class TripPlannerAgent:
         def in_scope(candidate: dict) -> bool:
             if not city_center or not radius_km:
                 return True
-            location = TripPlannerAgent._parse_poi_location({
+            location = TripPlanningService._parse_poi_location({
                 "location": f"{candidate.get('longitude')},{candidate.get('latitude')}"
             })
             return bool(location and is_within_city(location, city_center, radius_km))
@@ -980,7 +980,7 @@ class TripPlannerAgent:
             if not poi_id:
                 continue
             used_ids.add(poi_id)
-            location = TripPlannerAgent._parse_poi_location({
+            location = TripPlanningService._parse_poi_location({
                 "location": f"{candidate.get('longitude')},{candidate.get('latitude')}"
             })
             if location is None:
@@ -1026,7 +1026,7 @@ class TripPlannerAgent:
         for poi in pois:
             if not isinstance(poi, dict):
                 continue
-            location = TripPlannerAgent._parse_poi_location(poi)
+            location = TripPlanningService._parse_poi_location(poi)
             poi_adcode = str(poi.get("adcode") or "").strip()
             if target_adcode and poi_adcode:
                 in_scope = poi_adcode == target_adcode
@@ -1059,7 +1059,7 @@ class TripPlannerAgent:
                     f"⚠️ 第{index}天景点“{attraction.name}”坐标越界，"
                     f"替换为“{replacement.get('name')}”"
                 )
-                TripPlannerAgent._overwrite_attraction_from_poi(
+                TripPlanningService._overwrite_attraction_from_poi(
                     attraction, replacement, plan.city
                 )
                 kept.append(attraction)
@@ -1074,7 +1074,7 @@ class TripPlannerAgent:
         模型原本的描述是针对外地景点写的，替换坐标后必须一并清掉，
         否则会出现“名字是深圳景点、简介却在讲北京”的错位。
         """
-        TripPlannerAgent._apply_poi_data(attraction, poi)
+        TripPlanningService._apply_poi_data(attraction, poi)
         poi_type = str(poi.get("type") or "").split(";")[0].strip()
         attraction.description = poi_type or f"{city}的推荐景点"
         attraction.category = "景点"
@@ -1087,7 +1087,7 @@ class TripPlannerAgent:
     @staticmethod
     def _apply_poi_data(attraction: Attraction, poi: dict) -> None:
         """将高德 POI 的权威名称、地址、编号和 GCJ-02 坐标写回景点。"""
-        location = TripPlannerAgent._parse_poi_location(poi)
+        location = TripPlanningService._parse_poi_location(poi)
         if location:
             attraction.location = location
         poi_id = str(poi.get("id") or "")
@@ -1465,7 +1465,7 @@ class TripPlannerAgent:
     ) -> list[dict]:
         """先按景点、酒店、餐馆三大类从 Chroma 召回，天气和路线仍实时查询。"""
         try:
-            from ..services.poi_vector_store import get_poi_vector_store
+            from .poi_vector_store import get_poi_vector_store
 
             store = get_poi_vector_store()
             if not store:
@@ -1514,14 +1514,14 @@ class TripPlannerAgent:
             return []
 
 # 全局单 Agent 实例
-_trip_planner_agent = None
+_trip_planning_service = None
 
 
-def get_trip_planner_agent() -> TripPlannerAgent:
-    """获取单 Agent 旅行规划系统实例。"""
-    global _trip_planner_agent
+def get_trip_planning_service() -> TripPlanningService:
+    """获取单例旅行规划服务。"""
+    global _trip_planning_service
 
-    if _trip_planner_agent is None:
-        _trip_planner_agent = TripPlannerAgent()
+    if _trip_planning_service is None:
+        _trip_planning_service = TripPlanningService()
 
-    return _trip_planner_agent
+    return _trip_planning_service

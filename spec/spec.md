@@ -6,6 +6,15 @@ test 接口向backend 适配，backend 接口不得向 test 适配
 
 ## api 规范
 
+## Agent api 规范
+
+{
+    conversation_id: str,  # 会话 ID
+    city: str,  # 目的地城市
+    plan_context: str,  # 当前行程摘要
+    preference: {prompt: str},  # 已知长期偏好
+}
+
 ## 数据库规范
 
 ### 数据库列表

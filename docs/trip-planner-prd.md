@@ -233,14 +233,16 @@ flowchart TB
     UI[Vue 3 + TypeScript + Vite]
     API[FastAPI API Gateway]
     AUTH[认证与会话服务]
-    PLAN[旅行规划服务]
-    CHAT[上下文对话服务]
+    PLAN[TripPlanningService<br/>旅行规划服务层]
+    CHAT[TalkAgent<br/>对话服务]
     PREF[偏好服务]
-    MAP[高德地图服务 / MCP]
-    AGENT[HelloAgents Planner Agent]
-    LLM[DeepSeek API\n默认模型: deepseek-v4-flash]
+    AMAP_REST[高德地图 REST API<br/>POI/天气/地理编码]
+    AMAP_MCP[高德地图 MCP<br/>路线规划/可选]
+    CHROMA[Chroma 向量缓存<br/>POI 持久化存储]
+    REACT[PlanAgent + ReActAgent<br/>领域工具调用循环]
+    TOOLS[PlanningToolset<br/>POI 搜索路由]
+    LLM[DeepSeek API<br/>默认: deepseek-v4-flash]
     DB[(PostgreSQL)]
-    CACHE[(Redis 可选)]
     OBS[日志/指标/链路追踪]
 
     UI -->|REST + SSE| API
@@ -248,15 +250,19 @@ flowchart TB
     API --> PLAN
     API --> CHAT
     API --> PREF
-    PLAN --> AGENT
-    CHAT --> AGENT
-    AGENT --> LLM
-    AGENT --> MAP
+    PLAN -->|上下文准备<br/>证据预取<br/>后处理| REACT
+    PLAN -->|POI召回| CHROMA
+    PLAN -->|坐标校验<br/>图片补齐| AMAP_REST
+    REACT -->|工具调用| TOOLS
+    REACT -->|ReAct循环| LLM
+    TOOLS -->|POI搜索| CHROMA
+    TOOLS -->|新POI补充| AMAP_REST
+    TOOLS -->|定向查询| AMAP_MCP
+    CHAT -->|变更识别| LLM
     AUTH --> DB
     PLAN --> DB
     CHAT --> DB
     PREF --> DB
-    API --> CACHE
     API --> OBS
 ~~~
 
@@ -286,14 +292,16 @@ flowchart TB
 
 ### 6.3 后端
 
-- API：Python FastAPI。
-- 数据：Pydantic v2；SQLAlchemy Async + asyncpg；PostgreSQL。
-- Agent：HelloAgents SimpleAgent/规划 Agent，封装为独立服务，不在路由层拼接复杂提示词。
-- 地图：高德 Web 服务 API 与 MCP 工具分层封装，Agent 只能使用白名单工具。
-- 流式：FastAPI StreamingResponse + SSE；后续双向协作再评估 WebSocket。
-- 异步任务：v1.0 先用 FastAPI 异步请求；高并发时增加 Redis + Celery/Arq。
-- 配置：pydantic-settings + .env；密钥不得提交 Git。
-- 日志：记录 request_id、conversation_id、plan_version_id、模型耗时、工具耗时和错误码，不记录完整 API Key。
+- **API 层**：Python FastAPI；路由前缀 `/api`；所有 Agent 调用通过 `asyncio.to_thread` + 超时控制。
+- **服务层**：`TripPlanningService` 负责规划上下文、POI 召回、证据预取、定向修改和后处理；`TalkAgent` 负责对话与变更识别。
+- **Agent 层**：`PlanAgent` 封装 HelloAgents ReActAgent，注册领域工具（SearchAttraction/Weather/Hotel/Restaurant）；`ValidatedPlanningReActAgent` 执行 ReAct 循环并强制计划校验。
+- **工具层**：`PlanningToolset` 提供 `search_poi` 和 `validate_draft` 两个工具，路由 Chroma/高德查询，记录 POI 证据。
+- **向量缓存**：Chroma PersistentClient 存储高德 POI（名称、地址、坐标、POI ID）；按城市和偏好分类召回；不缓存天气和路线。
+- **地图服务**：高德 REST API（POI/天气/地理编码）+ 可选 MCP 工具（路线规划）；REST 为主通道，MCP 按需懒加载。
+- **数据持久化**：Pydantic v2；SQLAlchemy Async + asyncpg；PostgreSQL。
+- **流式输出**：FastAPI StreamingResponse + SSE。
+- **配置管理**：pydantic-settings + .env；密钥不得提交 Git。
+- **日志规范**：记录 request_id、conversation_id、plan_version_id、模型耗时、工具耗时和错误码，不记录完整 API Key。
 
 ### 6.4 DeepSeek 调用建议
 
@@ -310,38 +318,54 @@ LLM_MAX_TOKENS=8000
 
 模型名、Base URL、超时、最大输出 Token、温度和重试次数必须支持环境变量覆盖。生产请求显式传入模型名，并在上线前做真实调用验证，确认账号权限、上下文长度、结构化输出和工具调用能力。
 
-### 6.5 Agent 工作流
+### 6.5 规划工作流
 
-1. 需求解析：表单和自由文本 → TripRequirement JSON。
-2. 地点检索：城市、日期、风格和预算 → 高德 POI/路线工具。
-3. 初代规划：结构化需求 + 工具结果 → ItineraryPlan JSON。
-4. 服务端校验：日期、预算、地点坐标、必填字段；失败则修复或降级。
-5. 对话优化：当前计划 JSON + 偏好 + 最近消息 + 最新指令 → PlanChangeSet。
-6. 应用变更：后端应用操作集、校验并保存新版本。
-7. 用户解释：生成自然语言变更摘要，但不把解释文本当作唯一事实来源。
+系统采用**服务层 + ReAct Agent**分层架构，职责清晰：
 
-建议核心 Schema：TripRequirement、PreferenceProfile、ItineraryPlan、ItineraryDay、ItineraryItem、BudgetSummary、PlanChangeSet。
+**初代规划流程**：
+1. **服务层准备**：`TripPlanningService.plan_trip` 解析城市 adcode、中心坐标、搜索半径
+2. **向量召回**：从 Chroma 按城市和偏好分类召回景点/酒店/餐馆候选（超时 3 秒则跳过）
+3. **证据预取**（可选）：`PlanningToolset.prepare_required_evidence` 预取完整 POI 证据
+4. **确定性生成**（可选）：若证据完整，`_build_evidence_plan` 通过近邻排程生成计划，跳过长 JSON 模型调用
+5. **ReAct 规划**（回退路径）：`PlanAgent` 调用 `ValidatedPlanningReActAgent`，执行 ReAct 循环，调用 `search_poi` 工具搜索 POI，最终通过 `validate_draft` 校验交付计划
+6. **后处理**：日期归属、近邻排序、图片补齐、坐标校验、天气补全
 
-对话优先生成操作集，例如：
+**定向修改流程**：
+1. **对话识别**：`TalkAgent` 识别用户意图，生成 `ChangeSet`（操作集）
+2. **局部执行**：若为白名单操作（add/delete/replace_attraction、update_day），`_execute_change_set` 直接执行
+3. **ReAct 重规划**：若操作不可局部执行或为 `full_replan`，转入 ReAct 定向重规划
+4. **后处理与校验**：同初代规划流程
 
+**核心 Schema**：`TripRequest`、`TripPlan`、`DayPlan`、`Attraction`、`Hotel`、`Meal`、`ChangeSet`、`ChangeOperation`、`Preference`。
+
+**ChangeSet 示例**：
 ~~~json
 {
-  "op": "replace_item",
-  "day": 2,
-  "item_id": "d2-3",
-  "reason": "用户不吃辣",
-  "constraints": {"cuisine": "清淡粤菜"}
+  "operations": [
+    {
+      "operation": "delete_attraction",
+      "selector": {"semantic": "寺庙"}
+    },
+    {
+      "operation": "add_attraction",
+      "selector": {"day_index": 1},
+      "target": {"semantic": "深圳技术大学"}
+    }
+  ]
 }
 ~~~
 
 ### 6.6 降级与容错
 
-- DeepSeek 超时：重试 1～2 次，仍失败则返回可恢复错误并保留表单。
-- JSON 不合法：尝试修复；失败时降级为文本建议并提示结构化行程暂不可用。
-- 高德不可用：生成非实时建议，但标注地点信息未核验。
-- 单个 POI 查询失败：跳过该地点，继续完成规划。
-- 预算无法满足：返回省钱/平衡/舒适多方案。
-- 频率超限：返回明确限流提示，不暴露供应商内部错误。
+- **LLM 超时**：重试 1～2 次，仍失败则返回可恢复错误并保留表单。
+- **JSON 不合法**：ReAct 校验失败时由 Agent 自行修复；多次失败后返回文本建议。
+- **Chroma 召回超时**：3 秒内未返回则跳过，直接使用高德 REST API 搜索。
+- **高德 REST 不可用**：若 Chroma 有缓存，使用缓存候选；否则返回"地图服务暂不可用"。
+- **单个 POI 查询失败**：跳过该地点，继续完成规划，标注"部分地点信息未核验"。
+- **MCP 工具失败**：回退到 REST API 或跳过路线规划，仅展示距离估算。
+- **图片补齐超时**：定向修改与预加载证据模式下跳过，转为前端异步加载。
+- **预算无法满足**：返回省钱/平衡/舒适多方案。
+- **频率超限**：返回明确限流提示，不暴露供应商内部错误。
 
 ---
 

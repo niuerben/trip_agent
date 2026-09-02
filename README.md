@@ -36,7 +36,7 @@ helloagents-trip-planner/
 ├── backend/                    # 后端服务
 │   ├── app/
 │   │   ├── agents/            # Agent实现
-│   │   │   └── trip_planner_agent.py
+│   │   │   └── trip_planning_service.py
 │   │   ├── api/               # FastAPI路由
 │   │   │   ├── main.py
 │   │   │   └── routes/

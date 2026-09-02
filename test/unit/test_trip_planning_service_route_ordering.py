@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.trip_planner_agent import TripPlannerAgent
+from backend.app.services.trip_planning_service import TripPlanningService
 from backend.app.models.schemas import Attraction, DayPlan, Location, Meal, TripPlan
 
 
@@ -42,7 +42,7 @@ class RouteOrderingTest(unittest.TestCase):
             )],
         )
 
-        TripPlannerAgent._order_day_attractions_by_proximity(plan)
+        TripPlanningService._order_day_attractions_by_proximity(plan)
 
         self.assertEqual(
             [item.name for item in plan.days[0].attractions],

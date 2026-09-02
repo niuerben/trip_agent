@@ -1,6 +1,6 @@
 """智能体模块"""
 
-from .plan_agent import PlanAgent, PlanningAgentError
+from .plan_agent import PlanAgent
 from .search_agent import (
     AttractionAgent,
     HotelAgent,
@@ -12,7 +12,6 @@ from .validate_agent import ValidateAgent, ValidationResult
 
 __all__ = [
     "PlanAgent",
-    "PlanningAgentError",
     "SearchAgent",
     "WeatherAgent",
     "HotelAgent",

@@ -10,11 +10,11 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
-from ...agents.trip_planner_agent import (
-    TripPlannerAgent,
+from ...services.trip_planning_service import (
+    TripPlanningService,
     _is_district_adcode,
     _is_district_request,
-    get_trip_planner_agent,
+    get_trip_planning_service,
 )
 from ...services.planning_service import PlanningLoopError
 from ...config import get_settings
@@ -214,7 +214,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
         else:
             try:
                 agent = await asyncio.wait_for(
-                    asyncio.to_thread(get_trip_planner_agent),
+                    asyncio.to_thread(get_trip_planning_service),
                     timeout=settings.planner_init_timeout_seconds,
                 )
                 print("开始生成旅行计划...")
@@ -231,6 +231,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     # 但 API 必须在用户预算内立即返回 504。
                     raise asyncio.TimeoutError
                 trip_plan = planner_task.result()
+                print(f'planner_task.result() = {planner_task.result()}')
             except asyncio.TimeoutError as timeout_error:
                 agent_error = RuntimeError(
                     f"旅行规划超过 {settings.planner_execution_timeout_seconds} 秒总预算"
@@ -360,7 +361,7 @@ async def enrich_trip_images(plan: TripPlan):
     )
     if requires_poi_enrichment:
         enriched_plan = await asyncio.to_thread(
-            TripPlannerAgent._enrich_attraction_images,
+            TripPlanningService._enrich_attraction_images,
             plan,
             city_center,
             radius_km,
@@ -382,7 +383,7 @@ async def enrich_trip_images(plan: TripPlan):
         accommodation=first_day.accommodation if first_day else "经济型酒店",
     )
     enriched_plan.weather_info = await asyncio.to_thread(
-        TripPlannerAgent._complete_weather_for_travel_dates,
+        TripPlanningService._complete_weather_for_travel_dates,
         enriched_plan.weather_info,
         weather_request,
         city_center,
@@ -412,7 +413,7 @@ async def health_check():
     """检查规划 Agent 是否可以初始化。"""
     try:
         agent = await asyncio.wait_for(
-            asyncio.to_thread(get_trip_planner_agent),
+            asyncio.to_thread(get_trip_planning_service),
             timeout=get_settings().planner_init_timeout_seconds,
         )
         return {

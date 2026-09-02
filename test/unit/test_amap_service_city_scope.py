@@ -10,7 +10,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.trip_planner_agent import _is_district_adcode
+from backend.app.services.trip_planning_service import _is_district_adcode
 from backend.app.services.amap_service import AmapService, _get_city_geocode_cached
 
 
