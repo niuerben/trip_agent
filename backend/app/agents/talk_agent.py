@@ -4,6 +4,9 @@
 供 TripPlannerAgent.plan_trip 使用。不依赖高德 MCP 工具，构造轻量。
 """
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from ..services.llm_service import get_llm
 import json
 from typing import Any
@@ -150,7 +153,59 @@ class TalkAgent:
         return json.loads(talk_response_raw)
 
     @staticmethod
-    def _is_explicit_full_replan(text: str) -> bool:
+    def _extract_explicit_date_change(request: TalkRequest) -> dict[str, str] | None:
+        """从用户确认及其对话上下文提取完整日期区间，避免依赖模型漏出的 ChangeSet。"""
+        import re
+
+        context = "\n".join(
+            [*(message.content for message in request.messages), request.message]
+        )
+        matches = re.findall(
+            r"(?:20\d{2}[年/-])?(\d{1,2})[月/-](\d{1,2})日?"
+            r"(?:[^\n]{0,20}?)(?:至|到|－|–|—|-)[^\n]{0,12}?"
+            r"(?:20\d{2}[年/-])?(\d{1,2})[月/-](\d{1,2})日?",
+            context,
+        )
+        if not matches:
+            return None
+        month, day, end_month, end_day = matches[-1]
+        year_match = re.search(r"(20\d{2})年?[-/]\d{1,2}[-/]\d{1,2}", context)
+        year = int(year_match.group(1)) if year_match else datetime.now(ZoneInfo("Asia/Shanghai")).year
+        try:
+            start = datetime(year, int(month), int(day)).date()
+            end = datetime(year if int(end_month) >= int(month) else year + 1, int(end_month), int(end_day)).date()
+        except ValueError:
+            return None
+        if start > end:
+            return None
+        return {"start_date": start.isoformat(), "end_date": end.isoformat()}
+
+    @staticmethod
+    def _apply_date_change_fallback(parsed: dict[str, Any], request: TalkRequest) -> dict[str, Any]:
+        """模型漏出日期操作时，仅在上下文有完整区间且用户确认/改期时补齐。"""
+        if parsed.get("intent") == "replan" and parsed.get("change_set"):
+            return parsed
+        if not any(marker in request.message for marker in ("确认", "改到", "改为", "改成", "日期", "出行")):
+            return parsed
+        fields = TalkAgent._extract_explicit_date_change(request)
+        if not fields:
+            return parsed
+        # 日期确认优先于模型可能返回的 full_replan：确认消息本身通常不重复日期，
+        # 日期来自上一轮助手回复，因此必须把上下文中的完整区间固化为 update_dates。
+        if parsed.get("intent") == "replan" and parsed.get("change_set"):
+            has_date_operation = any(
+                item.operation == "update_dates"
+                for item in parsed["change_set"].operations
+            )
+            if has_date_operation:
+                return parsed
+        parsed = dict(parsed)
+        parsed["intent"] = "replan"
+        parsed["change_request"] = parsed.get("change_request") or "更新旅行日期"
+        parsed["change_set"] = ChangeSet(operations=[ChangeOperation(operation="update_dates", fields=fields)])
+        parsed["done"] = True
+        return parsed
+
         """识别没有具体目标、但明确要求整体重规划的短请求。"""
         normalized = "".join((text or "").split()).lower()
         if not normalized or any(marker in normalized for marker in ("不想改", "不要改", "不用改")):
@@ -172,7 +227,18 @@ class TalkAgent:
         return any(phrase in normalized for phrase in phrases)
 
     @staticmethod
-    def _force_full_replan(parsed: dict[str, Any]) -> dict[str, Any]:
+    def _is_explicit_full_replan(text: str) -> bool:
+        """识别没有具体目标、但明确要求整体重规划的短请求。"""
+        normalized = "".join((text or "").split()).lower()
+        if not normalized or any(marker in normalized for marker in ("不想改", "不要改", "不用改")):
+            return False
+        phrases = (
+            "我要改计划", "我想改计划", "帮我改计划", "把计划改一下",
+            "把行程改一下", "我想调整行程", "帮我调整行程", "重新安排一下",
+            "重新规划一下", "我想重新规划",
+        )
+        return any(phrase in normalized for phrase in phrases)
+
         """为明确的整体改计划请求补齐稳定的结构化契约。"""
         parsed = dict(parsed)
         parsed["reply"] = "好的，我会基于当前行程重新规划一版路线。"
@@ -197,6 +263,7 @@ class TalkAgent:
             prompt = self._build_prompt(request)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
+            parsed = self._apply_date_change_fallback(parsed, request)
             model_intent = parsed["intent"]
             gate_hit = self._is_explicit_full_replan(request.message)
             if gate_hit and parsed["intent"] == "chat":
@@ -259,6 +326,15 @@ class TalkAgent:
             )
         if request.plan_context:
             lines.append(f"当前行程摘要: {request.plan_context}")
+        lines.append(
+            "日期解析基准：Asia/Shanghai；当前日期："
+            f"{datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()}。"
+        )
+        if request.plan_context:
+            lines.append(
+                "若用户确认新日期，必须在 ChangeSet.fields 中给出两个完整 ISO 日期，"
+                "不能只写在 reply 中。"
+            )
         if request.preference and request.preference.prompt:
             lines.append(f"已知长期偏好: {request.preference.prompt}")
         for msg in request.messages:

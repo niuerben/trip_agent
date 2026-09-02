@@ -273,7 +273,7 @@ const planContext = computed(() => {
     const attractions = day.attractions.map((item) => item.name).join('、') || '暂无景点'
     return `第${day.day_index + 1}天：${attractions}`
   }).join('；')
-  return `${plan.value.city}，${days}`
+  return `${plan.value.city}，行程日期：${plan.value.start_date} 至 ${plan.value.end_date}；${days}`
 })
 let nextMessageId = 1
 let loadVersion = 0
