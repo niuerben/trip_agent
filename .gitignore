@@ -1,4 +1,5 @@
 # Environment and secrets
+.vscode
 **/.env
 **/.env.*
 !**/.env.example
@@ -19,6 +20,9 @@ backend/venv/
 test/*.png
 test/**/*.png
 test/logs/
+todo.md
+spec/
+role/
 
 # Local Chroma persistence (rebuildable POI cache)
 backend/data/chroma/
