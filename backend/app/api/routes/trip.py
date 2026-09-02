@@ -2,11 +2,12 @@
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ...agents.trip_planner_agent import MultiAgentTripPlanner, get_trip_planner_agent
 from ...config import get_settings
 from ...models.schemas import TripPlan, TripPlanResponse, TripRequest
+from .conversations import authenticated_user_id
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 
@@ -17,8 +18,9 @@ router = APIRouter(prefix="/trip", tags=["旅行规划"])
     summary="生成旅行计划",
     description="根据用户输入的旅行需求，生成详细的旅行计划",
 )
-async def plan_trip(request: TripRequest):
-    """生成旅行计划；模型或 MCP 不可用时返回可用的基础计划。"""
+async def plan_trip(request: TripRequest, http_request: Request):
+    """生成旅行计划；必须先登录。"""
+    authenticated_user_id(http_request)
     try:
         print(f"\n{'=' * 60}")
         print("收到旅行规划请求:")

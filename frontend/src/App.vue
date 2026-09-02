@@ -92,6 +92,7 @@ const userInitial = computed(() => {
 
 onMounted(() => {
   authUser.value = getCurrentUser()
+  if (authUser.value) void syncConversations().then(refreshConversations)
   window.addEventListener('trip-planner-login-required', openLogin)
   refreshConversations()
   unsubscribeConversationChanges = subscribeToConversationChanges(refreshConversations)
@@ -109,6 +110,11 @@ onMounted(() => {
 })
 
 function refreshConversations() {
+  if (!authUser.value) {
+    conversations.value = []
+    currentConversationId.value = null
+    return
+  }
   conversations.value = listConversations()
   currentConversationId.value = getCurrentConversationId()
 }
@@ -202,8 +208,10 @@ function startOAuth(provider: 'wechat' | 'github') {
 
 function logout() {
   clearSession()
+  clearCurrentConversationId()
   authUser.value = null
-  void syncConversations().then(refreshConversations)
+  conversations.value = []
+  currentConversationId.value = null
   message.success('已退出登录')
 }
 

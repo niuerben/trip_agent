@@ -152,6 +152,7 @@ async function persistConversation(record: ConversationRecord) {
 }
 
 export async function syncConversations() {
+  if (!localStorage.getItem('trip_planner_access_token')) return
   try {
     const response = await apiClient.get<ConversationRecord[]>('/api/conversations')
     const remoteRecords = Array.isArray(response.data) ? response.data : []
