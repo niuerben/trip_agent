@@ -2,203 +2,80 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Optional
 
-from hello_agents.agents import ReActAgent
+from hello_agents import ReActAgent, ToolRegistry
+from hello_agents.agents import SimpleAgent
+
+from .tool_lib import SearchAttraction, SearchHotel, SearchRestaurant, SearchWeather
 from ..services.llm_service import get_llm
-from ..tool.prompt_transform import (
-    build_selection_prompt,
-    normalise_selection_response,
-    prompt_value,
-)
+
 from .search_agent import (
-    AttractionAgent,
     HotelAgent,
     RestaurantAgent,
-    SearchAgent,
     WeatherAgent,
 )
 from .validate_agent import ValidateAgent
 
+PLAN_PROMPT = """你是一个具备推理和行动能力的AI助手。你可以通过思考分析问题，然后调用合适的工具来获取信息，最终给出准确的答案。
 
-class PlanningAgentError(RuntimeError):
-    """The planning loop stopped without a validated result."""
+## 可用工具
+{tools}
 
+## 工作流程
+请严格按照以下格式进行回应，每次只能执行一个步骤：
 
+Thought: 分析问题，确定需要什么信息，制定研究策略。
+Action: 选择合适的工具获取信息，格式为：
+- `{{tool_name}}[{{tool_input}}]`：调用工具获取信息。
+- `Finish[TalkResponse]`：当你有足够信息得出结论时。TalkResponse为JSON格式，schema 如下
+    success: bool = Field(default=True, description="是否成功")
+    reply: str = Field(default="", description="assistant 回复")
+    intent: str = Field(default="chat", description="语义意图: chat / replan")
+    change_request: Optional[str] = Field(default=None, description="提炼后的行程修改要求")
+    change_set: Optional[ChangeSet] = Field(default=None, description="LLM 输出的结构化计划操作")
+    top_suggestions: List[str] = Field(default_factory=list, description="基于当前会话记忆生成的 3 条后续建议")
+    preference: Optional["Preference"] = Field(default=None, description="提炼出的偏好")
+    done: bool = Field(default=False, description="偏好是否收集完成")
+    messages: List[ChatMessage] = Field(default=[], description="持久化后的完整聊天记录")
 
+## 重要提醒
+1. 每次回应必须包含Thought和Action两部分
+2. 工具调用的格式必须严格遵循：工具名[参数]
+3. 只有当你确信有足够信息回答问题时，才使用Finish
+4. 如果工具返回的信息不够，继续使用其他工具或相同工具的不同参数
 
-SELECTION_PROMPT = """你是旅行规划专家。
-你可根据用户需求选择需要的一个或多个 Search Agent， 利用返回的真实信息生成旅行计划。
+## 当前任务
+**Question:** {question}
 
-信息充分后使用 finish 提交最终计划。finish.arguments.plan 使用紧凑 JSON，
-包含三天行程、天气摘要、酒店、餐饮和预算摘要即可。
-禁止编造工具未返回的地址、坐标、天气和价格。
+## 执行历史
+{history}
 
-只返回 JSON 对象，格式如下：
-{"think": "本轮决策理由", "action": {"name": "工具名", "arguments": {}}}
+现在开始你的推理和行动："""
 
-每个搜索工具最多调用一次。在调用 finish 前，必须完成当前可用的景点、
-天气、酒店和餐厅搜索；全部完成后，下一轮必须调用 finish，禁止继续搜索。
-"""
-
-
-class PlanAgent(ReActAgent):
+class PlanAgent(SimpleAgent):
     """ 通过 ReAct 循环，完成旅行规划 """
 
-    def __init__(
-        self,
-        llm: Any = None,
-        search_agents: Optional[Mapping[str, SearchAgent]] = None,
-        validate_agent: Optional[ValidateAgent] = None,
-        runner: Any = None,
-        max_iterations: int = 8,
-    ) -> None:
-        self.llm = llm or get_llm()
-        super().__init__(
-            name="旅行规划 Agent",
-            llm=self.llm,
-            system_prompt=SELECTION_PROMPT,
-            max_steps=max(1, max_iterations),
-        )
-        self.search_agents = (
-            dict(search_agents)
-            if search_agents is not None
-            else {
-                "search_attraction": AttractionAgent(),
-                "search_weather": WeatherAgent(),
-                "search_hotel": HotelAgent(),
-                "search_restaurant": RestaurantAgent(),
-            }
-        )
-        self.last_result: Any = None
-        self.validate_agent = validate_agent or ValidateAgent()
-        self.runner = runner
-        self.max_iterations = max(1, max_iterations)
-        self.observation: Any = None
-        self.result: Any = None
-        self.prompt = ""
-        self.model_reasons: list[Any] = []
-        self.selection_prompt = SELECTION_PROMPT
+    def __init__(self) -> None:
+        self.llm = get_llm()
 
-    def create_observation(self, requirement_prompt: str, preference_prompt: str, tool_result: Any = None) -> Any:
-        if tool_result is not None:
-            self.observation = tool_result
-        elif self.observation is None:
-            self.observation = {
-                "requirement_prompt": requirement_prompt,
-                "preference_prompt": preference_prompt,
-            }
-        return self.observation
-
-    def plan(self, requirement_prompt: str, preference_prompt: str = "") -> Any:
-        if self.runner is not None:
-            self.result = self.runner(requirement_prompt, preference_prompt)
-            self.prompt = "Requirement: " + str(requirement_prompt or "") + "\nPreference: " + str(preference_prompt or "")
-            return self.result
-
-        prompt = "Requirement: " + str(requirement_prompt or "") + "\nPreference: " + str(preference_prompt or "")
-        self.prompt = prompt
-        completed_tools: set[str] = set()
-        for i in range(self.max_iterations):
-            pending_tools = sorted(set(self.search_agents) - completed_tools)
-            selection_context = prompt + (
-                "\n原始输入: "
-                + str(requirement_prompt or "")
-                + str(preference_prompt or "")
-            )
-            
-            if pending_tools:
-                selection_context += "\n待调用搜索工具: " + "、".join(pending_tools)
-            else:
-                selection_context += (
-                    "\n所有搜索工具已完成。"
-                    "本轮 action.name 必须是 finish；禁止继续调用搜索工具。"
-                )
-            selection_prompt = build_selection_prompt(
-                self.selection_prompt,
-                selection_context,
-                self._tool_description(),
-            )
-            response = self.llm.invoke([
-                {"role": "user", "content": selection_prompt}
-            ])
-            selection = normalise_selection_response(response)
-            think = selection["think"]
-            raw_action = selection["action"]
-            action = raw_action if isinstance(raw_action, dict) else {}
-            action_name = self._action_name(raw_action)
-            tool_response = self._tooluse(action)
-            if action_name in self.search_agents and not (
-                isinstance(tool_response, dict) and tool_response.get("error")
-            ):
-                completed_tools.add(action_name)
-            observation = {
-                "result": tool_response.get("result", tool_response),
-                "action": raw_action,
-                "passed": bool(tool_response.get("passed", False)),
-            }
-
-            prompt += "\nThink: " + prompt_value(think)
-            prompt += "\nAction: " + prompt_value(raw_action)
-            prompt += "\nObservation: " + prompt_value(observation)
-            self.prompt = prompt
-            self.model_reasons.append(think)
-
-            if self.validate_agent.validate(observation):
-                self.result = self._validated_result(observation)
-                return self.result
-
-        self.result = {
-            "passed": False,
-            "error": "规划达到最大循环次数，结果仍未通过验证",
+        self.search_agents = {
+            "search_weather": WeatherAgent(),
+            "search_hotel": HotelAgent(),
+            "search_restaurant": RestaurantAgent(),
         }
-        return self.result
+        self.validate_agent = ValidateAgent()    
+        self.result: Any = None
 
-    def _tooluse(self, command: Any) -> Any:
-        actions = SearchAgent.normalise_actions(command)
-        if not actions:
-            self.last_result = {"passed": False, "error": "未提供有效 Action"}
-            return self.last_result
-        result: Any = None
-        for action in actions:
-            name = action.get("name")
-            if name == "finish":
-                result = {"passed": True, "result": action.get("arguments", {})}
-            elif name in self.search_agents:
-                result = self.search_agents[name].tooluse([action])
-            else:
-                result = {"passed": False, "error": f"未注册搜索 Agent: {name}"}
-        self.last_result = result
-        return result
+        tool_registry = ToolRegistry()
+        tool_registry.register_tool(SearchAttraction())
+        tool_registry.register_tool(SearchWeather())
+        tool_registry.register_tool(SearchHotel())
+        tool_registry.register_tool(SearchRestaurant())
+        self.react_agent = ReActAgent("旅行规划师",self.llm,tool_registry,max_steps=8, custom_prompt=PLAN_PROMPT)
 
-    @staticmethod
-    def _action_name(action: Any) -> str:
-        if isinstance(action, dict):
-            return str(action.get("name") or "")
-        actions = SearchAgent.normalise_actions(action)
-        return str(actions[0].get("name") or "") if actions else ""
-
-    def _tool_description(self) -> str:
-        descriptions = [
-            'finish[{"plan": "..."}]',
-            'search_attraction[{"city": "...", "keywords": "..."}]',
-            'search_weather[{"city": "..."}]',
-            'search_hotel[{"city": "...", "keywords": "..."}]',
-            'search_restaurant[{"city": "...", "keywords": "..."}]',
-        ]
-        return "、".join(descriptions)
-
-    def _validated_result(self, observation: Any) -> Any:
-        if self.last_result is not None:
-            return self.last_result
-        return observation
-
-
-def plan(requirement_prompt: str, preference_prompt: str = "", **kwargs: Any) -> Any:
-    planner = PlanAgent(**kwargs)
-    result = planner.plan(requirement_prompt, preference_prompt)
-    if isinstance(result, dict):
-        response = dict(result)
-        response["loop_prompt"] = planner.prompt
+    def run(self, input_text: str, max_tool_iterations: int=3, **kwargs) -> str:
+        response = self.react_agent.run(input_text) 
         return response
-    return {"passed": True, "result": result, "loop_prompt": planner.prompt}
+

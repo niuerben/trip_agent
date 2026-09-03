@@ -129,14 +129,17 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
 
     # 调用对话智能体（带超时；失败走兜底回复）。
     try:
+        print('开始调用偏好对话智能体...')
         agent = await asyncio.wait_for(
             asyncio.to_thread(get_talk_agent),
             timeout=settings.planner_init_timeout_seconds,
         )
+        print('偏好对话智能体已就绪，开始处理请求...')
         result = await asyncio.wait_for(
             asyncio.to_thread(agent.chat, agent_request),
             timeout=settings.planner_execution_timeout_seconds,
         )
+        print('偏好对话智能体已完成响应...')
         reply = result.reply
         intent = result.intent
         change_request = result.change_request

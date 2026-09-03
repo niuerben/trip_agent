@@ -31,3 +31,7 @@ test/integration/results/
 
 # Local Chroma persistence (rebuildable POI cache)
 backend/data/chroma/
+
+# Local databases and Claude worktrees
+**/memory_data/
+.claude/worktrees/

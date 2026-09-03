@@ -11,7 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.trip_planner_agent import TripPlannerAgent
+from backend.app.services.trip_planning_service import TripPlanningService
 from backend.app.models.schemas import (
     Attraction,
     ChangeSet,
@@ -81,7 +81,7 @@ def request(change_set: ChangeSet) -> TripRequest:
 
 class ChangeSetExecutionTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.planner = object.__new__(TripPlannerAgent)
+        self.planner = object.__new__(TripPlanningService)
 
     def test_delete_attraction_by_llm_semantic_selector(self) -> None:
         change_set = ChangeSet.model_validate({"operations": [{
@@ -100,7 +100,7 @@ class ChangeSetExecutionTest(unittest.TestCase):
             "selector": {"name": "马峦山"},
             "target": {"semantic": "大学"},
         }]})
-        with patch.object(TripPlannerAgent, "_resolve_replacement_poi", return_value=UNIVERSITY):
+        with patch.object(TripPlanningService, "_resolve_replacement_poi", return_value=UNIVERSITY):
             result, _ = self.planner._execute_change_set(
                 plan(), change_set, request(change_set), [], "440310"
             )
@@ -113,7 +113,7 @@ class ChangeSetExecutionTest(unittest.TestCase):
             "selector": {"day_index": 0},
             "target": {"semantic": "大学"},
         }]})
-        with patch.object(TripPlannerAgent, "_resolve_replacement_poi", return_value=UNIVERSITY):
+        with patch.object(TripPlanningService, "_resolve_replacement_poi", return_value=UNIVERSITY):
             result, _ = self.planner._execute_change_set(
                 plan(), change_set, request(change_set), [], "440310"
             )
@@ -182,15 +182,15 @@ class ChangeSetExecutionTest(unittest.TestCase):
         self.planner._enrich_attraction_images = lambda value, **_kwargs: value
 
         with (
-            patch("backend.app.agents.trip_planner_agent.get_settings", return_value=SimpleNamespace(
+            patch("backend.app.services.trip_planning_service.get_settings", return_value=SimpleNamespace(
                 district_geo_radius_km=30,
                 city_geo_radius_km=80,
                 planner_preload_poi_evidence=True,
                 planner_preloaded_deterministic_plan=False,
             )),
             patch("backend.app.services.amap_service.get_amap_service", return_value=FakeAmapService()),
-            patch("backend.app.agents.trip_planner_agent.ValidatedPlanningReActAgent", FakeReActAgent),
-            patch("backend.app.agents.trip_planner_agent.validate_trip_plan"),
+            patch("backend.app.services.trip_planning_service.ValidatedPlanningReActAgent", FakeReActAgent),
+            patch("backend.app.services.trip_planning_service.validate_trip_plan"),
         ):
             result = self.planner.plan_trip(trip_request)
 

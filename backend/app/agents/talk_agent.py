@@ -8,7 +8,7 @@ from ..services.llm_service import get_llm
 import json
 from typing import Any
 
-from ..models.schemas import ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
+from ..models.schemas import ChangeOperation, ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
 from .plan_agent import PlanAgent
 
 from hello_agents import SimpleAgent
@@ -28,8 +28,10 @@ TALK_AGENT_PROMPT = """你是「行旅天下」的旅行偏好顾问。你的任
 **变更判定与 ChangeSet 规则:**
 1. 询问、闲聊或咨询建议时，intent 填 "chat"，change_set 填 null。
 2. **关键：用户表达改计划、调整、替换、删除、增加、合并、移到等修改意图时，intent 必须填 replan，直接输出可执行的 change_set，禁止追问。**
-3. 只能使用以下 operation: add_attraction、delete_attraction、replace_attraction、update_day、full_replan。
-4. **删除景点**：使用 delete_attraction，selector.semantic 指定要删除的景点名称或类别。例如"删除寺庙" → {"operation":"delete_attraction","selector":{"semantic":"寺庙"}}
+3. 用户只说“我要改计划”“重新安排一下”“把行程改一下”等明确但没有具体目标的表达时，必须立即返回 `intent="replan"`，并使用 `{"operations":[{"operation":"full_replan"}]}`；日期、城市和已有偏好从当前行程上下文读取，不要追问。
+4. 只有营业时间、天气等事实咨询才保持 `intent="chat"`；不要把上一轮咨询话题带入新的明确改计划请求。
+5. 只能使用以下 operation: add_attraction、delete_attraction、replace_attraction、update_day、full_replan。
+6. **删除景点**：使用 delete_attraction，selector.semantic 指定要删除的景点名称或类别。例如"删除寺庙" → {"operation":"delete_attraction","selector":{"semantic":"寺庙"}}
 5. **替换景点**：使用 replace_attraction，selector 指向旧景点，target 指向新景点。例如"把马峦山改为大学" → {"operation":"replace_attraction","selector":{"semantic":"马峦山"},"target":{"semantic":"大学"}}
 6. **添加景点**：使用 add_attraction，selector.day_index 指定添加到第几天（从0开始），target 指定新景点。例如"第2天添加大学" → {"operation":"add_attraction","selector":{"day_index":1},"target":{"semantic":"深圳技术大学"}}
 7. **用户只说我要改计划且没有具体修改内容时，输出 full_replan**。禁止输出 SQL、正则表达式或自然语言操作说明。
@@ -86,12 +88,12 @@ class TalkAgent:
         """初始化对话 Agent(无 MCP 工具)"""
         print("🔄 初始化偏好对话智能体...")
         self.llm = get_llm()
-        self.plan_agent = plan_agent or PlanAgent(llm=self.llm)
+        self.plan_agent = plan_agent or PlanAgent()
         self.agent = SimpleAgent(
             name="旅行偏好顾问",
             llm=self.llm,
             system_prompt=TALK_AGENT_PROMPT,
-        )
+        ) 
         self.suggestion_agent = SimpleAgent(
             name="旅行建议生成器",
             llm=self.llm,
@@ -99,7 +101,7 @@ class TalkAgent:
         )
         print("✅ 偏好对话智能体初始化成功")
 
-    def create_prompt(self, requirement: Any) -> str:
+    def create_prompt(self, requirement: TalkRequest) -> str:
         if isinstance(requirement, TalkRequest):
             return self._build_prompt(requirement)
         if hasattr(requirement, "model_dump"):
@@ -119,10 +121,66 @@ class TalkAgent:
             return str(preference.get("prompt") or "")
         return str(getattr(requirement, "free_text_input", "") or "")
 
-    def talk(self, requirement: Any) -> Any:
-        requirement_prompt = self.create_prompt(requirement)
-        preference_prompt = self._preference_prompt(requirement)
-        return self.plan_agent.plan(requirement_prompt, preference_prompt)
+    def talk(self, requirement: TalkRequest) -> TalkResponse:
+        '''通过对话重新计划
+        
+        Args:
+            requirement: TalkRequest，包含历史对话与本轮用户输入
+        
+        Returns:
+            TalkResponse，包含智能体回复、意图、变更集、Top3 建议、偏好提示词等
+        '''
+        print('='*20)
+        print(f'🔄 偏好对话智能体 talk() 调用，\nrequirement={requirement}')
+        requirement_prompt = requirement.message
+        preference_prompt = requirement.preference.prompt if requirement.preference else ""
+        print('='*20)
+        print(f"🔄 偏好对话智能体 talk() 调用，\nrequirement_prompt={requirement_prompt},\npreference_prompt={preference_prompt}")
+        print('='*20)
+        if hasattr(self.plan_agent, "plan"):
+            return self.plan_agent.plan(
+                self.create_prompt(requirement),
+                preference_prompt,
+            )
+        talk_response_raw = self.plan_agent.run(
+            requirement_prompt + preference_prompt
+        )
+        return json.loads(talk_response_raw)
+
+    @staticmethod
+    def _is_explicit_full_replan(text: str) -> bool:
+        """识别没有具体目标、但明确要求整体重规划的短请求。"""
+        normalized = "".join((text or "").split()).lower()
+        if not normalized or any(marker in normalized for marker in ("不想改", "不要改", "不用改")):
+            return False
+        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
+            return False
+        phrases = (
+            "我要改计划",
+            "我想改计划",
+            "帮我改计划",
+            "把计划改一下",
+            "把行程改一下",
+            "我想调整行程",
+            "帮我调整行程",
+            "重新安排一下",
+            "重新规划一下",
+            "我想重新规划",
+        )
+        return any(phrase in normalized for phrase in phrases)
+
+    @staticmethod
+    def _force_full_replan(parsed: dict[str, Any]) -> dict[str, Any]:
+        """为明确的整体改计划请求补齐稳定的结构化契约。"""
+        parsed = dict(parsed)
+        parsed["reply"] = "好的，我会基于当前行程重新规划一版路线。"
+        parsed["intent"] = "replan"
+        parsed["change_request"] = "重新规划当前行程"
+        parsed["change_set"] = ChangeSet(
+            operations=[ChangeOperation(operation="full_replan")]
+        )
+        parsed["done"] = True
+        return parsed
 
     def chat(self, request: TalkRequest) -> TalkResponse:
         """处理一轮对话。
@@ -137,6 +195,17 @@ class TalkAgent:
             prompt = self._build_prompt(request)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
+            model_intent = parsed["intent"]
+            gate_hit = self._is_explicit_full_replan(request.message)
+            if gate_hit and parsed["intent"] == "chat":
+                parsed = self._force_full_replan(parsed)
+            print(
+                "TalkAgent 结构化结果: "
+                f"model_intent={model_intent}, "
+                f"full_replan_gate={gate_hit}, "
+                f"final_intent={parsed['intent']}, "
+                f"operations={len(parsed['change_set'].operations) if parsed['change_set'] else 0}"
+            )
             # 每轮对话都应提供可点击的动态 Top3。主对话模型偶尔会遗漏
             # top_suggestions 字段，此时使用同一会话上下文单独生成建议，
             # 不以固定文案冒充推荐。
@@ -326,12 +395,13 @@ class TalkAgent:
         return Preference(prompt=(text or "").strip())
 
 
-# 全局对话智能体实例(单例模式)
+# 全局对话智能体实例(单例模式，生命周期与后端同寿)
 _talk_agent = None
 
 
 def get_talk_agent() -> TalkAgent:
-    """获取偏好对话智能体实例(单例模式)"""
+    """ 获取对话智能体实例(单例模式) """
+    print("🔄 获取对话智能体实例...")
     global _talk_agent
 
     if _talk_agent is None:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.trip_planner_agent import TripPlannerAgent
+from backend.app.services.trip_planning_service import TripPlanningService
 from backend.app.models.schemas import Location, TripRequest, WeatherInfo
 
 
@@ -34,14 +34,14 @@ class TravelWeatherDateTest(unittest.TestCase):
             WeatherInfo(date="2026-07-28", day_weather="阴"),
         ]
 
-        result = TripPlannerAgent._weather_for_travel_dates(forecast, request())
+        result = TripPlanningService._weather_for_travel_dates(forecast, request())
 
         self.assertEqual([item.date for item in result], ["2026-07-27", "2026-07-28"])
 
     def test_does_not_relabel_out_of_window_forecast(self) -> None:
         forecast = [WeatherInfo(date="2026-07-25", day_weather="晴")]
 
-        result = TripPlannerAgent._weather_for_travel_dates(forecast, request())
+        result = TripPlanningService._weather_for_travel_dates(forecast, request())
 
         self.assertEqual(result, [])
 
@@ -63,7 +63,7 @@ class TravelWeatherDateTest(unittest.TestCase):
             "backend.app.services.amap_service.get_amap_service",
             return_value=service,
         ):
-            result = TripPlannerAgent._complete_weather_for_travel_dates(
+            result = TripPlanningService._complete_weather_for_travel_dates(
                 forecast,
                 request(),
                 Location(longitude=114.4, latitude=22.7),

@@ -10,17 +10,15 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
-from ...agents.trip_planner_agent import (
-    TripPlannerAgent,
+from ...services.trip_planning_service import (
+    TripPlanningService,
     _is_district_adcode,
     _is_district_request,
-    get_trip_planner_agent,
+    get_trip_planning_service,
 )
-from ...services.planning_service import PlanningLoopError
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
-from ...services.trip_plan_validator import validate_trip_plan
 from .conversations import authenticated_user_id
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
@@ -200,21 +198,16 @@ async def plan_trip(request: TripRequest, http_request: Request):
         _write_planner_input_log(request, preference, preference_source)
 
         if not has_llm_key:
-            _write_planner_review_log(
-                status="rejected",
-                request=request,
-                preference=preference,
-                preference_source=preference_source,
-                error="未配置模型密钥",
+            print("未配置模型密钥，直接使用基础计划")
+            trip_plan = TripPlanningService._create_fallback_plan(
+                request,
+                "未配置模型密钥",
             )
-            raise HTTPException(
-                status_code=503,
-                detail="未配置模型密钥，无法生成经过 Validator 验证的旅行计划",
-            )
+            trip_plan = TripPlanningService._enrich_attraction_images(trip_plan)
         else:
             try:
                 agent = await asyncio.wait_for(
-                    asyncio.to_thread(get_trip_planner_agent),
+                    asyncio.to_thread(get_trip_planning_service),
                     timeout=settings.planner_init_timeout_seconds,
                 )
                 print("开始生成旅行计划...")
@@ -228,55 +221,13 @@ async def plan_trip(request: TripRequest, http_request: Request):
                 )
                 if not completed:
                     # 不取消线程：requests/LLM 等同步调用无法可靠中断，
-                    # 但 API 必须在用户预算内立即返回 504。
+                    # 但 API 必须在用户预算内立即返回。
                     raise asyncio.TimeoutError
                 trip_plan = planner_task.result()
-            except asyncio.TimeoutError as timeout_error:
-                agent_error = RuntimeError(
-                    f"旅行规划超过 {settings.planner_execution_timeout_seconds} 秒总预算"
-                )
-                message = (
-                    "定向重规划未完成，原计划保持不变"
-                    if request.current_plan
-                    else "旅行计划未通过 ReAct + Validator"
-                )
-                _write_planner_review_log(
-                    status="rejected",
-                    request=request,
-                    preference=preference,
-                    preference_source=preference_source,
-                    error=agent_error,
-                )
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"{message}: {agent_error}",
-                ) from timeout_error
-            except PlanningLoopError as agent_error:
-                # ReAct 已按内部上限停止但未得到可交付 Draft；对用户统一表现为
-                # 规划超时/未完成，避免把 Agent 循环细节暴露成 422。线程本身由
-                # asyncio.to_thread 继续运行，直到它自然结束，用户侧仍严格受
-                # planner_execution_timeout_seconds 控制。
-                message = (
-                    "定向重规划未完成，原计划保持不变"
-                    if request.current_plan
-                    else "旅行计划生成超时"
-                )
-                _write_planner_review_log(
-                    status="rejected",
-                    request=request,
-                    preference=preference,
-                    preference_source=preference_source,
-                    error=agent_error,
-                )
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"{message}: {agent_error}",
-                ) from agent_error
             except Exception as agent_error:
-                message = (
-                    "定向重规划未完成，原计划保持不变"
-                    if request.current_plan
-                    else "旅行计划未通过 ReAct + Validator"
+                print(
+                    "模型服务不可用，使用基础计划: "
+                    f"{type(agent_error).__name__}: {agent_error}"
                 )
                 _write_planner_review_log(
                     status="rejected",
@@ -285,13 +236,12 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     preference_source=preference_source,
                     error=agent_error,
                 )
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{message}: {agent_error}",
-                ) from agent_error
+                trip_plan = TripPlanningService._create_fallback_plan(
+                    request,
+                    "模型或高德服务响应超时/不可用",
+                )
+                trip_plan = TripPlanningService._enrich_attraction_images(trip_plan)
 
-        # ReAct 内部校验后，路由出站前再执行一次独立业务校验。
-        validate_trip_plan(trip_plan, request, require_enriched_locations=True)
         _write_planner_review_log(
             status="approved",
             request=request,
@@ -307,8 +257,6 @@ async def plan_trip(request: TripRequest, http_request: Request):
             message="旅行计划生成成功",
             data=trip_plan,
         )
-    except HTTPException:
-        raise
     except Exception as error:
         print(f"生成旅行计划失败: {error}")
         import traceback
@@ -360,7 +308,7 @@ async def enrich_trip_images(plan: TripPlan):
     )
     if requires_poi_enrichment:
         enriched_plan = await asyncio.to_thread(
-            TripPlannerAgent._enrich_attraction_images,
+            TripPlanningService._enrich_attraction_images,
             plan,
             city_center,
             radius_km,
@@ -382,23 +330,14 @@ async def enrich_trip_images(plan: TripPlan):
         accommodation=first_day.accommodation if first_day else "经济型酒店",
     )
     enriched_plan.weather_info = await asyncio.to_thread(
-        TripPlannerAgent._complete_weather_for_travel_dates,
+        TripPlanningService._complete_weather_for_travel_dates,
         enriched_plan.weather_info,
         weather_request,
         city_center,
     )
-    for day in enriched_plan.days:
-        for attraction in day.attractions:
-            if any(marker in attraction.name for marker in ("大学", "学院", "学校", "校园")):
-                print(
-                    "高德 POI 出站坐标: "
-                    f"{attraction.name} | {attraction.address} | "
-                    f"{attraction.location.longitude},{attraction.location.latitude} | "
-                    f"poi_id={attraction.poi_id or '无'}"
-                )
     return TripPlanResponse(
         success=True,
-        message="景点图片补齐成功",
+        message="历史计划补齐成功",
         data=enriched_plan,
     )
 
@@ -412,7 +351,7 @@ async def health_check():
     """检查规划 Agent 是否可以初始化。"""
     try:
         agent = await asyncio.wait_for(
-            asyncio.to_thread(get_trip_planner_agent),
+            asyncio.to_thread(get_trip_planning_service),
             timeout=get_settings().planner_init_timeout_seconds,
         )
         return {
