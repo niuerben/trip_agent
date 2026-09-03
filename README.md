@@ -3,6 +3,7 @@
 基于 [HelloAgents](https://github.com/jjyaoao/HelloAgents) 构建的智能旅行规划应用。系统结合大语言模型、高德地图与 Chroma POI 向量缓存，为用户生成包含景点、餐饮、住宿、天气和交通信息的多日行程，并支持通过对话收集偏好和定向调整计划。
 
 > 产品需求与技术路线详见 [docs/trip-planner-prd.md](docs/trip-planner-prd.md)。
+![产品展示](./record/demo.png)
 
 ## 功能概览
 
