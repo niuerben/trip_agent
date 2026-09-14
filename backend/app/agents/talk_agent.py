@@ -35,7 +35,7 @@ TALK_AGENT_PROMPT = """你是「行旅天下」旅行偏好顾问。通过自然
 * `add_attraction`: `{"selector":{"day_index":0},"target":{"semantic":"景点名"}}` (day_index 从 0 计)
 * `delete_attraction`: `{"selector":{"semantic":"景点名/类别"}}`
 * `replace_attraction`: `{"selector":{"semantic":"旧景点"},"target":{"semantic":"新景点"}}`
-* `replace_meal`: `{"selector":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"钱江世纪公园/来福士附近非面类餐厅"}}`
+* `replace_meal`: `{"sele搜素ctor":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"钱江世纪公园/来福士附近非面类餐厅"}}`
 * `update_dates`: `{"fields":{"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}`
 * `full_replan`: 全局重排，无附加字段
 
