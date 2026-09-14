@@ -34,6 +34,9 @@ from .planning_service import (
     PlanningToolset,
     ValidatedPlanningReActAgent,
 )
+from .change_set_executor import ChangeSetExecutor
+from .domain_errors import ChangeExecutionError
+from .planning_context import PlanningContext, POIRecord
 from ..agents.plan_agent import PlanAgent
 
 def _normalize_city_for_amap(city: str) -> str:
@@ -211,7 +214,7 @@ class TripPlanningService:
                     # Draft 交给 ReAct，根据 Validator Observation 定向补齐。
                     print(f"定向修改后的 Draft 需继续修复: {validation_error}")
                     request.current_plan = trip_plan.model_dump()
-                except ValueError as change_set_error:
+                except (ChangeExecutionError, ValueError) as change_set_error:
                     # Talk LLM 有时能正确识别重规划意图，却为餐饮等当前局部执行器
                     # 尚未表达的变更输出空操作。此时保留原计划，转由 ReAct 根据完整
                     # 上下文和 change_request 完成真实 POI 检索及校验，避免把“已更新”
@@ -297,13 +300,10 @@ class TripPlanningService:
                             + (f" 原因: {issue_text}" if issue_text else "")
                         )
             if trip_plan is None:
-                planner_response = PlanAgent(
+                planner_response = ValidatedPlanningReActAgent(
                     llm=self.llm,
-                    runner=lambda prompt, _preference: ValidatedPlanningReActAgent(
-                        llm=self.llm,
-                        session=planning_session,
-                    ).run(prompt),
-                ).plan(planner_query, preference.prompt)
+                    session=planning_session,
+                ).run(planner_query)
                 print(f"规划 Agent 返回: {planner_response[:300]}...\n")
                 trip_plan = planning_session.validated_plan
                 if trip_plan is None:
@@ -375,6 +375,34 @@ class TripPlanningService:
             traceback.print_exc()
             # 未通过 ReAct + Validator 的计划禁止用占位数据伪装成功。
             raise
+
+    @staticmethod
+    def _create_fallback_plan(request: TripRequest, reason: str = "") -> TripPlan:
+        """Create a minimal plan when model-backed planning is unavailable."""
+        try:
+            start = date.fromisoformat(request.start_date)
+        except ValueError:
+            start = date.today()
+        days = []
+        for index in range(request.travel_days):
+            current = start + timedelta(days=index)
+            days.append(DayPlan(
+                date=current.isoformat(),
+                day_index=index,
+                description=reason or "请稍后重新规划",
+                transportation=request.transportation,
+                accommodation=request.accommodation,
+                attractions=[],
+                meals=[],
+            ))
+        return TripPlan(
+            city=request.city,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            days=days,
+            weather_info=[],
+            overall_suggestions="当前规划服务暂时不可用，请稍后重试。",
+        )
 
     @staticmethod
     def _fill_plan_timeline(plan: TripPlan, request: TripRequest) -> TripPlan:
@@ -1251,79 +1279,66 @@ class TripPlanningService:
         vector_pois: list[dict],
         target_adcode: Optional[str],
     ) -> tuple[TripPlan, list[str]]:
-        """执行 LLM 产生的白名单操作；任何操作失败都会阻止整次持久化。"""
-        changes: list[str] = []
-        date_operations = [item for item in change_set.operations if item.operation == "update_dates"]
-        if len(date_operations) > 1:
-            raise ValueError("一次 ChangeSet 只能包含一个 update_dates")
-        if date_operations:
-            fields = date_operations[0].fields
-            try:
-                new_start = date.fromisoformat(fields["start_date"])
-                new_end = date.fromisoformat(fields["end_date"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError("update_dates 包含无效的起止日期") from error
-            if new_start > new_end:
-                raise ValueError("update_dates 的开始日期不能晚于结束日期")
-            new_days = (new_end - new_start).days + 1
-            if new_days != len(plan.days) or new_days != request.travel_days:
-                raise ValueError("日期变更后的天数必须与当前行程天数一致")
-            plan.start_date = new_start.isoformat()
-            plan.end_date = new_end.isoformat()
-            for index, day in enumerate(plan.days):
-                day.day_index = index
-                day.date = (new_start + timedelta(days=index)).isoformat()
-            for index, weather in enumerate(plan.weather_info[:new_days]):
-                weather.date = (new_start + timedelta(days=index)).isoformat()
-            plan.weather_info = plan.weather_info[:new_days]
-            request.start_date = plan.start_date
-            request.end_date = plan.end_date
-            changes.append(f"日期调整为 {plan.start_date} 至 {plan.end_date}")
-        for operation in change_set.operations:
-            if operation.operation == "update_dates":
-                continue
-            if operation.operation == "delete_attraction":
-                removed = self._delete_attractions(plan, operation)
-                if not removed:
-                    raise ValueError("delete_attraction 没有匹配到任何景点")
-                changes.append("移除 " + "、".join(removed))
-                continue
+        """兼容旧调用方；实际执行委托给原子 ChangeSetExecutor。"""
+        class _LegacyAttractionResolver:
+            def __init__(self, planner):
+                self.planner = planner
 
-            if operation.operation in {"replace_attraction", "add_attraction"}:
-                target = operation.target
+            def resolve_attraction(self, target, context, operation=""):
                 query = ((target.name if target else None) or (target.semantic if target else None) or "").strip()
-                if not query:
-                    raise ValueError(f"{operation.operation} 缺少 target.name 或 target.semantic")
-                poi = self._resolve_replacement_poi(request, query, vector_pois, target_adcode)
-                if poi is None:
-                    raise ValueError(f"在{request.city}范围内没有找到符合“{query}”的真实 POI")
-                if operation.operation == "replace_attraction":
-                    replaced = self._replace_attraction(plan, operation, poi)
-                    if not replaced:
-                        raise ValueError("replace_attraction 没有匹配到待替换景点")
-                    changes.append(f"替换 {replaced} 为 {poi.get('name')}")
+                if operation == "replace_meal":
+                    poi = self.planner._resolve_replacement_meal_poi(
+                        context.request or request,
+                        query,
+                        target_adcode,
+                    )
                 else:
-                    day_index = self._add_attraction(plan, operation, poi)
-                    changes.append(f"在第{day_index + 1}天添加 {poi.get('name')}")
-                continue
+                    poi = self.planner._resolve_replacement_poi(
+                        context.request or request,
+                        query,
+                        vector_pois,
+                        target_adcode,
+                    )
+                if poi is None:
+                    return None
+                location = self.planner._parse_poi_location(poi)
+                if location is None:
+                    return POIRecord(
+                        name=str(poi.get("name") or ""),
+                        address=str(poi.get("address") or ""),
+                        poi_id=str(poi.get("id") or poi.get("poi_id") or ""),
+                        type=str(poi.get("type") or ""),
+                    )
+                return POIRecord(
+                    name=str(poi.get("name") or ""),
+                    address=str(poi.get("address") or ""),
+                    location=location,
+                    poi_id=str(poi.get("id") or poi.get("poi_id") or ""),
+                    type=str(poi.get("type") or ""),
+                    category=poi.get("category"),
+                    description=str(poi.get("description") or ""),
+                    rating=poi.get("rating"),
+                    photos=tuple(poi.get("photos") or ()),
+                    image_url=poi.get("image_url"),
+                    ticket_price=int(poi.get("ticket_price", poi.get("cost") or 0) or 0),
+                )
 
-            if operation.operation == "update_day":
-                day_index = operation.selector.day_index if operation.selector else None
-                if day_index is None or day_index >= len(plan.days):
-                    raise ValueError("update_day 缺少有效的 selector.day_index")
-                allowed = {"description", "transportation", "accommodation"}
-                updated = []
-                for field, value in operation.fields.items():
-                    if field in allowed and isinstance(value, str):
-                        setattr(plan.days[day_index], field, value)
-                        updated.append(field)
-                if not updated:
-                    raise ValueError("update_day 没有可执行的白名单字段")
-                changes.append(f"更新第{day_index + 1}天: {', '.join(updated)}")
-                continue
-
-            raise ValueError(f"局部执行器不支持操作: {operation.operation}")
-        return plan, changes
+        context = PlanningContext(
+            city=request.city,
+            amap_city=_normalize_city_for_amap(request.city),
+            target_adcode=target_adcode,
+            request=request,
+        )
+        result = ChangeSetExecutor(_LegacyAttractionResolver(self)).execute(
+            plan,
+            request,
+            context,
+            change_set,
+        )
+        if result.request is not None:
+            request.start_date = result.request.start_date
+            request.end_date = result.request.end_date
+        return result.plan, list(result.changes)
 
     @staticmethod
     def _operation_matches_attraction(attraction: Attraction, operation: ChangeOperation) -> bool:
@@ -1438,6 +1453,54 @@ class TripPlanningService:
                 score -= 200
         return score
 
+    def _resolve_replacement_meal_poi(
+        self,
+        request: TripRequest,
+        target: str,
+        target_adcode: Optional[str],
+    ) -> Optional[dict]:
+        """Search an in-scope non-noodle restaurant for a meal replacement."""
+        target_text = str(target or "").strip()
+        area = next(
+            (part.strip() for part in re.split(r"[/、，,]", target_text) if part.strip() and "非面" not in part and "早餐" not in part),
+            "",
+        )
+        query = f"{area or request.city} 餐厅"
+        try:
+            pois = get_amap_photo_service().search_pois(
+                query,
+                city=_normalize_city_for_amap(request.city),
+                offset=20,
+            )
+        except Exception as error:
+            print(f"⚠️ 定向餐厅查询失败: {type(error).__name__}: {error}")
+            return None
+
+        excluded = ("面馆", "面店", "拉面", "拌面", "面食", "面条", "粉面", "牛肉面", "私房面")
+        area_terms = [part for part in re.split(r"[/、，,]", area) if part]
+        candidates = []
+        for poi in pois:
+            if classify_poi_group(poi) != "meal":
+                continue
+            if target_adcode and str(poi.get("adcode") or "").strip() not in {"", target_adcode}:
+                continue
+            text = f"{poi.get('name') or ''}|{poi.get('type') or ''}|{poi.get('address') or ''}"
+            if any(marker in text for marker in excluded):
+                continue
+            location = self._parse_poi_location(poi)
+            if location is None:
+                continue
+            score = sum(20 for term in area_terms if term in text)
+            if "早餐" in target_text and any(marker in text for marker in ("粥", "包子", "豆浆", "早餐")):
+                score += 30
+            candidates.append((score, poi))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], str(item[1].get("name") or "")))
+        chosen = candidates[0][1]
+        print(f"定向餐厅查询: 目标={target_text}; 关键词={query}; 候选={len(candidates)}; 选中={chosen.get('name')}")
+        return chosen
+
     def _resolve_replacement_poi(
         self,
         request: TripRequest,
@@ -1445,7 +1508,6 @@ class TripPlanningService:
         vector_pois: list[dict],
         target_adcode: Optional[str],
     ) -> Optional[dict]:
-        """先从 Chroma 召回替换目标，缺失时只做一次高德 REST 精确搜索。"""
         def in_scope(poi: dict) -> bool:
             poi_adcode = str(poi.get("adcode") or "").strip()
             return not target_adcode or poi_adcode == target_adcode

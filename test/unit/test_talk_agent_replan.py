@@ -80,7 +80,7 @@ class TalkAgentReplanTest(unittest.TestCase):
 
         expected_fragments = [
             "当前旅行计划目的地: 深圳",
-            "当前行程摘要: 第 1 天安排深圳技术大学",
+            "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；不要把聊天历史中的建议当成已执行安排）: 第 1 天安排深圳技术大学",
             "已知长期偏好: 偏好校园和慢节奏",
             "用户: 我喜欢大学校园",
             "顾问: 我会优先安排校园路线",
@@ -279,7 +279,77 @@ class TalkAgentReplanTest(unittest.TestCase):
         self.assertEqual(result.intent, "chat")
         self.assertIsNone(result.change_set)
 
-    def test_chat_model_and_suggestion_failures_return_safe_response(self) -> None:
+    def test_update_dates_change_set_is_supported(self) -> None:
+        agent = self.build_agent(response(
+            reply="好的，我已调整出行日期。",
+            intent="replan",
+            change_request="调整出行日期",
+            change_set={"operations": [{
+                "operation": "update_dates",
+                "fields": {"start_date": "2026-10-01", "end_date": "2026-10-03"},
+            }]},
+            top_suggestions=self.suggestions(),
+            preference=None,
+            done=True,
+        ))
+
+        result = agent.chat(TalkRequest(message="改到10月1日至10月3日"))
+
+        operation = result.change_set.operations[0]
+        self.assertEqual(result.intent, "replan")
+        self.assertEqual(operation.operation, "update_dates")
+        self.assertEqual(operation.fields["start_date"], "2026-10-01")
+
+    def test_specific_replan_is_preserved_when_model_returns_chat(self) -> None:
+        agent = self.build_agent(response(
+            reply="我可以提供一些建议。",
+            intent="chat",
+            change_request=None,
+            change_set=None,
+            top_suggestions=self.suggestions(),
+            preference=None,
+            done=False,
+        ))
+
+        result = agent.chat(TalkRequest(message="删除第二天的博物馆"))
+
+        self.assertEqual(result.intent, "replan")
+        self.assertIsNone(result.change_set)
+        self.assertFalse(result.done)
+        self.assertIn("修改行程", result.reply)
+
+    def test_negative_request_with_following_change_is_not_suppressed(self) -> None:
+        agent = self.build_agent(response(
+            reply="好的，我来替换景点。",
+            intent="chat",
+            change_request=None,
+            change_set=None,
+            top_suggestions=self.suggestions(),
+            preference=None,
+            done=False,
+        ))
+
+        result = agent.chat(TalkRequest(message="不要保持原计划，请把第二天改成博物馆"))
+
+        self.assertEqual(result.intent, "replan")
+        self.assertIsNone(result.change_set)
+
+    def test_fact_question_remains_chat(self) -> None:
+        agent = self.build_agent(response(
+            reply="博物馆通常周一闭馆。",
+            intent="chat",
+            change_request=None,
+            change_set=None,
+            top_suggestions=self.suggestions(),
+            preference=None,
+            done=False,
+        ))
+
+        result = agent.chat(TalkRequest(message="请问博物馆周一是否闭馆"))
+
+        self.assertEqual(result.intent, "chat")
+        self.assertIsNone(result.change_set)
+
         class RaisingSuggestionAgent:
             def run(self, _prompt: str) -> str:
                 raise RuntimeError("LLM unavailable")

@@ -31,7 +31,9 @@ class ChangeOperation(BaseModel):
         "add_attraction",
         "delete_attraction",
         "replace_attraction",
+        "replace_meal",
         "update_day",
+        "update_dates",
         "full_replan",
     ]
     selector: Optional[ChangeSelector] = None

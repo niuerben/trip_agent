@@ -270,10 +270,22 @@ const travelWeatherCards = computed(() => {
 const planContext = computed(() => {
   if (!plan.value) return ''
   const days = plan.value.days.map((day) => {
-    const attractions = day.attractions.map((item) => item.name).join('、') || '暂无景点'
-    return `第${day.day_index + 1}天：${attractions}`
+    const attractions = day.attractions.map((item) => {
+      const category = item.category ? `（${item.category}）` : ''
+      return `${item.name}${category}`
+    }).join('、') || '暂无景点'
+    const meals = day.meals.map((meal) => `${meal.type}:${meal.name}`).join('、') || '暂无餐饮'
+    const hotel = day.hotel?.name || '未安排住宿'
+    return [
+      `第${day.day_index + 1}天（${day.date}）`,
+      `日程:${day.description || '暂无描述'}`,
+      `交通:${day.transportation || '未指定'}`,
+      `景点:${attractions}`,
+      `餐饮:${meals}`,
+      `住宿:${hotel}`,
+    ].join('，')
   }).join('；')
-  return `${plan.value.city}，${days}`
+  return `${plan.value.city}；${days}`.slice(0, 12000)
 })
 let nextMessageId = 1
 let loadVersion = 0

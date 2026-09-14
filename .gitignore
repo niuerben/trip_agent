@@ -34,4 +34,4 @@ backend/data/chroma/
 
 # Local databases and Claude worktrees
 **/memory_data/
-.claude/worktrees/
+.claude/

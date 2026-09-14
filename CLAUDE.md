@@ -100,6 +100,7 @@ python test/test_trip_planner.py --city 广州 --preferences 美食 自然风光
 - 前端负责异步加载行程图片（定向修改和预加载证据模式下，后端跳过图片补齐避免超时）
 
 ## 注意事项
+- 回答要基于现有代码，不要乱编词汇，比如MealConstraints在真实代码里有没有，在哪里
 - 后端默认端口 `8000`，与前端 Vite 代理、OAuth 回调一致（`backend/.env.example` 的 `PORT` 及回调 URL 均为 8000）
 - 数据模型集中在 `backend/app/models/schemas.py`（`TripRequest`/`TripPlan`/`DayPlan`/`Attraction` 等），前端类型在 `frontend/src/types/index.ts`，两侧改字段需同步
 - Chroma 数据目录默认为 `backend/data/chroma/`，属于本地可重建缓存，不应提交到 Git

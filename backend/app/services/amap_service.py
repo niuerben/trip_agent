@@ -306,6 +306,7 @@ class AmapService:
         normalized = (city or "").strip()
         if not normalized:
             return ""
+
         _, _, search_city = _get_city_geocode_cached(
             normalized,
             self.api_key,
@@ -552,6 +553,23 @@ class AmapService:
             return {}
 
 
+def _extract_search_city(item: dict[str, Any]) -> Optional[str]:
+    """从高德 geocode 结果提取 POI city 参数。"""
+    raw_city = item.get("city")
+    if isinstance(raw_city, str) and raw_city.strip():
+        return raw_city.strip()
+    if isinstance(raw_city, (list, tuple)):
+        for value in raw_city:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    # 高德对直辖市通常返回 city=[]，province 才是可用的 citylimit 值。
+    raw_province = item.get("province")
+    if isinstance(raw_province, str) and raw_province.strip().endswith("市"):
+        return raw_province.strip()
+    return None
+
+
 @lru_cache(maxsize=256)
 def _get_city_geocode_cached(
     city: str,
@@ -593,17 +611,7 @@ def _get_city_geocode_cached(
             continue
         if -180 <= longitude <= 180 and -90 <= latitude <= 90:
             adcode = str(item.get("adcode") or item.get("citycode") or "").strip() or None
-            raw_city = item.get("city")
-            search_city = (
-                str(raw_city).strip()
-                if isinstance(raw_city, str) and raw_city.strip()
-                else None
-            )
-            # 直辖市 geocode 的 city 可能是空数组，省字段才是可用 citylimit。
-            if not search_city:
-                raw_province = item.get("province")
-                if isinstance(raw_province, str) and raw_province.strip().endswith("市"):
-                    search_city = raw_province.strip()
+            search_city = _extract_search_city(item)
             return Location(longitude=longitude, latitude=latitude), adcode, search_city
     return None, None, None
 

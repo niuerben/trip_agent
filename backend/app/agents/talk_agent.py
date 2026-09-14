@@ -5,7 +5,9 @@
 """
 
 from ..services.llm_service import get_llm
+from datetime import date
 import json
+import re
 from typing import Any
 
 from ..models.schemas import ChangeOperation, ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
@@ -15,59 +17,42 @@ from hello_agents import SimpleAgent
 
 # ============ Agent提示词 ============
 
-TALK_AGENT_PROMPT = """你是「行旅天下」的旅行偏好顾问。你的任务是通过自然、友好的多轮对话，
-了解用户的旅行偏好，最终凝练成一段可供行程规划使用的偏好提示词。
+TALK_AGENT_PROMPT = """你是「行旅天下」旅行偏好顾问。通过自然多轮对话挖掘用户偏好（兴趣、节奏、饮食/禁忌、预算、同行人），并处理行程调整。
 
-**你需要逐步了解(不要一次全问，围绕用户回答自然追问):**
-1. 兴趣类型(历史文化 / 自然风光 / 美食 / 购物 / 艺术 / 休闲等)
-2. 节奏偏好(悠闲 / 紧凑 / 打卡为主)
-3. 忌口或饮食偏好、身体/无障碍需求
-4. 预算与住宿档次倾向
-5. 同行人员(独自 / 情侣 / 家庭带娃 / 朋友)等其他关键约束
+**核心行为准则:**
 
-**变更判定与 ChangeSet 规则:**
-1. 询问、闲聊或咨询建议时，intent 填 "chat"，change_set 填 null。
-2. **关键：用户表达改计划、调整、替换、删除、增加、合并、移到等修改意图时，intent 必须填 replan，直接输出可执行的 change_set，禁止追问。**
-3. 用户只说“我要改计划”“重新安排一下”“把行程改一下”等明确但没有具体目标的表达时，必须立即返回 `intent="replan"`，并使用 `{"operations":[{"operation":"full_replan"}]}`；日期、城市和已有偏好从当前行程上下文读取，不要追问。
-4. 只有营业时间、天气等事实咨询才保持 `intent="chat"`；不要把上一轮咨询话题带入新的明确改计划请求。
-5. 只能使用以下 operation: add_attraction、delete_attraction、replace_attraction、update_day、full_replan。
-6. **删除景点**：使用 delete_attraction，selector.semantic 指定要删除的景点名称或类别。例如"删除寺庙" → {"operation":"delete_attraction","selector":{"semantic":"寺庙"}}
-5. **替换景点**：使用 replace_attraction，selector 指向旧景点，target 指向新景点。例如"把马峦山改为大学" → {"operation":"replace_attraction","selector":{"semantic":"马峦山"},"target":{"semantic":"大学"}}
-6. **添加景点**：使用 add_attraction，selector.day_index 指定添加到第几天（从0开始），target 指定新景点。例如"第2天添加大学" → {"operation":"add_attraction","selector":{"day_index":1},"target":{"semantic":"深圳技术大学"}}
-7. **用户只说我要改计划且没有具体修改内容时，输出 full_replan**。禁止输出 SQL、正则表达式或自然语言操作说明。
+1. **意图判断**:
+* 咨询/闲聊：`intent="chat"`, `change_set=null`。每轮仅追问 1~2 个未确认的偏好。
+* 调整行程：`intent="replan"`, 直接输出 `change_set`，禁止反问确认。
+* 泛改请求（如“重新安排”“改一下计划”）：直接返回 `{"operations":[{"operation":"full_replan"}]}`。
 
-**对话规则:**
-1. 每轮只温和地追问 1-2 个问题，语气亲切自然，避免一次抛出一长串问题。
-2. preference.prompt 只填写从对话中提炼出的稳定旅行偏好；没有新偏好时填 null。
-3. 只返回 JSON，不要返回 Markdown 代码块或 JSON 以外的文字。
-4. top_suggestions 必须基于对话历史、当前行程摘要和已知偏好，返回 3 条彼此不同、可直接点击发送的下一步建议；禁止使用固定模板。
 
-**严格返回格式:**
+2. **偏好沉淀**: `preference.prompt` 仅收录已确认的稳定偏好，无更新则填 `null`。
+3. **输出限制**: 仅输出纯 JSON，不含 Markdown 标记及其他文本。`top_suggestions` 固定返回 3 条具体且各异的快捷回复选项。
+
+**ChangeSet 支持操作:**
+
+* `add_attraction`: `{"selector":{"day_index":0},"target":{"semantic":"景点名"}}` (day_index 从 0 计)
+* `delete_attraction`: `{"selector":{"semantic":"景点名/类别"}}`
+* `replace_attraction`: `{"selector":{"semantic":"旧景点"},"target":{"semantic":"新景点"}}`
+* `replace_meal`: `{"selector":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"钱江世纪公园/来福士附近非面类餐厅"}}`
+* `update_dates`: `{"fields":{"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}`
+* `full_replan`: 全局重排，无附加字段
+
+**输出 JSON 结构:**
 {
-  "reply": "给用户看的自然语言回复",
-  "intent": "chat 或 replan",
-  "change_request": "给日志和用户看的简短变更摘要，普通聊天时为 null",
-  "change_set": {
-    "operations": [
-      {"operation": "delete_attraction", "selector": {"semantic": "寺庙"}}
-    ]
-  } 或 null,
-  "top_suggestions": ["建议1", "建议2", "建议3"],
-  "preference": {"prompt": "稳定的用户旅行偏好"} 或 null,
-  "done": true 或 false
+"reply": "自然友好的用户回复",
+"intent": "chat | replan",
+"change_request": "变更摘要(普通聊天填 null)",
+"change_set": { "operations": [...] } | null,
+"top_suggestions": ["建议1", "建议2", "建议3"],
+"preference": { "prompt": "用户偏好描述" } | null,
+"done": false
 }
 
-**示例 1 (删除):**
-用户："把第2天的深圳自然博物馆删掉，改成技术大学校园"
-回复：{"reply":"好的，我来调整行程。删除第2天的深圳自然博物馆，添加深圳技术大学校园。","intent":"replan","change_request":"删除第2天博物馆，添加技术大学校园","change_set":{"operations":[{"operation":"delete_attraction","selector":{"semantic":"深圳自然博物馆"}},{"operation":"add_attraction","selector":{"day_index":1},"target":{"semantic":"深圳技术大学"}}]},"top_suggestions":["把校园参观安排在上午","添加附近餐饮","查看校园附近的景点"],"preference":null,"done":true}
-
-**示例 2 (合并):**
-用户："把第2天的博物馆调到第1天下午，和马峦山合一天"
-回复：{"reply":"好的，我把博物馆移到第1天下午。","intent":"replan","change_request":"把博物馆从第2天移到第1天下午","change_set":{"operations":[{"operation":"delete_attraction","selector":{"semantic":"深圳自然博物馆"}},{"operation":"add_attraction","selector":{"day_index":0},"target":{"semantic":"深圳自然博物馆"}}]},"top_suggestions":["第1天会不会太紧张了","把第2天安排得更轻松","增加第2天的其他景点"],"preference":null,"done":true}
-
-**示例 3 (添加):**
-用户："把大学加到第2天"
-回复：{"reply":"好的，我把深圳技术大学加到第2天。","intent":"replan","change_request":"第2天添加深圳技术大学","change_set":{"operations":[{"operation":"add_attraction","selector":{"day_index":1},"target":{"semantic":"深圳技术大学"}}]},"top_suggestions":["安排在上午还是下午","附近有什么好吃的","第2天还需要调整吗"],"preference":null,"done":true}
+**示例 (删改并存):**
+用户: "把第2天的博物馆换成深圳技术大学"
+输出: {"reply":"已为您替换为深圳技术大学。","intent":"replan","change_request":"第2天博物馆替换为深圳技术大学","change_set":{"operations":[{"operation":"replace_attraction","selector":{"semantic":"博物馆"},"target":{"semantic":"深圳技术大学"}}]},"top_suggestions":["推荐大学周边美食","调整第2天节奏为轻松","查看校园参观须知"],"preference":null,"done":false}
 """
 
 SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
@@ -148,24 +133,69 @@ class TalkAgent:
         return json.loads(talk_response_raw)
 
     @staticmethod
-    def _is_explicit_full_replan(text: str) -> bool:
+    def _normalized_message(text: str) -> str:
+        return "".join((text or "").split()).lower()
+
+    @classmethod
+    def _has_explicit_replan_intent(cls, text: str) -> bool:
+        """检测明确的计划修改动作，不猜测具体 ChangeSet。"""
+        normalized = cls._normalized_message(text)
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
+            return False
+        positive_markers = (
+            "删除", "删掉", "去掉", "取消", "不安排", "增加", "添加", "加一个",
+            "补充", "替换", "换成", "改成", "移到", "调到", "调整", "修改",
+            "改期", "出发日期", "结束日期", "提前", "推迟", "重新安排", "重新规划",
+            "改计划", "改行程",
+        )
+        return any(marker in normalized for marker in positive_markers)
+
+    @classmethod
+    def _is_negative_replan(cls, text: str) -> bool:
+        normalized = cls._normalized_message(text)
+        if not normalized:
+            return False
+        negative = ("不想改", "不要改", "不用改", "先别改", "暂时不改")
+        if not any(marker in normalized for marker in negative):
+            return False
+        positive = ("但", "但是", "不过", "请把", "请将", "改成", "换成", "删除", "增加", "添加")
+        return not any(marker in normalized for marker in positive)
+
+    @classmethod
+    def _date_confirmation(cls, request: TalkRequest) -> tuple[str, str] | None:
+        if not request.messages or not any(msg.role == "assistant" for msg in request.messages):
+            return None
+        if not any(marker in cls._normalized_message(request.message) for marker in ("确认", "好的", "可以", "按这个", "就这样")):
+            return None
+        text = "\n".join(msg.content for msg in request.messages if msg.role == "assistant")
+        match = re.search(
+            r"(?:新日期|日期)[^0-9]{0,12}(\d{1,2})月(?:\d{1,2})日[^至\-—]*[至\-—]\s*(\d{1,2})月(?:\d{1,2})日",
+            text,
+        )
+        if not match:
+            return None
+        year_match = re.search(r"(20\d{2})-\d{2}-\d{2}", request.plan_context or "")
+        year = int(year_match.group(1)) if year_match else date.today().year
+        start_month, end_month = int(match.group(1)), int(match.group(2))
+        start = date(year, start_month, 1)
+        end = date(year, end_month, 1)
+        start_day = int(re.search(rf"{start_month}月(\d{{1,2}})日", text).group(1))
+        end_day = int(re.findall(rf"{end_month}月(\d{{1,2}})日", text)[-1])
+        return date(year, start_month, start_day).isoformat(), date(year, end_month, end_day).isoformat()
+
+    @classmethod
+    def _is_explicit_full_replan(cls, text: str) -> bool:
         """识别没有具体目标、但明确要求整体重规划的短请求。"""
-        normalized = "".join((text or "").split()).lower()
-        if not normalized or any(marker in normalized for marker in ("不想改", "不要改", "不用改")):
+        normalized = cls._normalized_message(text)
+        if not normalized or cls._is_negative_replan(text):
             return False
         if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
             return False
         phrases = (
-            "我要改计划",
-            "我想改计划",
-            "帮我改计划",
-            "把计划改一下",
-            "把行程改一下",
-            "我想调整行程",
-            "帮我调整行程",
-            "重新安排一下",
-            "重新规划一下",
-            "我想重新规划",
+            "我要改计划", "我想改计划", "帮我改计划", "把计划改一下", "把行程改一下",
+            "我想调整行程", "帮我调整行程", "重新安排一下", "重新规划一下", "我想重新规划",
         )
         return any(phrase in normalized for phrase in phrases)
 
@@ -196,13 +226,32 @@ class TalkAgent:
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
             model_intent = parsed["intent"]
+            confirmation_dates = self._date_confirmation(request)
+            explicit_replan = self._has_explicit_replan_intent(request.message)
+            negative_replan = self._is_negative_replan(request.message)
             gate_hit = self._is_explicit_full_replan(request.message)
-            if gate_hit and parsed["intent"] == "chat":
+            if confirmation_dates:
+                parsed["reply"] = "好的，我已按确认的新日期调整行程。"
+                parsed["intent"] = "replan"
+                parsed["change_request"] = "确认新的出行日期"
+                parsed["change_set"] = ChangeSet(operations=[ChangeOperation(
+                    operation="update_dates",
+                    fields={"start_date": confirmation_dates[0], "end_date": confirmation_dates[1]},
+                )])
+                parsed["done"] = True
+            elif gate_hit and parsed["intent"] == "chat":
                 parsed = self._force_full_replan(parsed)
+            elif explicit_replan and not negative_replan and not parsed.get("_parse_failed") and parsed["intent"] == "chat":
+                parsed["reply"] = "我识别到你想修改行程，但还没有生成可执行的修改方案，请再试一次。"
+                parsed["intent"] = "replan"
+                parsed["change_request"] = request.message.strip()
+                parsed["change_set"] = None
+                parsed["done"] = False
             print(
                 "TalkAgent 结构化结果: "
                 f"model_intent={model_intent}, "
                 f"full_replan_gate={gate_hit}, "
+                f"explicit_replan={explicit_replan}, "
                 f"final_intent={parsed['intent']}, "
                 f"operations={len(parsed['change_set'].operations) if parsed['change_set'] else 0}"
             )
@@ -256,7 +305,11 @@ class TalkAgent:
                 "必须理解为该目的地范围内的地点。"
             )
         if request.plan_context:
-            lines.append(f"当前行程摘要: {request.plan_context}")
+            lines.append(
+                "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；"
+                "不要把聊天历史中的建议当成已执行安排）: "
+                + request.plan_context
+            )
         if request.preference and request.preference.prompt:
             lines.append(f"已知长期偏好: {request.preference.prompt}")
         for msg in request.messages:
@@ -278,7 +331,11 @@ class TalkAgent:
     def _build_suggestion_prompt(self, request: TalkRequest) -> str:
         lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
         if request.plan_context:
-            lines.append(f"当前行程摘要: {request.plan_context}")
+            lines.append(
+                "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；"
+                "不要把聊天历史中的建议当成已执行安排）: "
+                + request.plan_context
+            )
         if request.preference and request.preference.prompt:
             lines.append(f"已知长期偏好: {request.preference.prompt}")
         if request.messages:
@@ -370,6 +427,7 @@ class TalkAgent:
                 "top_suggestions": top_suggestions,
                 "preference": preference,
                 "done": bool(data.get("done", preference is not None)),
+                "_parse_failed": False,
             }
 
             if intent == "replan":
@@ -387,6 +445,7 @@ class TalkAgent:
                 "top_suggestions": [],
                 "preference": None,
                 "done": False,
+                "_parse_failed": True,
             }
 
     @staticmethod
