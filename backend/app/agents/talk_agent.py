@@ -78,7 +78,7 @@ class TalkAgent:
             name="旅行偏好顾问",
             llm=self.llm,
             system_prompt=TALK_AGENT_PROMPT,
-        ) 
+        )
         self.suggestion_agent = SimpleAgent(
             name="旅行建议生成器",
             llm=self.llm,
@@ -86,130 +86,7 @@ class TalkAgent:
         )
         print("✅ 偏好对话智能体初始化成功")
 
-    def create_prompt(self, requirement: TalkRequest) -> str:
-        if isinstance(requirement, TalkRequest):
-            return self._build_prompt(requirement)
-        if hasattr(requirement, "model_dump"):
-            payload = requirement.model_dump()
-        elif isinstance(requirement, dict):
-            payload = requirement
-        else:
-            return str(requirement or "").strip()
-        return json.dumps(payload, ensure_ascii=False, default=str)
-
-    @staticmethod
-    def _preference_prompt(requirement: Any) -> str:
-        preference = getattr(requirement, "preference", None)
-        if isinstance(preference, Preference):
-            return preference.prompt
-        if isinstance(preference, dict):
-            return str(preference.get("prompt") or "")
-        return str(getattr(requirement, "free_text_input", "") or "")
-
-    def talk(self, requirement: TalkRequest) -> TalkResponse:
-        '''通过对话重新计划
-        
-        Args:
-            requirement: TalkRequest，包含历史对话与本轮用户输入
-        
-        Returns:
-            TalkResponse，包含智能体回复、意图、变更集、Top3 建议、偏好提示词等
-        '''
-        requirement_prompt = requirement.message
-        preference_prompt = requirement.preference.prompt if requirement.preference else ""
-        if preference_prompt:
-            print(f"偏好对话请求: message={requirement_prompt!r}; preference={preference_prompt[:120]!r}")
-        else:
-            print(f"偏好对话请求: message={requirement_prompt!r}")
-        if hasattr(self.plan_agent, "plan"):
-            return self.plan_agent.plan(
-                self.create_prompt(requirement),
-                preference_prompt,
-            )
-        talk_response_raw = self.plan_agent.run(
-            requirement_prompt + preference_prompt
-        )
-        return json.loads(talk_response_raw)
-
-    @staticmethod
-    def _normalized_message(text: str) -> str:
-        return "".join((text or "").split()).lower()
-
-    @classmethod
-    def _has_explicit_replan_intent(cls, text: str) -> bool:
-        """检测明确的计划修改动作，不猜测具体 ChangeSet。"""
-        normalized = cls._normalized_message(text)
-        if not normalized:
-            return False
-        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
-            return False
-        positive_markers = (
-            "删除", "删掉", "去掉", "取消", "不安排", "增加", "添加", "加一个",
-            "补充", "替换", "换成", "改成", "移到", "调到", "调整", "修改",
-            "改期", "出发日期", "结束日期", "提前", "推迟", "重新安排", "重新规划",
-            "改计划", "改行程",
-        )
-        return any(marker in normalized for marker in positive_markers)
-
-    @classmethod
-    def _is_negative_replan(cls, text: str) -> bool:
-        normalized = cls._normalized_message(text)
-        if not normalized:
-            return False
-        negative = ("不想改", "不要改", "不用改", "先别改", "暂时不改")
-        if not any(marker in normalized for marker in negative):
-            return False
-        positive = ("但", "但是", "不过", "请把", "请将", "改成", "换成", "删除", "增加", "添加")
-        return not any(marker in normalized for marker in positive)
-
-    @classmethod
-    def _date_confirmation(cls, request: TalkRequest) -> tuple[str, str] | None:
-        if not request.messages or not any(msg.role == "assistant" for msg in request.messages):
-            return None
-        if not any(marker in cls._normalized_message(request.message) for marker in ("确认", "好的", "可以", "按这个", "就这样")):
-            return None
-        text = "\n".join(msg.content for msg in request.messages if msg.role == "assistant")
-        match = re.search(
-            r"(?:新日期|日期)[^0-9]{0,12}(\d{1,2})月(?:\d{1,2})日[^至\-—]*[至\-—]\s*(\d{1,2})月(?:\d{1,2})日",
-            text,
-        )
-        if not match:
-            return None
-        year_match = re.search(r"(20\d{2})-\d{2}-\d{2}", request.plan_context or "")
-        year = int(year_match.group(1)) if year_match else date.today().year
-        start_month, end_month = int(match.group(1)), int(match.group(2))
-        start = date(year, start_month, 1)
-        end = date(year, end_month, 1)
-        start_day = int(re.search(rf"{start_month}月(\d{{1,2}})日", text).group(1))
-        end_day = int(re.findall(rf"{end_month}月(\d{{1,2}})日", text)[-1])
-        return date(year, start_month, start_day).isoformat(), date(year, end_month, end_day).isoformat()
-
-    @classmethod
-    def _is_explicit_full_replan(cls, text: str) -> bool:
-        """识别没有具体目标、但明确要求整体重规划的短请求。"""
-        normalized = cls._normalized_message(text)
-        if not normalized or cls._is_negative_replan(text):
-            return False
-        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
-            return False
-        phrases = (
-            "我要改计划", "我想改计划", "帮我改计划", "把计划改一下", "把行程改一下",
-            "我想调整行程", "帮我调整行程", "重新安排一下", "重新规划一下", "我想重新规划",
-        )
-        return any(phrase in normalized for phrase in phrases)
-
-    @staticmethod
-    def _force_full_replan(parsed: dict[str, Any]) -> dict[str, Any]:
-        """为明确的整体改计划请求补齐稳定的结构化契约。"""
-        parsed = dict(parsed)
-        parsed["reply"] = "好的，我会基于当前行程重新规划一版路线。"
-        parsed["intent"] = "replan"
-        parsed["change_request"] = "重新规划当前行程"
-        parsed["change_set"] = ChangeSet(
-            operations=[ChangeOperation(operation="full_replan")]
-        )
-        parsed["done"] = True
-        return parsed
+    # ============ 对话入口 ============
 
     def chat(self, request: TalkRequest) -> TalkResponse:
         """处理一轮对话。
@@ -283,13 +160,49 @@ class TalkAgent:
             return TalkResponse(
                 success=True,
                 reply="我暂时没能理解这次修改要求，请换一种说法再试一次。",
-                preference=self.extract_preference(request.message),
+                preference=self._extract_preference(request.message),
                 intent="chat",
                 change_request=None,
                 change_set=None,
                 top_suggestions=[],
                 done=False,
             )
+
+    def generate_suggestions(self, request: TalkRequest) -> list[str]:
+        """从已持久化的会话记忆恢复动态 Top3，不写入聊天记录。"""
+        try:
+            raw_reply = self.suggestion_agent.run(self._build_suggestion_prompt(request))
+            return self._parse_suggestions(raw_reply)
+        except Exception as error:
+            print(f"⚠️ Top3 建议生成失败: {type(error).__name__}: {error}")
+            return []
+
+    def talk(self, requirement: TalkRequest) -> TalkResponse:
+        '''将对话上下文转交规划 Agent（旧版路径；生产路由使用 chat()）。
+
+        Args:
+            requirement: TalkRequest，包含历史对话与本轮用户输入
+
+        Returns:
+            TalkResponse，包含智能体回复、意图、变更集、Top3 建议、偏好提示词等
+        '''
+        requirement_prompt = requirement.message
+        preference_prompt = requirement.preference.prompt if requirement.preference else ""
+        if preference_prompt:
+            print(f"偏好对话请求: message={requirement_prompt!r}; preference={preference_prompt[:120]!r}")
+        else:
+            print(f"偏好对话请求: message={requirement_prompt!r}")
+        if hasattr(self.plan_agent, "plan"):
+            return self.plan_agent.plan(
+                self._create_prompt(requirement),
+                preference_prompt,
+            )
+        talk_response_raw = self.plan_agent.run(
+            requirement_prompt + preference_prompt
+        )
+        return json.loads(talk_response_raw)
+
+    # ============ 提示构造 ============
 
     def _build_prompt(self, request: TalkRequest) -> str:
         """把历史对话与本轮输入拼成一段上下文提示。"""
@@ -314,15 +227,6 @@ class TalkAgent:
         history = "\n".join(lines)
         return f"以下是与用户的对话记录，请根据系统设定继续本轮回复:\n\n{history}"
 
-    def generate_suggestions(self, request: TalkRequest) -> list[str]:
-        """从已持久化的会话记忆恢复动态 Top3，不写入聊天记录。"""
-        try:
-            raw_reply = self.suggestion_agent.run(self._build_suggestion_prompt(request))
-            return self._parse_suggestions(raw_reply)
-        except Exception as error:
-            print(f"⚠️ Top3 建议生成失败: {type(error).__name__}: {error}")
-            return []
-
     def _build_suggestion_prompt(self, request: TalkRequest) -> str:
         lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
         if request.plan_context:
@@ -343,28 +247,19 @@ class TalkAgent:
         lines.append("现在生成恰好 3 条建议。")
         return "\n".join(lines)
 
-    @staticmethod
-    def _parse_suggestions(raw_reply: str) -> list[str]:
-        text = (raw_reply or "").strip()
-        try:
-            if text.startswith("```"):
-                text = text.strip("`").removeprefix("json").strip()
-            start, end = text.find("{"), text.rfind("}")
-            if start < 0 or end <= start:
-                raise ValueError("未找到 JSON 对象")
-            data = json.loads(text[start:end + 1])
-            values = data.get("top_suggestions")
-            if not isinstance(values, list):
-                raise ValueError("top_suggestions 必须是数组")
-            suggestions = list(dict.fromkeys(
-                str(item).strip() for item in values if str(item).strip()
-            ))
-            if len(suggestions) != 3:
-                raise ValueError("top_suggestions 必须恰好包含 3 条建议")
-            return suggestions
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            print(f"Top3 建议结构化输出解析失败: {error}")
-            return []
+    def _create_prompt(self, requirement: TalkRequest) -> str:
+        """talk() 专用：把请求转成规划 Agent 的输入提示。"""
+        if isinstance(requirement, TalkRequest):
+            return self._build_prompt(requirement)
+        if hasattr(requirement, "model_dump"):
+            payload = requirement.model_dump()
+        elif isinstance(requirement, dict):
+            payload = requirement
+        else:
+            return str(requirement or "").strip()
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    # ============ 结构化输出解析 ============
 
     def _parse_reply(self, raw_reply: str) -> dict[str, Any]:
         """解析结构化语义结果；解析失败时安全降级为普通聊天。"""
@@ -446,7 +341,114 @@ class TalkAgent:
             }
 
     @staticmethod
-    def extract_preference(text: str) -> Preference:
+    def _parse_suggestions(raw_reply: str) -> list[str]:
+        text = (raw_reply or "").strip()
+        try:
+            if text.startswith("```"):
+                text = text.strip("`").removeprefix("json").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("未找到 JSON 对象")
+            data = json.loads(text[start:end + 1])
+            values = data.get("top_suggestions")
+            if not isinstance(values, list):
+                raise ValueError("top_suggestions 必须是数组")
+            suggestions = list(dict.fromkeys(
+                str(item).strip() for item in values if str(item).strip()
+            ))
+            if len(suggestions) != 3:
+                raise ValueError("top_suggestions 必须恰好包含 3 条建议")
+            return suggestions
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"Top3 建议结构化输出解析失败: {error}")
+            return []
+
+    # ============ 意图识别 ============
+
+    @staticmethod
+    def _normalized_message(text: str) -> str:
+        return "".join((text or "").split()).lower()
+
+    @classmethod
+    def _has_explicit_replan_intent(cls, text: str) -> bool:
+        """检测明确的计划修改动作，不猜测具体 ChangeSet。"""
+        normalized = cls._normalized_message(text)
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
+            return False
+        positive_markers = (
+            "删除", "删掉", "去掉", "取消", "不安排", "增加", "添加", "加一个",
+            "补充", "替换", "换成", "改成", "移到", "调到", "调整", "修改",
+            "改期", "出发日期", "结束日期", "提前", "推迟", "重新安排", "重新规划",
+            "改计划", "改行程",
+        )
+        return any(marker in normalized for marker in positive_markers)
+
+    @classmethod
+    def _is_negative_replan(cls, text: str) -> bool:
+        normalized = cls._normalized_message(text)
+        if not normalized:
+            return False
+        negative = ("不想改", "不要改", "不用改", "先别改", "暂时不改")
+        if not any(marker in normalized for marker in negative):
+            return False
+        positive = ("但", "但是", "不过", "请把", "请将", "改成", "换成", "删除", "增加", "添加")
+        return not any(marker in normalized for marker in positive)
+
+    @classmethod
+    def _is_explicit_full_replan(cls, text: str) -> bool:
+        """识别没有具体目标、但明确要求整体重规划的短请求。"""
+        normalized = cls._normalized_message(text)
+        if not normalized or cls._is_negative_replan(text):
+            return False
+        if any(marker in normalized for marker in ("怎么改计划", "改计划怎么", "改计划接口", "改计划是什么")):
+            return False
+        phrases = (
+            "我要改计划", "我想改计划", "帮我改计划", "把计划改一下", "把行程改一下",
+            "我想调整行程", "帮我调整行程", "重新安排一下", "重新规划一下", "我想重新规划",
+        )
+        return any(phrase in normalized for phrase in phrases)
+
+    @classmethod
+    def _date_confirmation(cls, request: TalkRequest) -> tuple[str, str] | None:
+        if not request.messages or not any(msg.role == "assistant" for msg in request.messages):
+            return None
+        if not any(marker in cls._normalized_message(request.message) for marker in ("确认", "好的", "可以", "按这个", "就这样")):
+            return None
+        text = "\n".join(msg.content for msg in request.messages if msg.role == "assistant")
+        match = re.search(
+            r"(?:新日期|日期)[^0-9]{0,12}(\d{1,2})月(?:\d{1,2})日[^至\-—]*[至\-—]\s*(\d{1,2})月(?:\d{1,2})日",
+            text,
+        )
+        if not match:
+            return None
+        year_match = re.search(r"(20\d{2})-\d{2}-\d{2}", request.plan_context or "")
+        year = int(year_match.group(1)) if year_match else date.today().year
+        start_month, end_month = int(match.group(1)), int(match.group(2))
+        start = date(year, start_month, 1)
+        end = date(year, end_month, 1)
+        start_day = int(re.search(rf"{start_month}月(\d{{1,2}})日", text).group(1))
+        end_day = int(re.findall(rf"{end_month}月(\d{{1,2}})日", text)[-1])
+        return date(year, start_month, start_day).isoformat(), date(year, end_month, end_day).isoformat()
+
+    @staticmethod
+    def _force_full_replan(parsed: dict[str, Any]) -> dict[str, Any]:
+        """为明确的整体改计划请求补齐稳定的结构化契约。"""
+        parsed = dict(parsed)
+        parsed["reply"] = "好的，我会基于当前行程重新规划一版路线。"
+        parsed["intent"] = "replan"
+        parsed["change_request"] = "重新规划当前行程"
+        parsed["change_set"] = ChangeSet(
+            operations=[ChangeOperation(operation="full_replan")]
+        )
+        parsed["done"] = True
+        return parsed
+
+    # ============ 兜底 ============
+
+    @staticmethod
+    def _extract_preference(text: str) -> Preference:
         """兜底:把任意文本转成 Preference。"""
         return Preference(prompt=(text or "").strip())
 
@@ -464,7 +466,3 @@ def get_talk_agent() -> TalkAgent:
         _talk_agent = TalkAgent()
 
     return _talk_agent
-
-
-def talk(requirement: Any, plan_agent: PlanAgent | None = None) -> Any:
-    return TalkAgent(plan_agent=plan_agent).talk(requirement)
