@@ -1,7 +1,9 @@
-"""行程对话智能体
+"""行程规划智能体
 
-多轮偏好挖掘 + LLM 意图识别 + 结构化 ChangeSet 输出。
-意图判定完全由提示词驱动（三分规则见 TALK_AGENT_PROMPT），
+原 PlanAgent 的 ReAct 规划机制（search_agents/ToolRegistry/react_agent/run）
+原样保留，并合并原 TalkAgent 的对话能力：多轮偏好挖掘 + 意图识别 +
+结构化 ChangeSet 输出，唯一对话入口 talk(TalkRequest) -> TalkResponse。
+对话意图判定完全由提示词驱动（三分规则见 TALK_AGENT_PROMPT），
 后端只做 JSON 解析、Pydantic 校验与安全降级，不做确定性意图门控。
 """
 
@@ -11,7 +13,15 @@ from typing import Any
 
 from ..models.schemas import ChangeSet, Preference, TalkMessage, TalkRequest, TalkResponse
 
-from hello_agents import SimpleAgent
+from hello_agents import ReActAgent, SimpleAgent, ToolRegistry
+
+from .tool_lib import SearchAttraction, SearchHotel, SearchRestaurant, SearchWeather
+from .search_agent import (
+    HotelAgent,
+    RestaurantAgent,
+    WeatherAgent,
+)
+from .validate_agent import ValidateAgent
 
 # ============ Agent提示词 ============
 
@@ -82,14 +92,50 @@ SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
 {"top_suggestions":["把深圳技术大学安排在第二天上午","补充大学附近人均 40 元以内的午餐","将第三天调整为轻松的室内路线"]}
 """
 
+PLAN_PROMPT = """你是一个具备推理和行动能力的AI助手。你可以通过思考分析问题，然后调用合适的工具来获取信息，最终给出准确的答案。
 
-class PlanAgent:
-    """旅行对话智能体：偏好挖掘 + 意图识别 + 结构化行程修改"""
+## 可用工具
+{tools}
 
-    def __init__(self):
-        """初始化对话 Agent（无 MCP 工具）"""
-        print("🔄 初始化旅行对话智能体...")
+## 工作流程
+请严格按照以下格式进行回应，每次只能执行一个步骤：
+
+Thought: 分析问题，确定需要什么信息，制定研究策略。
+Action: 选择合适的工具获取信息，格式为：
+- `{{tool_name}}[{{tool_input}}]`：调用工具获取信息。
+- `Finish[TalkResponse]`：当你有足够信息得出结论时。TalkResponse为JSON格式，schema 如下
+    success: bool = Field(default=True, description="是否成功")
+    reply: str = Field(default="", description="assistant 回复")
+    intent: str = Field(default="chat", description="语义意图: chat / replan")
+    change_request: Optional[str] = Field(default=None, description="提炼后的行程修改要求")
+    change_set: Optional[ChangeSet] = Field(default=None, description="LLM 输出的结构化计划操作")
+    top_suggestions: List[str] = Field(default_factory=list, description="基于当前会话记忆生成的 3 条后续建议")
+    preference: Optional["Preference"] = Field(default=None, description="提炼出的偏好")
+    done: bool = Field(default=False, description="偏好是否收集完成")
+    messages: List[ChatMessage] = Field(default=[], description="持久化后的完整聊天记录")
+
+## 重要提醒
+1. 每次回应必须包含Thought和Action两部分
+2. 工具调用的格式必须严格遵循：工具名[参数]
+3. 只有当你确信有足够信息回答问题时，才使用Finish
+4. 如果工具返回的信息不够，继续使用其他工具或相同工具的不同参数
+
+## 当前任务
+**Question:** {question}
+
+## 执行历史
+{history}
+
+现在开始你的推理和行动："""
+
+
+class PlanAgent(SimpleAgent):
+    """旅行规划智能体：ReAct 规划 + 偏好对话（唯一对话入口 talk()）"""
+
+    def __init__(self) -> None:
         self.llm = get_llm()
+
+        # 对话 Agent（talk() 入口使用）
         self.agent = SimpleAgent(
             name="旅行偏好顾问",
             llm=self.llm,
@@ -100,7 +146,26 @@ class PlanAgent:
             llm=self.llm,
             system_prompt=SUGGESTION_AGENT_PROMPT,
         )
-        print("✅ 旅行对话智能体初始化成功")
+
+        # ReAct 规划工具链（自原 PlanAgent 移植）
+        self.search_agents = {
+            "search_weather": WeatherAgent(),
+            "search_hotel": HotelAgent(),
+            "search_restaurant": RestaurantAgent(),
+        }
+        self.validate_agent = ValidateAgent()
+        self.result: Any = None
+
+        tool_registry = ToolRegistry()
+        tool_registry.register_tool(SearchAttraction())
+        tool_registry.register_tool(SearchWeather())
+        tool_registry.register_tool(SearchHotel())
+        tool_registry.register_tool(SearchRestaurant())
+        self.react_agent = ReActAgent("旅行规划师", self.llm, tool_registry, max_steps=8, custom_prompt=PLAN_PROMPT)
+
+    def run(self, input_text: str, max_tool_iterations: int=3, **kwargs) -> str:
+        response = self.react_agent.run(input_text)
+        return response
 
     # ============ 对话入口 ============
 
@@ -346,8 +411,8 @@ _plan_agent = None
 
 
 def get_plan_agent() -> PlanAgent:
-    """ 获取旅行对话智能体实例(单例模式) """
-    print("🔄 获取旅行对话智能体实例...")
+    """ 获取旅行规划智能体实例(单例模式) """
+    print("🔄 获取旅行规划智能体实例...")
     global _plan_agent
 
     if _plan_agent is None:
