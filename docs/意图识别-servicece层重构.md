@@ -1,3 +1,5 @@
+> **已过时**：本文档为历史设计讨论。TalkAgent 已并入 plan_agent.py 的 PlanAgent（唯一入口 `talk()`），意图识别改为提示词驱动、后端不再做确定性门控。当前实现以 `backend/app/agents/plan_agent.py` 为准。
+
 可以，而且我建议这次不要再按照“发现一个 Bug → 在现有 service 里打一个补丁”的方式做。你现在已经碰到了一个很典型的边界问题：意图识别、ChangeSet、业务执行、POI 检索、fallback 全部有互相渗透的迹象。日志里甚至出现了 `resolve_attraction(..., operation="replace_meal")` 这种为了补业务语义而给旧接口加参数的做法。
 
 你准备从“意图识别 → service 层”重构，我建议把目标定成：

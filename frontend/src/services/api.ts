@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { ChatHistoryResponse, Location, TalkRequest, TalkResponse, TalkSuggestionsRequest, TalkSuggestionsResponse, TripFormData, TripPlan, TripPlanResponse } from '@/types'
+import type { Location, TalkHistoryResponse, TalkRequest, TalkResponse, TalkSuggestionsRequest, TalkSuggestionsResponse, TripFormData, TripPlan, TripPlanResponse } from '@/types'
 
 // 开发模式使用空 baseURL（同源相对路径），请求经 Vite 代理转发到后端，
 // 这样局域网设备访问 http://<本机IP>:5173 时 API 也走同一来源，无需暴露后端或改 CORS。
@@ -75,7 +75,7 @@ export async function enrichTripPlanImages(plan: TripPlan): Promise<TripPlanResp
 /**
  * 与 AI 助手对话（收集/提炼旅行偏好，聊天记录按行程持久化）
  */
-export async function sendChatMessage(payload: TalkRequest): Promise<TalkResponse> {
+export async function sendTalkMessage(payload: TalkRequest): Promise<TalkResponse> {
   const response = await apiClient.post<TalkResponse>('/api/talk', payload)
   return response.data
 }
@@ -83,8 +83,8 @@ export async function sendChatMessage(payload: TalkRequest): Promise<TalkRespons
 /**
  * 读取某个行程对话的 AI 助手聊天历史
  */
-export async function getChatHistory(conversationId: string): Promise<ChatHistoryResponse> {
-  const response = await apiClient.get<ChatHistoryResponse>(`/api/talk/${encodeURIComponent(conversationId)}`, {
+export async function getTalkHistory(conversationId: string): Promise<TalkHistoryResponse> {
+  const response = await apiClient.get<TalkHistoryResponse>(`/api/talk/${encodeURIComponent(conversationId)}`, {
     timeout: 15000
   })
   return response.data
@@ -122,7 +122,7 @@ export async function getRouteGeometry(
 }
 
 /** 刷新页面或打开历史会话时，从会话记忆恢复动态 Top3 建议。 */
-export async function getChatSuggestions(payload: TalkSuggestionsRequest): Promise<TalkSuggestionsResponse> {
+export async function getTalkSuggestions(payload: TalkSuggestionsRequest): Promise<TalkSuggestionsResponse> {
   const response = await apiClient.post<TalkSuggestionsResponse>('/api/talk/suggestions', payload, {
     timeout: 30000
   })

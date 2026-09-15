@@ -8,7 +8,7 @@ from datetime import date
 # ============ 请求模型 ============
 
 class Preference(BaseModel):
-    """用户偏好，由 talk_agent 对话产出。"""
+    """用户偏好，由 PlanAgent 对话产出。"""
     prompt: str = Field(default="", description="用户偏好提示词")
 
 
@@ -66,7 +66,7 @@ class TripRequest(BaseModel):
     preferences: List[str] = Field(default=[], description="旅行偏好标签", example=["历史文化", "美食"])
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
     conversation_id: Optional[str] = Field(default=None, description="关联的行程对话ID")
-    preference: Optional[Preference] = Field(default=None, description="talk_agent 提炼的用户偏好")
+    preference: Optional[Preference] = Field(default=None, description="PlanAgent 提炼的用户偏好")
     current_plan: Optional[dict] = Field(default=None, description="当前旅行计划，用于定向修改")
     change_request: Optional[str] = Field(default="", description="用户要求修改的内容")
     change_set: Optional[ChangeSet] = Field(default=None, description="talk LLM 输出的结构化计划操作")
@@ -96,7 +96,7 @@ class TalkMessage(BaseModel):
 
 
 class TalkRequest(BaseModel):
-    """talk_agent 对话请求"""
+    """PlanAgent 对话请求"""
     conversation_id: Optional[str] = Field(default=None, description="所属行程对话ID，用于持久化聊天记录")
     city: Optional[str] = Field(default=None, description="当前旅行计划目的地，用于消解大学、公园等模糊地点")
     plan_context: Optional[str] = Field(default=None, description="当前行程摘要，供对话记忆和建议生成使用")
@@ -105,7 +105,7 @@ class TalkRequest(BaseModel):
     message: str = Field(..., description="用户本轮输入")
 
 
-class ChatMessage(BaseModel):
+class TalkHistoryMessage(BaseModel):
     """持久化的聊天消息"""
     id: int = Field(..., description="消息ID")
     conversation_id: str = Field(..., description="所属行程对话ID")
@@ -115,7 +115,7 @@ class ChatMessage(BaseModel):
 
 
 class TalkResponse(BaseModel):
-    """talk_agent 对话响应"""
+    """PlanAgent 对话响应"""
     success: bool = Field(default=True, description="是否成功")
     reply: str = Field(default="", description="assistant 回复")
     intent: str = Field(default="chat", description="语义意图: chat / replan")
@@ -124,13 +124,13 @@ class TalkResponse(BaseModel):
     top_suggestions: List[str] = Field(default_factory=list, description="基于当前会话记忆生成的 3 条后续建议")
     preference: Optional["Preference"] = Field(default=None, description="提炼出的偏好")
     done: bool = Field(default=False, description="偏好是否收集完成")
-    messages: List[ChatMessage] = Field(default=[], description="持久化后的完整聊天记录")
+    messages: List[TalkHistoryMessage] = Field(default=[], description="持久化后的完整聊天记录")
 
 
-class ChatHistoryResponse(BaseModel):
+class TalkHistoryResponse(BaseModel):
     """聊天历史响应"""
     success: bool = Field(default=True, description="是否成功")
-    messages: List[ChatMessage] = Field(default=[], description="聊天记录")
+    messages: List[TalkHistoryMessage] = Field(default=[], description="聊天记录")
 
 
 class TalkSuggestionsRequest(BaseModel):
