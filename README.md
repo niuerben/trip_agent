@@ -23,7 +23,7 @@
 
 - Python 3.10+
 - FastAPI + Uvicorn
-- HelloAgents + `PlanAgent` / `ValidatedPlanningReActAgent`
+- HelloAgents + `PlanAgent`（行程对话/意图识别）/ `ValidatedPlanningReActAgent`（ReAct 规划）
 - 高德地图 Web API，以及按需懒加载的 MCP 通道
 - Chroma PersistentClient（仅缓存 POI，不缓存天气和路线）
 - PostgreSQL + SQLAlchemy Async / asyncpg

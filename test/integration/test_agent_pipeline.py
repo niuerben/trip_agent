@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.talk_agent import TalkAgent
+from backend.app.agents.plan_agent import PlanAgent
 from backend.app.services.trip_planning_service import TripPlanningService
 from backend.app.models.schemas import (
     Attraction,
@@ -120,7 +120,7 @@ class TripPlanningServiceIntegrationTest(unittest.TestCase):
         validate.assert_called()
 
     def test_talk_changeset_is_consumable_by_trip_planner(self) -> None:
-        talk_agent = object.__new__(TalkAgent)
+        plan_agent = object.__new__(PlanAgent)
 
         class FakeDialogue:
             def run(self, _prompt: str) -> str:
@@ -137,9 +137,9 @@ class TripPlanningServiceIntegrationTest(unittest.TestCase):
                     "done": True,
                 }, ensure_ascii=False)
 
-        talk_agent.agent = FakeDialogue()
-        talk_agent.suggestion_agent = FakeDialogue()
-        talk_response = talk_agent.chat(TalkRequest(
+        plan_agent.agent = FakeDialogue()
+        plan_agent.suggestion_agent = FakeDialogue()
+        talk_response = plan_agent.talk(TalkRequest(
             city="测试城区",
             plan_context="第 1 天安排测试大学",
             message="移除校园景点",

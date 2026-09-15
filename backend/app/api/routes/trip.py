@@ -120,7 +120,7 @@ def _write_planner_review_log(
 
 
 async def _load_conversation_preference(conversation_id: str | None, user_id: str) -> Preference | None:
-    """按当前用户读取 talk_agent 已提炼并保存的偏好。"""
+    """按当前用户读取 PlanAgent 已提炼并保存的偏好。"""
     if not conversation_id or engine is None:
         return None
     try:
@@ -183,7 +183,7 @@ async def plan_trip(request: TripRequest, http_request: Request):
                 request.conversation_id,
                 user_id,
             )
-            preference_source = "talk_agent.conversation"
+            preference_source = "plan_agent.conversation"
         if preference is None:
             preference = Preference(prompt=request.free_text_input or "")
             preference_source = "request.free_text_input"

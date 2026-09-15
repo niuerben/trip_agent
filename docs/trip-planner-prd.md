@@ -234,12 +234,12 @@ flowchart TB
     API[FastAPI API Gateway]
     AUTH[认证与会话服务]
     PLAN[TripPlanningService<br/>旅行规划服务层]
-    CHAT[TalkAgent<br/>对话服务]
+    CHAT[PlanAgent<br/>对话服务]
     PREF[偏好服务]
     AMAP_REST[高德地图 REST API<br/>POI/天气/地理编码]
     AMAP_MCP[高德地图 MCP<br/>路线规划/可选]
     CHROMA[Chroma 向量缓存<br/>POI 持久化存储]
-    REACT[PlanAgent + ReActAgent<br/>领域工具调用循环]
+    REACT[ValidatedPlanningReActAgent<br/>ReAct 规划循环]
     TOOLS[PlanningToolset<br/>POI 搜索路由]
     LLM[DeepSeek API<br/>默认: deepseek-v4-flash]
     DB[(PostgreSQL)]
@@ -293,8 +293,8 @@ flowchart TB
 ### 6.3 后端
 
 - **API 层**：Python FastAPI；路由前缀 `/api`；所有 Agent 调用通过 `asyncio.to_thread` + 超时控制。
-- **服务层**：`TripPlanningService` 负责规划上下文、POI 召回、证据预取、定向修改和后处理；`TalkAgent` 负责对话与变更识别。
-- **Agent 层**：`PlanAgent` 封装 HelloAgents ReActAgent，注册领域工具（SearchAttraction/Weather/Hotel/Restaurant）；`ValidatedPlanningReActAgent` 执行 ReAct 循环并强制计划校验。
+- **服务层**：`TripPlanningService` 负责规划上下文、POI 召回、证据预取、定向修改和后处理。
+- **Agent 层**：`PlanAgent` 是行程对话智能体（偏好挖掘、意图识别、ChangeSet 生成，唯一入口 `talk()`）；`ValidatedPlanningReActAgent` 执行 ReAct 规划循环并强制计划校验。
 - **工具层**：`PlanningToolset` 提供 `search_poi` 和 `validate_draft` 两个工具，路由 Chroma/高德查询，记录 POI 证据。
 - **向量缓存**：Chroma PersistentClient 存储高德 POI（名称、地址、坐标、POI ID）；按城市和偏好分类召回；不缓存天气和路线。
 - **地图服务**：高德 REST API（POI/天气/地理编码）+ 可选 MCP 工具（路线规划）；REST 为主通道，MCP 按需懒加载。
@@ -327,11 +327,11 @@ LLM_MAX_TOKENS=8000
 2. **向量召回**：从 Chroma 按城市和偏好分类召回景点/酒店/餐馆候选（超时 3 秒则跳过）
 3. **证据预取**（可选）：`PlanningToolset.prepare_required_evidence` 预取完整 POI 证据
 4. **确定性生成**（可选）：若证据完整，`_build_evidence_plan` 通过近邻排程生成计划，跳过长 JSON 模型调用
-5. **ReAct 规划**（回退路径）：`PlanAgent` 调用 `ValidatedPlanningReActAgent`，执行 ReAct 循环，调用 `search_poi` 工具搜索 POI，最终通过 `validate_draft` 校验交付计划
+5. **ReAct 规划**（回退路径）：`TripPlanningService` 调用 `ValidatedPlanningReActAgent`，执行 ReAct 循环，调用 `search_poi` 工具搜索 POI，最终通过 `validate_draft` 校验交付计划
 6. **后处理**：日期归属、近邻排序、图片补齐、坐标校验、天气补全
 
 **定向修改流程**：
-1. **对话识别**：`TalkAgent` 识别用户意图，生成 `ChangeSet`（操作集）
+1. **对话识别**：`PlanAgent` 识别用户意图，生成 `ChangeSet`（操作集）
 2. **局部执行**：若为白名单操作（add/delete/replace_attraction、update_day），`_execute_change_set` 直接执行
 3. **ReAct 重规划**：若操作不可局部执行或为 `full_replan`，转入 ReAct 定向重规划
 4. **后处理与校验**：同初代规划流程

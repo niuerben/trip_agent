@@ -37,7 +37,6 @@ from .planning_service import (
 from .change_set_executor import ChangeSetExecutor
 from .domain_errors import ChangeExecutionError
 from .planning_context import PlanningContext, POIRecord
-from ..agents.plan_agent import PlanAgent
 
 def _normalize_city_for_amap(city: str) -> str:
     """标准化城市名给高德 API，避免区县名导致 citylimit 失效搜出外地结果。
