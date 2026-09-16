@@ -1,6 +1,6 @@
 """偏好对话 API 路由。
 
-与 talk_agent 多轮对话，收集用户旅行偏好；聊天消息按 conversation 持久化到
+与 plan_agent 多轮对话，收集用户旅行偏好；聊天消息按 conversation 持久化到
 chat_messages 表（未配置 DATABASE_URL 时自动降级，仅返回回复不落库）。
 """
 
@@ -9,13 +9,13 @@ import asyncio
 from fastapi import APIRouter, Request
 from sqlalchemy import text
 
-from ...agents.talk_agent import get_talk_agent
+from ...agents.plan_agent import get_plan_agent
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import (
-    ChatHistoryResponse,
-    ChatMessage,
     Preference,
+    TalkHistoryMessage,
+    TalkHistoryResponse,
     TalkMessage,
     TalkRequest,
     TalkResponse,
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/talk", tags=["偏好对话"])
 settings = get_settings()
 
 
-async def _load_history(conversation_id: str, user_id: str | None = None) -> list[ChatMessage]:
+async def _load_history(conversation_id: str, user_id: str | None = None) -> list[TalkHistoryMessage]:
     """读取某个行程对话的全部聊天记录（按时间升序）。"""
     if engine is None or not conversation_id:
         return []
@@ -44,7 +44,7 @@ async def _load_history(conversation_id: str, user_id: str | None = None) -> lis
         query += " ORDER BY created_at ASC, id ASC"
         result = await connection.execute(text(query), params)
         return [
-            ChatMessage(
+            TalkHistoryMessage(
                 id=row.id,
                 conversation_id=row.conversation_id,
                 role=row.role,
@@ -103,7 +103,7 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
     user_id = user_id_from_request(http_request)
 
     # 已落库的历史作为上下文来源；未配置数据库时退回到请求携带的 messages。
-    history: list[ChatMessage] = []
+    history: list[TalkHistoryMessage] = []
     remembered_preference: Preference | None = None
     if request.conversation_id and engine is not None:
         try:
@@ -131,12 +131,12 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
     try:
         print('开始调用偏好对话智能体...')
         agent = await asyncio.wait_for(
-            asyncio.to_thread(get_talk_agent),
+            asyncio.to_thread(get_plan_agent),
             timeout=settings.planner_init_timeout_seconds,
         )
         print('偏好对话智能体已就绪，开始处理请求...')
         result = await asyncio.wait_for(
-            asyncio.to_thread(agent.chat, agent_request),
+            asyncio.to_thread(agent.talk, agent_request),
             timeout=settings.planner_execution_timeout_seconds,
         )
         print('偏好对话智能体已完成响应...')
@@ -164,7 +164,7 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         done = True
 
     # 持久化用户消息与助手回复；失败不影响对话返回。
-    messages: list[ChatMessage] = []
+    messages: list[TalkHistoryMessage] = []
     if request.conversation_id and engine is not None:
         try:
             await _persist_messages(
@@ -176,7 +176,7 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         except Exception as error:
             print(f"聊天记录持久化失败，忽略: {type(error).__name__}: {error}")
 
-    # 将 talk_agent 提炼出的偏好与当前行程对话关联，供后续 /trip/plan 使用。
+    # 将 PlanAgent 提炼出的偏好与当前行程对话关联，供后续 /trip/plan 使用。
     if request.conversation_id and preference and preference.prompt and engine is not None:
         try:
             async with engine.begin() as connection:
@@ -210,18 +210,18 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
 
 @router.get(
     "/{conversation_id}",
-    response_model=ChatHistoryResponse,
+    response_model=TalkHistoryResponse,
     summary="获取聊天历史",
     description="返回某个行程对话的全部 AI 助手聊天记录",
 )
-async def get_chat_history(conversation_id: str, http_request: Request) -> ChatHistoryResponse:
+async def get_talk_history(conversation_id: str, http_request: Request) -> TalkHistoryResponse:
     """读取聊天历史；未配置数据库时返回空列表。"""
     try:
         messages = await _load_history(conversation_id, user_id_from_request(http_request))
     except Exception as error:
         print(f"读取聊天历史失败: {type(error).__name__}: {error}")
         messages = []
-    return ChatHistoryResponse(success=True, messages=messages)
+    return TalkHistoryResponse(success=True, messages=messages)
 
 
 @router.post(
@@ -240,7 +240,7 @@ async def get_suggestions(
         history = await _load_history(request.conversation_id, user_id)
         preference = await _load_conversation_preference(request.conversation_id, user_id)
         agent = await asyncio.wait_for(
-            asyncio.to_thread(get_talk_agent),
+            asyncio.to_thread(get_plan_agent),
             timeout=settings.planner_init_timeout_seconds,
         )
         suggestions = await asyncio.wait_for(

@@ -46,9 +46,9 @@ python test/test_trip_planner.py --city 广州 --preferences 美食 自然风光
 - 定向修改执行（`_execute_change_set`）
 - 计划后处理（日期归属、近邻排序、图片补齐、坐标校验）
 
-**ReAct Agent 层** (`PlanAgent` + `ValidatedPlanningReActAgent`)：
-- `PlanAgent` 作为薄封装，注册领域工具（`tool_lib.py` 中的 SearchAttraction/Weather/Hotel/Restaurant）
-- `ValidatedPlanningReActAgent` 执行 ReAct 循环，调用 `PlanningToolset` 搜索 POI
+**对话 Agent 层** (`PlanAgent`) + **ReAct 规划层** (`ValidatedPlanningReActAgent`)：
+- `PlanAgent`（`plan_agent.py`）是行程对话智能体：多轮偏好挖掘 + 意图识别 + 结构化 ChangeSet 输出，唯一入口 `talk(TalkRequest) -> TalkResponse`。意图判定由提示词（`TALK_AGENT_PROMPT` 三分规则）驱动，后端只做 JSON 解析、ChangeSet 校验与安全降级
+- `ValidatedPlanningReActAgent` 执行 ReAct 规划循环，调用 `PlanningToolset` 搜索 POI
 - `validate_draft` 工具负责计划校验，只允许通过校验的计划交付
 
 关键约定：
@@ -83,7 +83,7 @@ python test/test_trip_planner.py --city 广州 --preferences 美食 自然风光
 `app/api/main.py` 注册全部路由，前缀 `/api`：`trip`（规划）、`poi`、`map`、`auth`、`conversations`。所有 Agent 调用在 `trip.py` 中通过 `asyncio.to_thread` + `asyncio.wait_for` 包裹，受 `PLANNER_INIT_TIMEOUT_SECONDS` / `PLANNER_EXECUTION_TIMEOUT_SECONDS` 控制超时。
 
 规划服务提供两种模式：
-- **ReAct 模式**（默认）：通过 `PlanAgent` + `ValidatedPlanningReActAgent` 执行 POI 搜索与计划生成
+- **ReAct 模式**（默认）：通过 `ValidatedPlanningReActAgent` 执行 POI 搜索与计划生成
 - **确定性模式**（可选，`PLANNER_PRELOADED_DETERMINISTIC_PLAN=true`）：预取完整 POI 证据后，通过 `_build_evidence_plan` 近邻排程生成计划，跳过长 JSON 模型调用
 - **降级模式**（`PLANNER_MODE=fallback`）：强制跳过 LLM，返回模拟数据
 

@@ -93,7 +93,7 @@ export interface ChangeTarget {
 }
 
 export interface ChangeOperation {
-  operation: 'add_attraction' | 'delete_attraction' | 'replace_attraction' | 'update_day' | 'full_replan'
+  operation: 'add_attraction' | 'delete_attraction' | 'replace_attraction' | 'replace_meal' | 'update_dates' | 'full_replan'
   selector?: ChangeSelector
   target?: ChangeTarget
   fields?: Record<string, unknown>
@@ -139,7 +139,7 @@ export interface TalkMessage {
   content: string
 }
 
-export interface ChatMessage {
+export interface TalkHistoryMessage {
   id: number
   conversation_id: string
   role: 'user' | 'assistant'
@@ -151,6 +151,7 @@ export interface TalkRequest {
   conversation_id?: string
   city?: string
   plan_context?: string
+  preference?: Preference
   messages?: TalkMessage[]
   message: string
 }
@@ -164,7 +165,7 @@ export interface TalkResponse {
   top_suggestions: string[]
   preference?: Preference
   done: boolean
-  messages: ChatMessage[]
+  messages: TalkHistoryMessage[]
 }
 
 export interface TalkSuggestionsRequest {
@@ -178,8 +179,8 @@ export interface TalkSuggestionsResponse {
   top_suggestions: string[]
 }
 
-export interface ChatHistoryResponse {
+export interface TalkHistoryResponse {
   success: boolean
-  messages: ChatMessage[]
+  messages: TalkHistoryMessage[]
 }
 

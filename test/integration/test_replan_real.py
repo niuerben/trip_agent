@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from test._gates import require_real_service_tests
 
-from backend.app.agents.talk_agent import TalkAgent
+from backend.app.agents.plan_agent import PlanAgent
 from backend.app.config import get_settings
 from backend.app.models.schemas import Preference, TalkRequest, TripRequest
 from backend.app.services.trip_planning_service import TripPlanningService
@@ -73,8 +73,8 @@ class RealReplanIntegrationTest(unittest.TestCase):
             ensure_ascii=False,
         )
 
-        talk_agent = TalkAgent()
-        talk_response = talk_agent.chat(TalkRequest(
+        plan_agent = PlanAgent()
+        talk_response = plan_agent.talk(TalkRequest(
             city=city,
             plan_context=plan_context,
             preference=Preference(prompt="保留城市文化，同时希望午餐换成火锅。"),

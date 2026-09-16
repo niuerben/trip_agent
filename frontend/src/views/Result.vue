@@ -18,7 +18,7 @@
       </span>
     </div>
 
-    <aside class="conversation-panel conversation-float" :class="{ 'conversation-collapsed': chatCollapsed }">
+    <aside class="conversation-panel conversation-float" :class="{ 'conversation-collapsed': talkCollapsed }">
       <div class="conversation-panel-header">
         <div class="chat-heading">
           <h2>我要改计划</h2>
@@ -28,21 +28,21 @@
           <button
             class="chat-collapse-button"
             type="button"
-            :aria-label="chatCollapsed ? '展开聊天' : '折叠聊天'"
-            :title="chatCollapsed ? '展开聊天' : '折叠聊天'"
-            @click="chatCollapsed = !chatCollapsed"
+            :aria-label="talkCollapsed ? '展开聊天' : '折叠聊天'"
+            :title="talkCollapsed ? '展开聊天' : '折叠聊天'"
+            @click="talkCollapsed = !talkCollapsed"
           >
-            <span aria-hidden="true">{{ chatCollapsed ? '⌁' : '—' }}</span>
+            <span aria-hidden="true">{{ talkCollapsed ? '⌁' : '—' }}</span>
           </button>
         </div>
       </div>
-      <div v-if="!chatCollapsed" class="conversation-messages" aria-live="polite">
+      <div v-if="!talkCollapsed" class="conversation-messages" aria-live="polite">
         <div class="assistant-message">
           <strong>行旅助手</strong>
           <p>{{ plan ? `已为你整理${plan.city}的旅行计划，可以继续告诉我想调整的内容。` : '填写旅行信息后，我会帮你安排景点、餐饮、交通和住宿。' }}</p>
         </div>
         <div
-          v-for="message in chatMessages"
+          v-for="message in talkMessages"
           :key="message.id"
           :class="message.role === 'user' ? 'user-message' : 'assistant-message'"
         >
@@ -52,28 +52,28 @@
           </template>
           <template v-else>{{ message.content }}</template>
         </div>
-        <div v-if="chatSending" class="assistant-message">
+        <div v-if="talkSending" class="assistant-message">
           <strong>行旅助手</strong>
           <p>正在思考…</p>
         </div>
-        <div v-if="plan && !chatSending" class="topk-suggestions" aria-label="快捷建议">
+        <div v-if="plan && !talkSending" class="topk-suggestions" aria-label="快捷建议">
           <button
             v-for="suggestion in topKSuggestions"
             :key="suggestion"
             type="button"
             class="topk-suggestion"
-            @click="chatInput = suggestion"
+            @click="talkInput = suggestion"
           >{{ suggestion }}</button>
         </div>
       </div>
-      <form v-if="!chatCollapsed" class="conversation-composer" @submit.prevent="sendMessage">
+      <form v-if="!talkCollapsed" class="conversation-composer" @submit.prevent="sendMessage">
         <textarea
-          v-model="chatInput"
+          v-model="talkInput"
           rows="2"
           placeholder="告诉我想怎么调整行程"
           aria-label="行程对话输入框"
         />
-        <button type="submit" :disabled="!chatInput.trim() || chatSending">发送</button>
+        <button type="submit" :disabled="!talkInput.trim() || talkSending">发送</button>
       </form>
     </aside>
 
@@ -228,7 +228,7 @@ import AMapLoader from '@amap/amap-jsapi-loader'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Location, TripFormData, TripPlan } from '@/types'
-import { enrichTripPlanImages, generateTripPlan, getChatHistory, getChatSuggestions, getRouteGeometry, sendChatMessage, type RouteGeometrySegment } from '@/services/api'
+import { enrichTripPlanImages, generateTripPlan, getTalkHistory, getTalkSuggestions, getRouteGeometry, sendTalkMessage, type RouteGeometrySegment } from '@/services/api'
 import { clearLegacyPlan, createConversation, getConversation, getCurrentConversationId, loadLegacyPlan, setCurrentConversationId, updateConversation } from '@/services/conversations'
 
 const router = useRouter()
@@ -245,12 +245,12 @@ const mapRouteNodes = computed(() => (
     : routeNodes.value.filter((node) => node.dayIndex === selectedRouteDay.value)
 ))
 const pdfExporting = ref(false)
-const chatInput = ref('')
-const chatSending = ref(false)
-const chatCollapsed = ref(false)
+const talkInput = ref('')
+const talkSending = ref(false)
+const talkCollapsed = ref(false)
 const manualCollapsed = ref(false)
 const conversationId = ref<string | null>(null)
-const chatMessages = ref<Array<{ id: number | string; role: 'user' | 'assistant'; content: string }>>([])
+const talkMessages = ref<Array<{ id: number | string; role: 'user' | 'assistant'; content: string }>>([])
 const focusedNode = ref<RouteNode | null>(null)
 const topKSuggestions = ref<string[]>([])
 // 历史会话可能包含旧版本透传的“本日预报”；界面只渲染实际行程日对应的天气。
@@ -872,15 +872,15 @@ async function drawRouteLeg(
 }
 
 async function sendMessage() {
-  const text = chatInput.value.trim()
-  if (!text || chatSending.value) return
+  const text = talkInput.value.trim()
+  if (!text || talkSending.value) return
 
-  chatInput.value = ''
-  chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'user', content: text })
-  chatSending.value = true
+  talkInput.value = ''
+  talkMessages.value.push({ id: `local-${nextMessageId++}`, role: 'user', content: text })
+  talkSending.value = true
 
   try {
-    const response = await sendChatMessage({
+    const response = await sendTalkMessage({
       conversation_id: conversationId.value || undefined,
       city: plan.value?.city,
       plan_context: planContext.value,
@@ -888,13 +888,13 @@ async function sendMessage() {
     })
     if (response.messages?.length) {
       // 后端已落库，以持久化记录为权威来源。
-      chatMessages.value = response.messages.map((message) => ({
+      talkMessages.value = response.messages.map((message) => ({
         id: message.id,
         role: message.role,
         content: message.content,
       }))
     } else {
-      chatMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: response.reply })
+      talkMessages.value.push({ id: `local-${nextMessageId++}`, role: 'assistant', content: response.reply })
     }
     topKSuggestions.value = response.top_suggestions || []
 
@@ -912,7 +912,7 @@ async function sendMessage() {
 
     const currentPlan = plan.value
     const changeRequest = response.change_request?.trim() || text
-    chatMessages.value.push({
+    talkMessages.value.push({
       id: `local-${nextMessageId++}`,
       role: 'assistant',
       content: '正在根据你的要求重新安排旅行计划…',
@@ -955,7 +955,7 @@ async function sendMessage() {
       renderMap()
     })
 
-    chatMessages.value.push({
+    talkMessages.value.push({
       id: `local-${nextMessageId++}`,
       role: 'assistant',
       content: '✅ 行程已调整完成，请查看上方的路线安排。',
@@ -963,21 +963,21 @@ async function sendMessage() {
   } catch (error) {
     console.error('对话或重新规划失败:', error)
     const detail = error instanceof Error ? error.message : '未知错误'
-    chatMessages.value.push({
+    talkMessages.value.push({
       id: `local-${nextMessageId++}`,
       role: 'assistant',
       content: `重新规划失败：${detail}。原计划已保留。`,
     })
   } finally {
-    chatSending.value = false
+    talkSending.value = false
   }
 }
 
 async function loadChatHistory(id: string, version: number) {
   try {
-    const response = await getChatHistory(id)
+    const response = await getTalkHistory(id)
     if (version !== loadVersion) return
-    chatMessages.value = (response.messages || []).map((message) => ({
+    talkMessages.value = (response.messages || []).map((message) => ({
       id: message.id,
       role: message.role,
       content: message.content,
@@ -990,7 +990,7 @@ async function loadChatHistory(id: string, version: number) {
 async function loadChatSuggestions(id: string, version: number) {
   if (!plan.value) return
   try {
-    const response = await getChatSuggestions({
+    const response = await getTalkSuggestions({
       conversation_id: id,
       city: plan.value.city,
       plan_context: planContext.value,
@@ -1057,7 +1057,7 @@ function loadConversation() {
   const version = ++loadVersion
   plan.value = null
   conversationId.value = null
-  chatMessages.value = []
+  talkMessages.value = []
   topKSuggestions.value = []
   selectedRouteDay.value = null
 

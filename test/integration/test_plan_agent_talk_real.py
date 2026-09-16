@@ -1,7 +1,7 @@
-"""真实 TalkAgent.chat 意图识别评测。
+"""真实 PlanAgent.talk 意图识别评测。
 
-该模块需要真实 LLM 配置，只应作为集成评测运行；每组结果独立落盘，
-避免单个模型失败丢失已经完成的评测记录。
+需要真实 LLM 配置，且必须显式设置 RUN_REAL_SERVICE_TESTS=1 才会运行；
+每组结果独立落盘，避免单个模型失败丢失已经完成的评测记录。
 """
 
 from __future__ import annotations
@@ -16,26 +16,23 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.talk_agent import TalkAgent
+from backend.app.agents.plan_agent import PlanAgent, build_talk_prompt
 from backend.app.models.schemas import Preference, TalkRequest
+from test._gates import require_real_service_tests, test_artifact_dir
 
 
-CHAT_CASES = [
+TALK_CASES = [
     ("chat-advice", "深圳", "推荐适合慢节奏旅行的大学校园", "chat", None),
     # ("chat-food", "广州", "带孩子去旅行有哪些饮食建议", "chat", None),
     # ("chat-preference", "杭州", "我不想早起，也不吃辣", "chat", None),
     # ("delete", "深圳", "把寺庙景点删掉", "replan", "delete_attraction"),
     # ("replace", "深圳", "把马峦山改成大学", "replan", "replace_attraction"),
     # ("add", "深圳", "第2天加深圳技术大学", "replan", "add_attraction"),
-    # ("update-day", "成都", "第1天交通改成步行", "replan", "update_day"),
+    # ("update-dates", "成都", "改到10月1日至10月3日出发", "replan", "update_dates"),
     # ("full-replan", "重庆", "我要改计划", "replan", "full_replan"),
     # ("move", "西安", "把第2天的博物馆调到第1天下午", "replan", None),
     # ("budget-question", "青岛", "预算有限时住哪里方便", "chat", None),
 ]
-
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
-JSONL_RESULT_FILE = RESULTS_DIR / "talk_agent_chat_real_results.jsonl"
-TEXT_RESULT_FILE = RESULTS_DIR / "talk_agent_chat_real_results.txt"
 
 
 def write_record(jsonl_output: Any, text_output: Any, record: dict[str, Any]) -> None:
@@ -57,17 +54,23 @@ def write_record(jsonl_output: Any, text_output: Any, record: dict[str, Any]) ->
     text_output.flush()
 
 
-class TalkAgentChatRealTest(unittest.TestCase):
-    def test_ten_real_chat_calls_are_recorded_independently(self) -> None:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+class PlanAgentTalkRealTest(unittest.TestCase):
+    def setUp(self) -> None:
+        require_real_service_tests("真实 LLM 意图识别评测")
+
+    def test_real_talk_calls_are_recorded_independently(self) -> None:
+        results_dir = test_artifact_dir()
+        results_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_result_file = results_dir / "plan_agent_talk_real_results.jsonl"
+        text_result_file = results_dir / "plan_agent_talk_real_results.txt"
         with (
-            JSONL_RESULT_FILE.open("w", encoding="utf-8") as jsonl_output,
-            TEXT_RESULT_FILE.open("w", encoding="utf-8") as text_output,
+            jsonl_result_file.open("w", encoding="utf-8") as jsonl_output,
+            text_result_file.open("w", encoding="utf-8") as text_output,
         ):
             try:
-                agent = TalkAgent()
+                agent = PlanAgent()
             except Exception as error:
-                for case_id, city, message, expected_intent, expected_operation in CHAT_CASES:
+                for case_id, city, message, expected_intent, expected_operation in TALK_CASES:
                     request = TalkRequest(city=city, message=message)
                     write_record(jsonl_output, text_output, {
                         "case_id": case_id,
@@ -81,16 +84,16 @@ class TalkAgentChatRealTest(unittest.TestCase):
                         "duration_ms": 0,
                     })
             else:
-                for case_id, city, message, expected_intent, expected_operation in CHAT_CASES:
+                for case_id, city, message, expected_intent, expected_operation in TALK_CASES:
                     request = TalkRequest(
                         city=city,
                         preference=Preference(prompt="偏好慢节奏和本地美食"),
                         message=message,
                     )
-                    prompt = agent._build_prompt(request)
+                    prompt = build_talk_prompt(request)
                     started = time.perf_counter()
                     try:
-                        response = agent.chat(request)
+                        response = agent.talk(request)
                         operation = (
                             response.change_set.operations[0].operation
                             if response.change_set and response.change_set.operations
@@ -120,8 +123,8 @@ class TalkAgentChatRealTest(unittest.TestCase):
                         "duration_ms": round((time.perf_counter() - started) * 1000),
                     })
 
-        records = JSONL_RESULT_FILE.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(CHAT_CASES), len(records))
+        records = jsonl_result_file.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(TALK_CASES), len(records))
 
 
 if __name__ == "__main__":

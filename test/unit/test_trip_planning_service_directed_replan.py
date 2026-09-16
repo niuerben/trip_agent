@@ -21,6 +21,7 @@ from backend.app.models.schemas import (
     TripRequest,
 )
 from backend.app.services.trip_plan_validator import TripPlanValidationError, validate_trip_plan
+from backend.app.services.domain_errors import TargetedReplanUnsatisfiable
 
 
 UNIVERSITY = {
@@ -145,8 +146,8 @@ class ChangeSetExecutionTest(unittest.TestCase):
                 require_enriched_locations=True,
             )
 
-    def test_unexecutable_change_set_is_replanned_instead_of_returning_422(self) -> None:
-        """餐饮修改的空 update_day 需转给 ReAct，而非宣称已修改后直接失败。"""
+    def test_unexecutable_change_set_reports_unsatisfiable_and_keeps_original_plan(self) -> None:
+        """餐饮修改的空 update_day 无解时如实上报，由路由层保留原计划告知用户。"""
         invalid_change_set = ChangeSet.model_validate({"operations": [{
             "operation": "update_day",
             "selector": {},
@@ -155,9 +156,6 @@ class ChangeSetExecutionTest(unittest.TestCase):
         trip_request = request(invalid_change_set)
         trip_request.change_request = "将第2天晚餐添加至计划"
 
-        replanned = plan()
-        replanned.days[0].description = "已根据用户要求重新安排"
-
         class FakeAmapService:
             def get_city_center(self, _city):
                 return Location(longitude=114.35, latitude=22.68)
@@ -165,21 +163,8 @@ class ChangeSetExecutionTest(unittest.TestCase):
             def get_city_adcode(self, _city):
                 return "440310"
 
-            def get_weather(self, _city):
-                return []
-
-        class FakeReActAgent:
-            def __init__(self, *, session, **_kwargs):
-                self.session = session
-
-            def run(self, _query):
-                self.session.validated_plan = replanned
-                return "Finish[validator_passed]"
-
         self.planner.llm = object()
         self.planner._retrieve_cached_pois = lambda *_args, **_kwargs: []
-        self.planner._complete_weather_for_travel_dates = lambda *_args, **_kwargs: []
-        self.planner._enrich_attraction_images = lambda value, **_kwargs: value
 
         with (
             patch("backend.app.services.trip_planning_service.get_settings", return_value=SimpleNamespace(
@@ -189,12 +174,12 @@ class ChangeSetExecutionTest(unittest.TestCase):
                 planner_preloaded_deterministic_plan=False,
             )),
             patch("backend.app.services.amap_service.get_amap_service", return_value=FakeAmapService()),
-            patch("backend.app.services.trip_planning_service.ValidatedPlanningReActAgent", FakeReActAgent),
-            patch("backend.app.services.trip_planning_service.validate_trip_plan"),
         ):
-            result = self.planner.plan_trip(trip_request)
+            with self.assertRaises(TargetedReplanUnsatisfiable):
+                self.planner.plan_trip(trip_request)
 
-        self.assertEqual(result.days[0].description, "已根据用户要求重新安排")
+        # 原计划与原始 ChangeSet 保持不变，供路由层原样保留并告知用户。
+        self.assertEqual(trip_request.current_plan["days"][0]["description"], "第一天")
         self.assertEqual(trip_request.change_set.operations[0].operation, "update_day")
 
 
