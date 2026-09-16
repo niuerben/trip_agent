@@ -1,6 +1,6 @@
 """行程规划智能体
 
-原 PlanAgent 的 ReAct 规划机制（search_agents/ToolRegistry/react_agent/run）
+原 PlanAgent 的 ReAct 规划机制（ToolRegistry/react_agent/run）
 原样保留，并合并原 TalkAgent 的对话能力：多轮偏好挖掘 + 意图识别 +
 结构化 ChangeSet 输出，唯一对话入口 talk(TalkRequest) -> TalkResponse。
 对话意图判定完全由提示词驱动（三分规则见 TALK_AGENT_PROMPT），
@@ -16,11 +16,6 @@ from ..models.schemas import ChangeSet, Preference, TalkMessage, TalkRequest, Ta
 from hello_agents import ReActAgent, SimpleAgent, ToolRegistry
 
 from .tool_lib import SearchAttraction, SearchHotel, SearchRestaurant, SearchWeather
-from .search_agent import (
-    HotelAgent,
-    RestaurantAgent,
-    WeatherAgent,
-)
 from .validate_agent import ValidateAgent
 
 # ============ Agent提示词 ============
@@ -148,11 +143,6 @@ class PlanAgent(SimpleAgent):
         )
 
         # ReAct 规划工具链（自原 PlanAgent 移植）
-        self.search_agents = {
-            "search_weather": WeatherAgent(),
-            "search_hotel": HotelAgent(),
-            "search_restaurant": RestaurantAgent(),
-        }
         self.validate_agent = ValidateAgent()
         self.result: Any = None
 
