@@ -6,7 +6,7 @@ import re
 from itertools import combinations, permutations, product
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Optional
 from .llm_service import get_llm
 from ..models.schemas import (
     Attraction,
@@ -59,6 +59,28 @@ def _normalize_city_for_amap(city: str) -> str:
         "化州": "茂名",
     }
     return mappings.get(city, city)
+
+
+def _format_poi_detail(poi: dict[str, Any]) -> str:
+    """把 POI 字典格式化成单行细节日志，空字段自动省略。"""
+    order = (
+        "name", "poi_id", "type", "address", "location", "adcode",
+        "tel", "cost", "rating", "photos",
+    )
+    parts: list[str] = []
+    for key in order:
+        value = poi.get(key)
+        if value in (None, "", [], ()):
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(item) for item in value[:2])
+        parts.append(f"{key}={value}")
+    for key in sorted(set(poi) - set(order)):
+        value = poi.get(key)
+        if value in (None, "", [], ()):
+            continue
+        parts.append(f"{key}={value}")
+    return "; ".join(parts)
 
 
 _DISTRICT_SCOPES = {
@@ -240,6 +262,11 @@ class TripPlanningService:
             )
             if preloaded:
                 print("已预取餐饮、景点和酒店 POI 证据；优先用确定性近邻排程。")
+                for purpose in ("attraction", "meal", "hotel"):
+                    records = planning_session.evidence_records.get(purpose) or {}
+                    print(f"POI 证据明细[{purpose}]: 共{len(records)}条")
+                    for poi in records.values():
+                        print(f"  - {_format_poi_detail(poi)}")
             else:
                 print("POI 预取不完整，回退到按需 ReAct 检索。")
             trip_plan = None
@@ -1477,27 +1504,41 @@ class TripPlanningService:
 
         excluded = ("面馆", "面店", "拉面", "拌面", "面食", "面条", "粉面", "牛肉面", "私房面")
         area_terms = [part for part in re.split(r"[/、，,]", area) if part]
-        candidates = []
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        rejected: list[tuple[str, dict[str, Any]]] = []
         for poi in pois:
             if classify_poi_group(poi) != "meal":
+                rejected.append((f"非餐饮类({poi.get('type') or '无类型'})", poi))
                 continue
             if target_adcode and str(poi.get("adcode") or "").strip() not in {"", target_adcode}:
+                rejected.append((f"adcode={poi.get('adcode') or '空'} 超出目标范围", poi))
                 continue
             text = f"{poi.get('name') or ''}|{poi.get('type') or ''}|{poi.get('address') or ''}"
             if any(marker in text for marker in excluded):
+                rejected.append(("命中面食排除词", poi))
                 continue
             location = self._parse_poi_location(poi)
             if location is None:
+                rejected.append(("缺少有效坐标", poi))
                 continue
             score = sum(20 for term in area_terms if term in text)
             if "早餐" in target_text and any(marker in text for marker in ("粥", "包子", "豆浆", "早餐")):
                 score += 30
             candidates.append((score, poi))
         if not candidates:
+            print(
+                f"定向餐厅查询无候选: 目标={target_text}; 关键词={query}; "
+                f"高德原始返回={len(pois)}条; 全部被过滤"
+            )
+            for reason, poi in rejected:
+                print(f"  [淘汰:{reason}] {_format_poi_detail(poi)}")
             return None
         candidates.sort(key=lambda item: (-item[0], str(item[1].get("name") or "")))
         chosen = candidates[0][1]
         print(f"定向餐厅查询: 目标={target_text}; 关键词={query}; 候选={len(candidates)}; 选中={chosen.get('name')}")
+        for index, (score, poi) in enumerate(candidates, start=1):
+            mark = "✅选中" if poi is chosen else f"候选{index}"
+            print(f"  [{mark}] 评分={score}; {_format_poi_detail(poi)}")
         return chosen
 
     def _resolve_replacement_poi(
@@ -1543,7 +1584,12 @@ class TripPlanningService:
 
         if not candidates:
             return None
-        return max(candidates, key=lambda poi: self._rank_replacement_poi(poi, target))
+        chosen = max(candidates, key=lambda poi: self._rank_replacement_poi(poi, target))
+        print(f"定向替换 POI 选定: 目标={target}; 候选={len(candidates)}; 选中={chosen.get('name')}")
+        for index, poi in enumerate(candidates, start=1):
+            mark = "✅选中" if poi is chosen else f"候选{index}"
+            print(f"  [{mark}] {_format_poi_detail(poi)}")
+        return chosen
 
     @staticmethod
     def _retrieve_cached_pois(
