@@ -16,7 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.plan_agent import PlanAgent
+from backend.app.agents.plan_agent import PlanAgent, build_talk_prompt
 from backend.app.models.schemas import Preference, TalkRequest
 from test._gates import require_real_service_tests, test_artifact_dir
 
@@ -90,7 +90,7 @@ class PlanAgentTalkRealTest(unittest.TestCase):
                         preference=Preference(prompt="偏好慢节奏和本地美食"),
                         message=message,
                     )
-                    prompt = agent._build_prompt(request)
+                    prompt = build_talk_prompt(request)
                     started = time.perf_counter()
                     try:
                         response = agent.talk(request)

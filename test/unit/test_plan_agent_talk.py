@@ -14,8 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from backend.app.agents.plan_agent import PlanAgent
-from backend.app.models.schemas import TalkMessage, TalkRequest
+from backend.app.agents.plan_agent import PlanAgent, build_talk_prompt
+from backend.app.models.schemas import Preference, TalkMessage, TalkRequest
 
 
 class FakeDialogueAgent:
@@ -43,11 +43,11 @@ class PlanAgentTalkTest(unittest.TestCase):
     def suggestions() -> list[str]:
         return ["安排在上午", "增加附近午餐", "减少一处景点"]
 
-    def test_build_prompt_keeps_city_plan_preference_and_history_order(self) -> None:
-        agent = object.__new__(PlanAgent)
-        prompt = agent._build_prompt(TalkRequest(
+    def test_build_talk_prompt_embeds_context_history_and_question_in_order(self) -> None:
+        prompt = build_talk_prompt(TalkRequest(
             city="深圳",
             plan_context="第 1 天安排深圳技术大学",
+            preference=Preference(prompt="偏好校园和慢节奏"),
             messages=[
                 TalkMessage(role="user", content="我喜欢大学校园"),
                 TalkMessage(role="assistant", content="我会优先安排校园路线"),
@@ -55,15 +55,24 @@ class PlanAgentTalkTest(unittest.TestCase):
             message="第 2 天加一处公园",
         ))
 
+        # 模板结构：## 当前任务(**Question**) 在前，## 执行历史({history}) 在后
         expected_fragments = [
-            "当前旅行计划目的地: 深圳",
-            "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；不要把聊天历史中的建议当成已执行安排）: 第 1 天安排深圳技术大学",
+            "**Question:** 第 2 天加一处公园",
+            "[目的地城市] 深圳",
+            "[当前行程摘要] 第 1 天安排深圳技术大学",
+            "[已知长期偏好] 偏好校园和慢节奏",
             "用户: 我喜欢大学校园",
             "顾问: 我会优先安排校园路线",
-            "用户: 第 2 天加一处公园",
         ]
         positions = [prompt.index(fragment) for fragment in expected_fragments]
         self.assertEqual(positions, sorted(positions))
+
+    def test_build_talk_prompt_formats_json_examples_without_leftover_braces(self) -> None:
+        prompt = build_talk_prompt(TalkRequest(city="深圳", message="推荐路线"))
+        # 模板中所有字面 JSON 大括号必须转义，format 后不残留占位符与花括号对。
+        self.assertNotIn("{question}", prompt)
+        self.assertNotIn("{history}", prompt)
+        self.assertIn('"operation":"full_replan"', prompt)
 
     def test_talk_uses_model_suggestions_without_fallback(self) -> None:
         agent = self.build_agent(response(

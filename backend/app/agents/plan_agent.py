@@ -26,7 +26,7 @@ TALK_AGENT_PROMPT = """你是「行旅天下」旅行偏好顾问。通过自然
 
 1. **意图判定（按顺序执行，三分输出）**:
 * 咨询/闲聊/提供偏好：用户在提问（“有什么好玩的”“博物馆几点闭馆”）、陈述偏好（“我喜欢大学校园”）或闲聊 → `intent="chat"`, `change_set=null`。每轮仅追问 1~2 个未确认的偏好。
-* 泛改请求（无具体对象）：用户要求整体重排但没有点名任何景点/餐饮/日期（“帮我改一下计划”“重新安排”“换个方案”“我想重新规划”）→ `intent="replan"`, `change_set={"operations":[{"operation":"full_replan"}]}`，回复确认即将整体重排。
+* 泛改请求（无具体对象）：用户要求整体重排但没有点名任何景点/餐饮/日期（“帮我改一下计划”“重新安排”“换个方案”“我想重新规划”）→ `intent="replan"`, `change_set={{"operations":[{{"operation":"full_replan"}}]}}`，回复确认即将整体重排。
 * 具体调整：用户明确点名景点/餐饮/某天/日期并要求修改 → `intent="replan"`，输出对应操作的最小 `change_set`。**禁止反问确认，禁止只给建议不落 change_set。**
 * 否定表达：“不想改/先别改/保持原样” → `intent="chat"`, `change_set=null`；但“不想保持原计划，请把 A 改成 B”这类转折后带具体修改的，按具体调整处理。
 * 保守降级：无法确定用户是否要修改行程时，一律 `intent="chat"`, `change_set=null`，并在 reply 中向用户确认。宁可少改，不可误改。
@@ -41,40 +41,46 @@ TALK_AGENT_PROMPT = """你是「行旅天下」旅行偏好顾问。通过自然
 
 **ChangeSet 支持操作（operation 只能取以下枚举值）:**
 
-* `add_attraction`: `{"selector":{"day_index":0},"target":{"semantic":"景点名"}}` (day_index 从 0 计)
-* `delete_attraction`: `{"selector":{"semantic":"景点名/类别"}}`
-* `replace_attraction`: `{"selector":{"semantic":"旧景点"},"target":{"semantic":"新景点"}}`
-* `replace_meal`: `{"selector":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"火锅"}}`。餐饮替换时，`target.semantic` 是唯一检索关键词，可包含菜品、餐厅名、地点等用户明确诉求；不要生成“非面类”“不含面”等排除词，不要人为划分餐饮类别。若用户只说“换一家”，`semantic` 可填“餐厅”作为通用检索词。
-* `update_dates`: `{"fields":{"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}`
+* `add_attraction`: `{{"selector":{{"day_index":0}},"target":{{"semantic":"景点名"}}}}` (day_index 从 0 计)
+* `delete_attraction`: `{{"selector":{{"semantic":"景点名/类别"}}}}`
+* `replace_attraction`: `{{"selector":{{"semantic":"旧景点"}},"target":{{"semantic":"新景点"}}}}`
+* `replace_meal`: `{{"selector":{{"name":"欢喜面馆","day_index":0}},"target":{{"semantic":"火锅"}}}}`。餐饮替换时，`target.semantic` 是唯一检索关键词，可包含菜品、餐厅名、地点等用户明确诉求；不要生成“非面类”“不含面”等排除词，不要人为划分餐饮类别。若用户只说“换一家”，`semantic` 可填“餐厅”作为通用检索词。
+* `update_dates`: `{{"fields":{{"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}}}`
 * `full_replan`: 全局重排，无附加字段
 
 **输出 JSON 结构:**
-{
+{{
 "reply": "自然友好的用户回复",
 "intent": "chat | replan",
 "change_request": "变更摘要(普通聊天填 null)",
-"change_set": { "operations": [...] } | null,
+"change_set": {{ "operations": [...] }} | null,
 "top_suggestions": ["建议1", "建议2", "建议3"],
-"preference": { "prompt": "用户偏好描述" } | null,
+"preference": {{ "prompt": "用户偏好描述" }} | null,
 "done": false
-}
+}}
 
 **示例 1 (具体调整: 删改并存):**
 用户: "把第2天的博物馆换成深圳技术大学"
-输出: {"reply":"已为您替换为深圳技术大学。","intent":"replan","change_request":"第2天博物馆替换为深圳技术大学","change_set":{"operations":[{"operation":"replace_attraction","selector":{"semantic":"博物馆"},"target":{"semantic":"深圳技术大学"}}]},"top_suggestions":["推荐大学周边美食","调整第2天节奏为轻松","查看校园参观须知"],"preference":null,"done":false}
+输出: {{"reply":"已为您替换为深圳技术大学。","intent":"replan","change_request":"第2天博物馆替换为深圳技术大学","change_set":{{"operations":[{{"operation":"replace_attraction","selector":{{"semantic":"博物馆"}},"target":{{"semantic":"深圳技术大学"}}}}]}},"top_suggestions":["推荐大学周边美食","调整第2天节奏为轻松","查看校园参观须知"],"preference":null,"done":false}}
 
 **示例 2 (泛改请求: 整体重排):**
 用户: "帮我重新安排一下行程"
-输出: {"reply":"好的，我会基于当前行程重新规划一版路线。","intent":"replan","change_request":"重新规划当前行程","change_set":{"operations":[{"operation":"full_replan"}]},"top_suggestions":["这次偏向自然风光","保持每天两个景点","加入本地美食"],"preference":null,"done":true}
+输出: {{"reply":"好的，我会基于当前行程重新规划一版路线。","intent":"replan","change_request":"重新规划当前行程","change_set":{{"operations":[{{"operation":"full_replan"}}]}},"top_suggestions":["这次偏向自然风光","保持每天两个景点","加入本地美食"],"preference":null,"done":true}}
 
 **示例 3 (咨询问题: 必须是 chat):**
 用户: "请问博物馆周一闭馆吗"
-输出: {"reply":"大多数博物馆周一闭馆，具体以目的地场馆公告为准。","intent":"chat","change_request":null,"change_set":null,"top_suggestions":["推荐几家本地博物馆","查一下开放日门票","加入第二天的行程"],"preference":null,"done":false}
+输出: {{"reply":"大多数博物馆周一闭馆，具体以目的地场馆公告为准。","intent":"chat","change_request":null,"change_set":null,"top_suggestions":["推荐几家本地博物馆","查一下开放日门票","加入第二天的行程"],"preference":null,"done":false}}
 
 **示例 4 (日期确认):**
 助手上一轮: "新日期 5月10日 至 5月12日 可以吗？"
 用户: "好的，就这几天"
-输出: {"reply":"好的，我已按确认的新日期调整行程。","intent":"replan","change_request":"确认新的出行日期","change_set":{"operations":[{"operation":"update_dates","fields":{"start_date":"2026-05-10","end_date":"2026-05-12"}}]},"top_suggestions":["看看新日期的天气","重新排每天的路线","推荐住宿"],"preference":null,"done":true}
+输出: {{"reply":"好的，我已按确认的新日期调整行程。","intent":"replan","change_request":"确认新的出行日期","change_set":{{"operations":[{{"operation":"update_dates","fields":{{"start_date":"2026-05-10","end_date":"2026-05-12"}}}}]}},"top_suggestions":["看看新日期的天气","重新排每天的路线","推荐住宿"],"preference":null,"done":true}}
+
+## 当前任务
+**Question:** {question}
+
+## 执行历史
+{history}
 """
 
 SUGGESTION_AGENT_PROMPT = """你是「行旅天下」的旅行建议生成器。
@@ -124,17 +130,45 @@ Action: 选择合适的工具获取信息，格式为：
 现在开始你的推理和行动："""
 
 
+def build_talk_prompt(request: TalkRequest) -> str:
+    """用当前会话上下文填充 TALK_AGENT_PROMPT 的 {question}/{history} 占位符。
+
+    模板中的字面 JSON 大括号已转义为 {{ }}，这里只负责填充两个命名占位符。
+    """
+    context_lines = []
+    if request.city:
+        context_lines.append(
+            f"[目的地城市] {request.city}（用户提到大学、公园、酒店等未带城市的地点时，"
+            "必须理解为该目的地范围内的地点）"
+        )
+    if request.plan_context:
+        context_lines.append(
+            "[当前行程摘要] " + request.plan_context
+            + "（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；"
+            "不要把聊天历史中的建议当成已执行安排）"
+        )
+    if request.preference and request.preference.prompt:
+        context_lines.append(f"[已知长期偏好] {request.preference.prompt}")
+    for msg in request.messages:
+        role = "用户" if msg.role == "user" else "顾问"
+        context_lines.append(f"{role}: {msg.content}")
+    history = "\n".join(context_lines) if context_lines else "（无）"
+    return TALK_AGENT_PROMPT.format(question=request.message, history=history)
+
+
 class PlanAgent(SimpleAgent):
     """旅行规划智能体：ReAct 规划 + 偏好对话（唯一对话入口 talk()）"""
 
     def __init__(self) -> None:
         self.llm = get_llm()
 
-        # 对话 Agent（talk() 入口使用）
+        # 对话 Agent（talk() 入口使用）。完整行为准则随每轮 format 后的
+        # TALK_AGENT_PROMPT 作为用户消息传入，system 侧只保留角色行，
+        # 避免模板占位符以未填充状态进入 system 提示。
         self.agent = SimpleAgent(
             name="旅行偏好顾问",
             llm=self.llm,
-            system_prompt=TALK_AGENT_PROMPT,
+            system_prompt="你是「行旅天下」旅行偏好顾问，严格按用户消息中给出的行为准则输出纯 JSON。",
         )
         self.suggestion_agent = SimpleAgent(
             name="旅行建议生成器",
@@ -169,7 +203,7 @@ class PlanAgent(SimpleAgent):
             assistant 回复；replan 时附带 ChangeSet；偏好足够时置 done=True
         """
         try:
-            prompt = self._build_prompt(request)
+            prompt = build_talk_prompt(request)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
             print(
@@ -228,29 +262,6 @@ class PlanAgent(SimpleAgent):
             return []
 
     # ============ 提示构造 ============
-
-    def _build_prompt(self, request: TalkRequest) -> str:
-        """把历史对话与本轮输入拼成一段上下文提示。"""
-        lines = []
-        if request.city:
-            lines.append(
-                f"当前旅行计划目的地: {request.city}。用户提到大学、公园、酒店等未带城市的地点时，"
-                "必须理解为该目的地范围内的地点。"
-            )
-        if request.plan_context:
-            lines.append(
-                "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；"
-                "不要把聊天历史中的建议当成已执行安排）: "
-                + request.plan_context
-            )
-        if request.preference and request.preference.prompt:
-            lines.append(f"已知长期偏好: {request.preference.prompt}")
-        for msg in request.messages:
-            role = "用户" if msg.role == "user" else "顾问"
-            lines.append(f"{role}: {msg.content}")
-        lines.append(f"用户: {request.message}")
-        history = "\n".join(lines)
-        return f"以下是与用户的对话记录，请根据系统设定继续本轮回复:\n\n{history}"
 
     def _build_suggestion_prompt(self, request: TalkRequest) -> str:
         lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
