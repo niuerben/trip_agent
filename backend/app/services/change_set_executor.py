@@ -81,10 +81,10 @@ class ChangeSetExecutor:
                 raise ChangeExecutionError("replace_attraction 没有匹配到待替换景点", code="selector_not_found")
             if len(matches) != 1:
                 raise ChangeExecutionError("replace_attraction 选择器匹配多个景点", code="ambiguous_selector")
-            poi = self._resolve(op, context)
-            old = matches[0][2].name
-            matches[0][0].attractions[matches[0][1]] = self._attraction(poi)
-            changes.append(f"替换 {old} 为 {self._poi_name(poi)}")
+            day, index, old_attraction = matches[0]
+            poi = self._resolve(op, replace(context, anchor=self._day_anchor(day)))
+            day.attractions[index] = self._attraction(poi)
+            changes.append(f"替换 {old_attraction.name} 为 {self._poi_name(poi)}")
             return
         if op.operation == "replace_meal":
             matches = self._meal_matches(plan, op)
@@ -92,9 +92,11 @@ class ChangeSetExecutor:
                 raise ChangeExecutionError("replace_meal 没有匹配到待替换餐饮", code="selector_not_found")
             if len(matches) != 1:
                 raise ChangeExecutionError("replace_meal 选择器匹配多个餐饮", code="ambiguous_selector")
-            poi = self._resolve(op, context)
             day, index, old = matches[0]
-            day.meals[index] = self._meal(poi, old.type)
+            poi = self._resolve(op, replace(context, anchor=self._day_anchor(day)))
+            # 继承被替换餐的人均：原计划已过校验，其人均必 >0，避免高德餐饮 POI
+            # 无价格导致新餐 estimated_cost=0 触发 MEAL_PRICE_MISSING。
+            day.meals[index] = self._meal(poi, old.type, fallback_cost=old.estimated_cost)
             changes.append(f"替换{old.type} {old.name} 为 {self._poi_name(poi)}")
             return
         if op.operation == "add_attraction":
@@ -151,6 +153,20 @@ class ChangeSetExecutor:
                     result.append((day, i, meal))
         return result
 
+    @staticmethod
+    def _day_anchor(day: Any) -> Location | None:
+        """被改那天的就近锚点：优先酒店，其次首个有坐标的景点，再次任一餐点。"""
+        hotel = getattr(day, "hotel", None)
+        if hotel is not None and getattr(hotel, "location", None) is not None:
+            return hotel.location
+        for attraction in day.attractions:
+            if attraction.location is not None:
+                return attraction.location
+        for meal in day.meals:
+            if meal.location is not None:
+                return meal.location
+        return None
+
     def _resolve(self, op: ChangeOperation, context: PlanningContext) -> POIRecord | dict[str, Any]:
         target = op.target
         query = (getattr(target, "name", None) or getattr(target, "semantic", None) or "").strip() if target else ""
@@ -197,9 +213,12 @@ class ChangeSetExecutor:
         return Attraction(name=str(data.get("name") or ""), address=str(data.get("address") or ""), location=cls._location(data), visit_duration=int(data.get("visit_duration", 120)), description=str(data.get("description") or data.get("type") or "真实高德 POI"), category=data.get("category", "景点"), rating=data.get("rating"), photos=list(data.get("photos") or []), image_url=data.get("image_url"), poi_id=str(data.get("poi_id") or data.get("id") or ""), ticket_price=int(data.get("ticket_price", data.get("cost") or 0) or 0))
 
     @classmethod
-    def _meal(cls, poi: Any, meal_type: str) -> Meal:
+    def _meal(cls, poi: Any, meal_type: str, fallback_cost: int = 0) -> Meal:
         data = cls._as_data(poi)
-        return Meal(type=meal_type, name=str(data.get("name") or ""), address=str(data.get("address") or ""), location=cls._location(data), description=str(data.get("description") or data.get("type") or "真实高德餐饮 POI"), estimated_cost=int(data.get("estimated_cost", data.get("ticket_price", data.get("cost") or 0)) or 0), poi_id=str(data.get("poi_id") or data.get("id") or ""))
+        cost = int(data.get("estimated_cost", data.get("ticket_price", data.get("cost") or 0)) or 0)
+        if cost <= 0 and fallback_cost:
+            cost = max(int(fallback_cost), 0)
+        return Meal(type=meal_type, name=str(data.get("name") or ""), address=str(data.get("address") or ""), location=cls._location(data), description=str(data.get("description") or data.get("type") or "真实高德餐饮 POI"), estimated_cost=cost, poi_id=str(data.get("poi_id") or data.get("id") or ""))
 
     @staticmethod
     def _update_dates(plan: TripPlan, request: TripRequest, op: ChangeOperation, changes: list[str]) -> None:

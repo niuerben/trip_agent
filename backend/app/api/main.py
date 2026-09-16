@@ -8,6 +8,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# 在任何业务日志产生前，把 stdout/stderr 持久化到 backend/logs/backend-YYYYMMDD.log。
+from ..logging_setup import setup_file_logging
+
+_LOG_FILE = setup_file_logging()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
@@ -50,6 +55,7 @@ async def startup_event():
     """应用启动事件"""
     print("\n" + "="*60)
     print(f"{settings.app_name} v{settings.app_version}")
+    print(f"日志持久化: {_LOG_FILE}")
     print("="*60)
     
     # 打印配置信息
@@ -64,7 +70,14 @@ async def startup_event():
         print("\n请检查.env文件并确保所有必要的配置项都已设置")
         raise
 
-    await init_database()
+    try:
+        await init_database()
+    except Exception as error:
+        # 数据库是可选持久化能力；连接失败不应阻断地图和规划 API 启动。
+        print(
+            "⚠️ PostgreSQL 不可用，跳过数据库初始化；"
+            f"会话持久化已禁用: {type(error).__name__}: {error}"
+        )
 
     # Chroma 在后端启动阶段预热，避免首个规划请求承担 PersistentClient
     # 和 collection 初始化耗时。Chroma 不可用时保持 REST/MCP 降级链路。

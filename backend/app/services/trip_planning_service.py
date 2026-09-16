@@ -28,14 +28,14 @@ from .trip_plan_validator import (
     is_within_city,
     validate_trip_plan,
 )
-from .poi_vector_store import classify_poi_group
+from .poi_vector_store import DINING_ROOT_TYPECODE, classify_poi_group
 from .planning_service import (
     PlanningSession,
     PlanningToolset,
     ValidatedPlanningReActAgent,
 )
 from .change_set_executor import ChangeSetExecutor
-from .domain_errors import ChangeExecutionError
+from .domain_errors import ChangeExecutionError, TargetedReplanUnsatisfiable
 from .planning_context import PlanningContext, POIRecord
 from ..agents.plan_agent import PlanAgent
 
@@ -187,6 +187,11 @@ class TripPlanningService:
                 change_set
                 and any(operation.operation == "full_replan" for operation in change_set.operations)
             )
+            if change_set:
+                print(
+                    "Replan ChangeSet: "
+                    + json.dumps(change_set.model_dump(mode="json"), ensure_ascii=False)
+                )
             if request.current_plan and change_set and not requires_full_replan:
                 original_plan = TripPlan.model_validate(request.current_plan)
                 try:
@@ -204,26 +209,22 @@ class TripPlanningService:
                         radius_km=radius_km,
                         require_enriched_locations=True,
                     )
-                    print(
-                        "定向重规划完成: " + "；".join(changes)
-                        + "；未重新检索酒店、餐厅、天气或路线。"
-                    )
+                    self._log_replan_result(trip_plan, changes, "deterministic-changeset")
+                    print("未重新检索酒店、餐厅、天气或路线。")
                     return trip_plan
                 except TripPlanValidationError as validation_error:
-                    # 旧计划含占位餐馆等遗留缺陷时，把已执行的局部修改作为
-                    # Draft 交给 ReAct，根据 Validator Observation 定向补齐。
-                    print(f"定向修改后的 Draft 需继续修复: {validation_error}")
-                    request.current_plan = trip_plan.model_dump()
+                    # 定向修改能执行但通不过校验（如替换餐超出步行范围/缺人均）时，
+                    # 不再静默丢弃改动去跑忽略 change_set 的全量重排——那会返回一份
+                    # 看起来没变的计划。直接如实上报，由路由层保留原计划并告知用户。
+                    raise TargetedReplanUnsatisfiable(
+                        self._describe_replan_failure(change_set, validation_error)
+                    ) from validation_error
                 except (ChangeExecutionError, ValueError) as change_set_error:
-                    # Talk LLM 有时能正确识别重规划意图，却为餐饮等当前局部执行器
-                    # 尚未表达的变更输出空操作。此时保留原计划，转由 ReAct 根据完整
-                    # 上下文和 change_request 完成真实 POI 检索及校验，避免把“已更新”
-                    # 变成 422 或仅修改一段文案。
-                    print(
-                        "ChangeSet 无法局部执行，转入 ReAct 定向重规划: "
-                        f"{change_set_error}"
-                    )
-                    request.current_plan = original_plan.model_dump()
+                    # 局部执行器无法完成该变更（如范围内找不到真实 POI）。同样如实上报，
+                    # 不下沉到忽略 change_set 的 _build_evidence_plan 全量重排。
+                    raise TargetedReplanUnsatisfiable(
+                        self._describe_replan_failure(change_set, change_set_error)
+                    ) from change_set_error
 
             planner_query = self._build_planner_query(request, preference, vector_pois)
             planning_session = PlanningSession(
@@ -296,15 +297,16 @@ class TripPlanningService:
                             for issue in issues
                         )
                         print(
-                            "确定性排程未通过 Validator，回退到 ReAct。"
-                            + (f" 原因: {issue_text}" if issue_text else "")
+                            "定向重规划校验未通过，转入 ReAct: "
+                            f"issues={len(issues)}; "
+                            + (f"原因={issue_text}" if issue_text else "")
                         )
             if trip_plan is None:
                 planner_response = ValidatedPlanningReActAgent(
                     llm=self.llm,
                     session=planning_session,
                 ).run(planner_query)
-                print(f"规划 Agent 返回: {planner_response[:300]}...\n")
+                print(f"规划 Agent 已返回最终答案（{len(planner_response)} 字符）。")
                 trip_plan = planning_session.validated_plan
                 if trip_plan is None:
                     raise RuntimeError("ReAct 已结束，但没有通过 Validator 的旅行计划")
@@ -369,6 +371,10 @@ class TripPlanningService:
                 require_enriched_locations=True,
             )
             return trip_plan
+        except TargetedReplanUnsatisfiable:
+            # 定向 replan 在约束内无解是预期业务分支，交由路由层如实告知用户；
+            # 不打印“Agent 失败”和堆栈，避免把正常结果写成错误噪声。
+            raise
         except Exception as error:
             print(f"旅行规划 Agent 失败: {type(error).__name__}: {error}")
             import traceback
@@ -1271,6 +1277,66 @@ class TripPlanningService:
             day.attractions = ordered + without_location
         return plan
 
+    @staticmethod
+    def _replan_meals(plan: TripPlan) -> list[dict[str, object]]:
+        """返回 replan 后餐饮关键字段，避免日志只显示抽象变更文案。"""
+        meals = []
+        for day in plan.days:
+            for meal in day.meals:
+                meals.append({
+                    "day": day.day_index + 1,
+                    "date": day.date,
+                    "type": meal.type,
+                    "name": meal.name,
+                    "address": meal.address,
+                    "location": meal.location.model_dump(mode="json") if meal.location else None,
+                    "poi_id": meal.poi_id,
+                    "estimated_cost": meal.estimated_cost,
+                })
+        return meals
+
+    @classmethod
+    def _log_replan_result(cls, plan: TripPlan, changes: list[str], stage: str) -> None:
+        print(
+            f"Replan 完成: stage={stage}; changes="
+            + json.dumps(changes, ensure_ascii=False)
+        )
+        print(
+            "Replan 餐饮结果: "
+            + json.dumps(cls._replan_meals(plan), ensure_ascii=False)
+        )
+
+    @staticmethod
+    def _describe_replan_failure(change_set: ChangeSet, error: Exception) -> str:
+        """把定向 replan 失败拼成给用户看的中文原因；不含密钥/坐标/内部错误码。"""
+        label_by_op = {
+            "replace_meal": "餐厅",
+            "replace_attraction": "景点",
+            "add_attraction": "景点",
+            "delete_attraction": "景点",
+        }
+        targets: list[str] = []
+        for op in getattr(change_set, "operations", None) or []:
+            selector = op.selector
+            day_text = (
+                f"第{selector.day_index + 1}天"
+                if selector and selector.day_index is not None
+                else ""
+            )
+            target = op.target
+            wish = (
+                (getattr(target, "semantic", None) or getattr(target, "name", None) or "").strip()
+                if target
+                else ""
+            )
+            label = label_by_op.get(op.operation, "行程项")
+            if wish:
+                targets.append(f"{day_text}符合『{wish}』的{label}".lstrip())
+            elif day_text:
+                targets.append(f"{day_text}的{label}")
+        scope = "、".join(targets) if targets else "本次修改"
+        return f"未能在步行范围内找到{scope}，已保留原计划。可放宽范围或调整诉求后再试。"
+
     def _execute_change_set(
         self,
         plan: TripPlan,
@@ -1285,12 +1351,13 @@ class TripPlanningService:
                 self.planner = planner
 
             def resolve_attraction(self, target, context, operation=""):
-                query = ((target.name if target else None) or (target.semantic if target else None) or "").strip()
+                query = ((target.semantic if target else None) or (target.name if target else None) or "").strip()
                 if operation == "replace_meal":
-                    poi = self.planner._resolve_replacement_meal_poi(
+                    poi = self.planner._replace_meal(
                         context.request or request,
                         query,
                         target_adcode,
+                        anchor=context.anchor,
                     )
                 else:
                     poi = self.planner._resolve_replacement_poi(
@@ -1453,52 +1520,92 @@ class TripPlanningService:
                 score -= 200
         return score
 
-    def _resolve_replacement_meal_poi(
+    def _replace_meal(
         self,
         request: TripRequest,
         target: str,
         target_adcode: Optional[str],
+        anchor: Optional[Location] = None,
     ) -> Optional[dict]:
-        """Search an in-scope non-noodle restaurant for a meal replacement."""
+        """按餐饮关键词检索并选择就近、贴合诉求的替换餐厅。
+
+        关键词按顿号/逗号/空格等切分为多词分别匹配，避免把整串复合诉求
+        （如“粥、包子、豆浆类中式早餐”）当成唯一子串导致候选全部 0 分退化。
+        提供锚点（被改那天的酒店/景点/餐点坐标）时按到锚点的近似距离就近排序；
+        7 公里步行门槛仍由 Validator 独占裁定，这里只负责相对排序。
+        """
         target_text = str(target or "").strip()
-        area = next(
-            (part.strip() for part in re.split(r"[/、，,]", target_text) if part.strip() and "非面" not in part and "早餐" not in part),
-            "",
-        )
-        query = f"{area or request.city} 餐厅"
+        query = target_text or f"{request.city} 餐厅"
+        city = _normalize_city_for_amap(request.city)
+        normalized_query = "".join(target_text.split()).lower()
+        tokens: list[str] = []
+        for raw in re.split(r"[、,，/／\s]+", target_text):
+            for piece in re.split(r"[类和及与的等]", raw):
+                token = "".join(piece.split()).lower()
+                if token and token not in tokens:
+                    tokens.append(token)
+
+        def collect(pois: list[dict]) -> list[tuple[int, float, dict]]:
+            candidates = []
+            for poi in pois:
+                if classify_poi_group(poi) != "meal":
+                    continue
+                if target_adcode and str(poi.get("adcode") or "").strip() not in {"", target_adcode}:
+                    continue
+                location = self._parse_poi_location(poi)
+                if location is None:
+                    continue
+                text = "|".join(
+                    str(poi.get(key) or "")
+                    for key in ("name", "type", "address")
+                )
+                normalized_text = "".join(text.split()).lower()
+                score = 0
+                if normalized_query and normalized_query in normalized_text:
+                    score += 40
+                for token in tokens:
+                    if token in normalized_text:
+                        score += 20
+                distance = (
+                    self._geo_distance_squared(anchor, location)
+                    if anchor is not None
+                    else 0.0
+                )
+                candidates.append((score, distance, poi))
+            return candidates
+
         try:
             pois = get_amap_photo_service().search_pois(
                 query,
-                city=_normalize_city_for_amap(request.city),
+                city=city,
                 offset=20,
+                types=DINING_ROOT_TYPECODE,
             )
+            candidates = collect(pois)
+            if not candidates and query != f"{request.city} 餐厅":
+                fallback_query = f"{request.city} 餐厅"
+                pois = get_amap_photo_service().search_pois(
+                    fallback_query,
+                    city=city,
+                    offset=20,
+                    types=DINING_ROOT_TYPECODE,
+                )
+                candidates = collect(pois)
         except Exception as error:
             print(f"⚠️ 定向餐厅查询失败: {type(error).__name__}: {error}")
             return None
 
-        excluded = ("面馆", "面店", "拉面", "拌面", "面食", "面条", "粉面", "牛肉面", "私房面")
-        area_terms = [part for part in re.split(r"[/、，,]", area) if part]
-        candidates = []
-        for poi in pois:
-            if classify_poi_group(poi) != "meal":
-                continue
-            if target_adcode and str(poi.get("adcode") or "").strip() not in {"", target_adcode}:
-                continue
-            text = f"{poi.get('name') or ''}|{poi.get('type') or ''}|{poi.get('address') or ''}"
-            if any(marker in text for marker in excluded):
-                continue
-            location = self._parse_poi_location(poi)
-            if location is None:
-                continue
-            score = sum(20 for term in area_terms if term in text)
-            if "早餐" in target_text and any(marker in text for marker in ("粥", "包子", "豆浆", "早餐")):
-                score += 30
-            candidates.append((score, poi))
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (-item[0], str(item[1].get("name") or "")))
-        chosen = candidates[0][1]
-        print(f"定向餐厅查询: 目标={target_text}; 关键词={query}; 候选={len(candidates)}; 选中={chosen.get('name')}")
+        candidates.sort(
+            key=lambda item: (-item[0], item[1], str(item[2].get("name") or ""))
+        )
+        chosen = candidates[0][2]
+        print(
+            f"定向餐厅查询: 目标={target_text or '通用餐厅'}; 关键词={query}; "
+            f"候选={len(candidates)}; 就近={'是' if anchor is not None else '否'}; "
+            f"选中={chosen.get('name')}"
+        )
         return chosen
 
     def _resolve_replacement_poi(

@@ -15,6 +15,8 @@ class PlanningContext:
     radius_km: float = 0.0
     target_adcode: Optional[str] = None
     request: Optional[TripRequest] = None
+    # 定向替换餐饮/景点时，被改那天的就近锚点（酒店或已定位景点/餐点）。
+    anchor: Optional[Location] = None
 
 
 @dataclass

@@ -16,6 +16,7 @@ from ...services.trip_planning_service import (
     _is_district_request,
     get_trip_planning_service,
 )
+from ...services.domain_errors import TargetedReplanUnsatisfiable
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
@@ -224,6 +225,22 @@ async def plan_trip(request: TripRequest, http_request: Request):
                     # 但 API 必须在用户预算内立即返回。
                     raise asyncio.TimeoutError
                 trip_plan = planner_task.result()
+            except TargetedReplanUnsatisfiable as unsatisfiable:
+                # 定向修改在约束内无解：保留原计划并如实告知。前端据此显示
+                # “重新规划失败：<message>。原计划已保留。”，且不覆盖原行程。
+                print(f"定向重规划无法满足，保留原计划: {unsatisfiable}")
+                _write_planner_review_log(
+                    status="rejected",
+                    request=request,
+                    preference=preference,
+                    preference_source=preference_source,
+                    error=unsatisfiable,
+                )
+                return TripPlanResponse(
+                    success=False,
+                    message=str(unsatisfiable),
+                    data=None,
+                )
             except Exception as agent_error:
                 print(
                     "模型服务不可用，使用基础计划: "

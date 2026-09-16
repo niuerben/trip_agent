@@ -10,6 +10,7 @@ from ..config import get_settings
 
 
 POI_GROUPS = ("attraction", "hotel", "meal")
+DINING_ROOT_TYPECODE = "050000"
 
 
 def normalize_city_key(city: str) -> str:
@@ -19,7 +20,7 @@ def normalize_city_key(city: str) -> str:
 
 
 def classify_poi_group(poi: dict[str, Any]) -> str | None:
-    """把高德 POI 归入规划需要的三类，大类之外保留原始 type 给 Agent 判断小类。"""
+    """按既有三大组归类，优先使用高德 typecode，缺失时保留关键词回退。"""
     accessory_text = " ".join(
         str(poi.get(key) or "")
         for key in ("name", "type")
@@ -28,25 +29,33 @@ def classify_poi_group(poi: dict[str, Any]) -> str | None:
         "公交站", "地铁站", "停车场", "停车位", "收费站", "出入口",
     )):
         return None
-    typecode = str(poi.get("typecode") or "")
+
+    typecode = str(poi.get("typecode") or "").strip()
+    if typecode.startswith("05"):
+        return "meal"
+    if typecode.startswith("10"):
+        return "hotel"
+    if typecode.startswith(("11", "14", "15", "16", "18")):
+        return "attraction"
+
     text = " ".join(
         str(poi.get(key) or "")
         for key in ("name", "type", "typecode")
     ).lower()
     if any(marker in text for marker in (
         "住宿服务", "宾馆", "酒店", "旅馆", "民宿", "客栈", "公寓式酒店",
-    )) or typecode.startswith("10"):
+    )):
         return "hotel"
     if any(marker in text for marker in (
         "餐饮服务", "餐厅", "餐馆", "饭店", "快餐", "咖啡", "茶馆", "茶艺",
         "酒吧", "甜品", "小吃", "美食",
-    )) or typecode.startswith("05"):
+    )):
         return "meal"
     if any(marker in text for marker in (
         "风景名胜", "公园", "景区", "游乐园", "博物馆", "美术馆", "展览馆",
         "纪念馆", "文化宫", "动物园", "植物园", "科教文化服务", "学校", "大学",
         "学院", "体育休闲服务",
-    )) or typecode.startswith(("11", "14", "15", "16", "18")):
+    )):
         return "attraction"
     return None
 

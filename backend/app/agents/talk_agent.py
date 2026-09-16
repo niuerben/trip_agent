@@ -35,7 +35,7 @@ TALK_AGENT_PROMPT = """你是「行旅天下」旅行偏好顾问。通过自然
 * `add_attraction`: `{"selector":{"day_index":0},"target":{"semantic":"景点名"}}` (day_index 从 0 计)
 * `delete_attraction`: `{"selector":{"semantic":"景点名/类别"}}`
 * `replace_attraction`: `{"selector":{"semantic":"旧景点"},"target":{"semantic":"新景点"}}`
-* `replace_meal`: `{"sele搜素ctor":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"钱江世纪公园/来福士附近非面类餐厅"}}`
+* `replace_meal`: `{"selector":{"name":"欢喜面馆","day_index":0},"target":{"semantic":"火锅"}}`。餐饮替换时，`target.semantic` 是唯一检索关键词，可包含菜品、餐厅名、地点等用户明确诉求；不要生成“非面类”“不含面”等排除词，不要人为划分餐饮类别。若用户只说“换一家”，`semantic` 可填“餐厅”作为通用检索词。
 * `update_dates`: `{"fields":{"start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}}`
 * `full_replan`: 全局重排，无附加字段
 
@@ -115,13 +115,12 @@ class TalkAgent:
         Returns:
             TalkResponse，包含智能体回复、意图、变更集、Top3 建议、偏好提示词等
         '''
-        print('='*20)
-        print(f'🔄 偏好对话智能体 talk() 调用，\nrequirement={requirement}')
         requirement_prompt = requirement.message
         preference_prompt = requirement.preference.prompt if requirement.preference else ""
-        print('='*20)
-        print(f"🔄 偏好对话智能体 talk() 调用，\nrequirement_prompt={requirement_prompt},\npreference_prompt={preference_prompt}")
-        print('='*20)
+        if preference_prompt:
+            print(f"偏好对话请求: message={requirement_prompt!r}; preference={preference_prompt[:120]!r}")
+        else:
+            print(f"偏好对话请求: message={requirement_prompt!r}")
         if hasattr(self.plan_agent, "plan"):
             return self.plan_agent.plan(
                 self.create_prompt(requirement),
@@ -225,7 +224,6 @@ class TalkAgent:
             prompt = self._build_prompt(request)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
-            model_intent = parsed["intent"]
             confirmation_dates = self._date_confirmation(request)
             explicit_replan = self._has_explicit_replan_intent(request.message)
             negative_replan = self._is_negative_replan(request.message)
@@ -249,10 +247,7 @@ class TalkAgent:
                 parsed["done"] = False
             print(
                 "TalkAgent 结构化结果: "
-                f"model_intent={model_intent}, "
-                f"full_replan_gate={gate_hit}, "
-                f"explicit_replan={explicit_replan}, "
-                f"final_intent={parsed['intent']}, "
+                f"intent={parsed['intent']}; "
                 f"operations={len(parsed['change_set'].operations) if parsed['change_set'] else 0}"
             )
             # 每轮对话都应提供可点击的动态 Top3。主对话模型偶尔会遗漏
@@ -398,7 +393,6 @@ class TalkAgent:
 
             if change_set_data:
                 try:
-                    print(f"🔍 解析 change_set，原始数据: {json.dumps(change_set_data, ensure_ascii=False)}")
                     change_set = ChangeSet.model_validate(change_set_data)
                     print(f"✅ change_set 解析成功: operations={len(change_set.operations)}")
                 except Exception as e:
@@ -431,7 +425,10 @@ class TalkAgent:
             }
 
             if intent == "replan":
-                print(f"✅ 识别为重规划意图: change_request={result['change_request']}, operations={len(change_set.operations) if change_set else 0}")
+                print(
+                    "识别为重规划: "
+                    f"operations={len(change_set.operations) if change_set else 0}"
+                )
 
             return result
         except (TypeError, ValueError, json.JSONDecodeError) as error:

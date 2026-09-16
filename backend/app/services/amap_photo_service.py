@@ -41,7 +41,13 @@ class AmapPhotoService:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-    def _fetch_pois(self, keywords: str, city: str = "", offset: int = 3) -> List[dict]:
+    def _fetch_pois(
+        self,
+        keywords: str,
+        city: str = "",
+        offset: int = 3,
+        types: Optional[str] = None,
+    ) -> List[dict]:
         """调用高德关键词搜索, 返回 pois 列表 (可能为空)"""
         if not self.api_key:
             print("⚠️  高德 API Key 未配置, 无法获取图片")
@@ -58,6 +64,8 @@ class AmapPhotoService:
         if city:
             params["city"] = city
             params["citylimit"] = "true"
+        if types:
+            params["types"] = types
 
         try:
             resp = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
@@ -110,10 +118,11 @@ class AmapPhotoService:
         city: str = "",
         offset: int = 10,
         *,
+        types: Optional[str] = None,
         persist: bool = True,
     ) -> List[dict]:
         """返回带图片扩展字段的高德 POI 原始结果。"""
-        pois = self._fetch_pois(keywords, city=city, offset=offset)
+        pois = self._fetch_pois(keywords, city=city, offset=offset, types=types)
         if not persist:
             return pois
         try:
