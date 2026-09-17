@@ -152,6 +152,7 @@ export interface TalkRequest {
   city?: string
   plan_context?: string
   preference?: Preference
+  recalled_preferences?: string[]
   messages?: TalkMessage[]
   message: string
 }

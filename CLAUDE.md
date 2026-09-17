@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-HelloAgents 智能旅行助手（产品名：**行旅天下**）：基于 HelloAgents 框架的 ReAct 旅行规划应用，集成高德地图服务和 Chroma 向量缓存生成多日行程。后端采用服务层 + ReAct Agent 架构，前端 Vue3 + Vite。产品需求详见 `docs/trip-planner-prd.md`。
+HelloAgents 智能旅行助手（产品名：**行旅天下**）：基于 HelloAgents 框架的 ReAct 旅行规划应用，集成高德地图服务和 Chroma 向量缓存生成多日行程。后端采用服务层 + ReAct Agent 架构，前端 Vue3 + Vite。产品需求详见 `docs/2026-07-22-trip-planner-prd.md`。
 
 ## 常用命令
 

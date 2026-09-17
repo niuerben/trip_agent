@@ -101,6 +101,7 @@ class TalkRequest(BaseModel):
     city: Optional[str] = Field(default=None, description="当前旅行计划目的地，用于消解大学、公园等模糊地点")
     plan_context: Optional[str] = Field(default=None, description="当前行程摘要，供对话记忆和建议生成使用")
     preference: Optional[Preference] = Field(default=None, description="当前会话已持久化的长期偏好")
+    recalled_preferences: Optional[List[str]] = Field(default=None, description="跨会话语义召回的相关历史偏好")
     messages: List[TalkMessage] = Field(default=[], description="历史对话")
     message: str = Field(..., description="用户本轮输入")
 

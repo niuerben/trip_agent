@@ -17,6 +17,7 @@ from ...services.trip_planning_service import (
     get_trip_planning_service,
 )
 from ...services.domain_errors import TargetedReplanUnsatisfiable
+from ...services.preference_vector_store import get_preference_vector_store
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest
@@ -188,6 +189,27 @@ async def plan_trip(request: TripRequest, http_request: Request):
         if preference is None:
             preference = Preference(prompt=request.free_text_input or "")
             preference_source = "request.free_text_input"
+
+        # 跨会话语义召回（时间加权）：把该用户历史会话的相关偏好并入本次
+        # 规划使用的偏好文本；只影响本次规划，不回写会话偏好。
+        try:
+            recall_query = " ".join(
+                part for part in (request.city, preference.prompt or "") if part
+            ).strip()
+            if recall_query:
+                store = await asyncio.to_thread(get_preference_vector_store)
+                if store is not None:
+                    rows = await asyncio.to_thread(
+                        store.search_preferences, recall_query, user_id
+                    )
+                    recalled = [row["prompt"] for row in rows if row.get("prompt")]
+                    if recalled:
+                        preference = Preference(
+                            prompt="\n".join([preference.prompt or "", *recalled]).strip()
+                        )
+                        print(f"已并入 {len(recalled)} 条跨会话历史偏好")
+        except Exception as error:
+            print(f"跨会话偏好召回失败，忽略: {type(error).__name__}: {error}")
         print(
             f"偏好来源: {preference_source}; "
             f"内容: {(preference.prompt or '无')[:120]}"

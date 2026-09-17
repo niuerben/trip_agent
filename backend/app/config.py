@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # asyncio.wait_for 可靠中断，因此在 LLM 客户端层先结束请求。
     llm_timeout_seconds: int = 50
     llm_max_tokens: int = 4096
+    # Talk 上下文窗口：中文场景按字符数近似 token 数（1 字 ≈ 1 token），
+    # 不做提前压缩余量，提示词总长超过该值才触发滚动摘要压缩。
+    talk_max_context_tokens: int = 16384
+    # 超限压缩时保留原文的最近消息条数（一问一答为 2 条），更早内容进摘要。
+    talk_context_keep_recent_messages: int = 8
     # 首次完整规划由后端预取三类 POI 证据，避免模型为每类证据各发起一次
     # 串行 ReAct 调用。仅把少量、字段最小化的候选交给模型。
     planner_preload_poi_evidence: bool = True
@@ -83,6 +88,14 @@ class Settings(BaseSettings):
     poi_vector_top_k: int = 10
     # Chroma 余弦距离阈值；距离越小越相似，超过阈值的候选转高德 POI。
     poi_vector_distance_threshold: float = 0.55
+    # 用户偏好向量库（独立 collection，按 user_id 过滤跨会话语义召回）。
+    preference_collection_name: str = "user_preferences"
+    preference_vector_top_k: int = 5
+    # 偏好召回的余弦距离上限；偏好文本较短且语义分散，阈值比 POI 宽松。
+    preference_vector_distance_threshold: float = 0.8
+    # 时间加权半衰期（天）：score = (1 - distance) * 0.5 ** (age_days / half_life)。
+    # 90 天前的偏好权重衰减为一半，避免上一次旅行的偏好压过本轮需求。
+    preference_recency_half_life_days: float = 90.0
     # 高德 Web 服务请求超时。连接和读取分开配置，避免单次网络抖动拖垮整条规划链路。
     amap_connect_timeout_seconds: int = 5
     amap_read_timeout_seconds: int = 12

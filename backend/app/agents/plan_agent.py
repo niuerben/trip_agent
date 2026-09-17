@@ -8,6 +8,8 @@
 """
 
 from ..services.llm_service import get_llm
+from ..services.context_compactor import ContextCompactor, estimate_tokens
+from ..config import get_settings
 import json
 from typing import Any
 
@@ -130,10 +132,12 @@ Action: 选择合适的工具获取信息，格式为：
 现在开始你的推理和行动："""
 
 
-def build_talk_prompt(request: TalkRequest) -> str:
+def build_talk_prompt(request: TalkRequest, compactor: ContextCompactor | None = None) -> str:
     """用当前会话上下文填充 TALK_AGENT_PROMPT 的 {question}/{history} 占位符。
 
     模板中的字面 JSON 大括号已转义为 {{ }}，这里只负责填充两个命名占位符。
+    传入 compactor 时，聊天历史超过 16k 字符窗口会自动滚动摘要压缩；
+    头部的城市、行程摘要、偏好等事实上下文优先保留，不参与压缩。
     """
     context_lines = []
     if request.city:
@@ -149,15 +153,42 @@ def build_talk_prompt(request: TalkRequest) -> str:
         )
     if request.preference and request.preference.prompt:
         context_lines.append(f"[已知长期偏好] {request.preference.prompt}")
-    for msg in request.messages:
-        role = "用户" if msg.role == "user" else "顾问"
-        context_lines.append(f"{role}: {msg.content}")
+    recalled = [item.strip() for item in (request.recalled_preferences or []) if item and item.strip()]
+    if recalled:
+        context_lines.append(
+            "[相关历史偏好] " + "；".join(recalled)
+            + "（来自用户历史会话的语义召回，仅供参考，与当前行程冲突时以当前行程和用户本轮表述为准）"
+        )
+
+    message_lines = [f"{'用户' if msg.role == 'user' else '顾问'}: {msg.content}" for msg in request.messages]
+    if compactor is not None:
+        base_prompt = TALK_AGENT_PROMPT.format(
+            question=request.message,
+            history="\n".join(context_lines) or "（无）",
+        )
+        budget = (
+            get_settings().talk_max_context_tokens
+            - estimate_tokens(base_prompt)
+            - sum(estimate_tokens(line) + 1 for line in context_lines)
+        )
+        if budget > 0:
+            message_lines, _ = compactor.compact_messages(request, budget)
+        else:
+            # 头部上下文已占满窗口：保底保留最新一条消息。
+            message_lines = message_lines[-1:]
+        context_lines = [*context_lines, *message_lines]
+    else:
+        context_lines = [*context_lines, *message_lines]
+
     history = "\n".join(context_lines) if context_lines else "（无）"
     return TALK_AGENT_PROMPT.format(question=request.message, history=history)
 
 
 class PlanAgent(SimpleAgent):
     """旅行规划智能体：ReAct 规划 + 偏好对话（唯一对话入口 talk()）"""
+
+    # 类级默认 None：未走 __init__ 构造（如单测注入 fake agent）时退回不压缩行为。
+    compactor: ContextCompactor | None = None
 
     def __init__(self) -> None:
         self.llm = get_llm()
@@ -175,6 +206,8 @@ class PlanAgent(SimpleAgent):
             llm=self.llm,
             system_prompt=SUGGESTION_AGENT_PROMPT,
         )
+        # 聊天历史超 16k 字符窗口时的滚动摘要压缩器，复用同一 LLM。
+        self.compactor = ContextCompactor(llm=self.llm)
 
         # ReAct 规划工具链（自原 PlanAgent 移植）
         self.validate_agent = ValidateAgent()
@@ -185,7 +218,7 @@ class PlanAgent(SimpleAgent):
         tool_registry.register_tool(SearchWeather())
         tool_registry.register_tool(SearchHotel())
         tool_registry.register_tool(SearchRestaurant())
-        self.react_agent = ReActAgent("旅行规划师", self.llm, tool_registry, max_steps=8, custom_prompt=PLAN_PROMPT)
+        self.react_agent = ReActAgent("旅行规划师", self.llm, tool_registry, max_steps=5, custom_prompt=PLAN_PROMPT)
 
     def run(self, input_text: str, max_tool_iterations: int=3, **kwargs) -> str:
         response = self.react_agent.run(input_text)
@@ -203,7 +236,7 @@ class PlanAgent(SimpleAgent):
             assistant 回复；replan 时附带 ChangeSet；偏好足够时置 done=True
         """
         try:
-            prompt = build_talk_prompt(request)
+            prompt = build_talk_prompt(request, self.compactor)
             raw_reply = self.agent.run(prompt)
             parsed = self._parse_reply(raw_reply)
             print(
@@ -264,23 +297,38 @@ class PlanAgent(SimpleAgent):
     # ============ 提示构造 ============
 
     def _build_suggestion_prompt(self, request: TalkRequest) -> str:
-        lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
+        head_lines = [f"当前旅行计划目的地: {request.city or '未提供'}。"]
         if request.plan_context:
-            lines.append(
+            head_lines.append(
                 "当前行程摘要（当前行程事实，仅以此为准解析‘第几天’、已有景点和住宿餐饮；"
                 "不要把聊天历史中的建议当成已执行安排）: "
                 + request.plan_context
             )
         if request.preference and request.preference.prompt:
-            lines.append(f"已知长期偏好: {request.preference.prompt}")
-        if request.messages:
-            lines.append("聊天历史:")
-            for msg in request.messages:
-                role = "用户" if msg.role == "user" else "行旅助手"
-                lines.append(f"{role}: {msg.content}")
+            head_lines.append(f"已知长期偏好: {request.preference.prompt}")
+        recalled = [item.strip() for item in (request.recalled_preferences or []) if item and item.strip()]
+        if recalled:
+            head_lines.append("相关历史偏好（语义召回，仅供参考）: " + "；".join(recalled))
+
+        message_lines = [
+            f"{'用户' if msg.role == 'user' else '行旅助手'}: {msg.content}"
+            for msg in request.messages
+        ]
+        if not message_lines:
+            message_lines = ["聊天历史为空；请仅根据当前行程提供下一步可调整项。"]
         else:
-            lines.append("聊天历史为空；请仅根据当前行程提供下一步可调整项。")
-        lines.append("现在生成恰好 3 条建议。")
+            head_lines.append("聊天历史:")
+        # 建议提示词与主对话共用同一个 16k 字符窗口预算。
+        base = "\n".join([*head_lines, "", "现在生成恰好 3 条建议。"])
+        budget = (
+            get_settings().talk_max_context_tokens
+            - estimate_tokens(base)
+            - sum(estimate_tokens(line) + 1 for line in head_lines)
+        )
+        if self.compactor is not None and budget > 0:
+            message_lines, _ = self.compactor.compact_messages(request, budget)
+
+        lines = [*head_lines, *message_lines, "现在生成恰好 3 条建议。"]
         return "\n".join(lines)
 
     # ============ 结构化输出解析 ============

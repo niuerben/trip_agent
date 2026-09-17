@@ -22,6 +22,7 @@ from ...models.schemas import (
     TalkSuggestionsRequest,
     TalkSuggestionsResponse,
 )
+from ...services.preference_vector_store import get_preference_vector_store
 from .conversations import as_beijing, ensure_user, user_id_from_request
 
 router = APIRouter(prefix="/talk", tags=["偏好对话"])
@@ -90,6 +91,40 @@ async def _persist_messages(
             })
 
 
+def _recall_preferences_sync(
+    user_id: str,
+    query: str,
+    exclude_conversation_id: str | None = None,
+) -> list[str]:
+    """跨会话语义召回该用户的历史偏好；Chroma 不可用时返回空列表。"""
+    store = get_preference_vector_store()
+    if store is None:
+        return []
+    try:
+        rows = store.search_preferences(query, user_id)
+    except Exception as error:
+        print(f"偏好向量召回失败，忽略: {type(error).__name__}: {error}")
+        return []
+    return [
+        row["prompt"]
+        for row in rows
+        if row.get("prompt") and row.get("conversation_id") != exclude_conversation_id
+    ]
+
+
+def _upsert_preference_sync(
+    prompt: str,
+    user_id: str,
+    conversation_id: str,
+    city: str,
+) -> None:
+    """把提炼出的偏好写入向量库；Chroma 不可用时静默跳过。"""
+    store = get_preference_vector_store()
+    if store is None:
+        return
+    store.upsert_preference(prompt, user_id, conversation_id, city=city)
+
+
 @router.post(
     "",
     response_model=TalkResponse,
@@ -113,6 +148,20 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         except Exception as error:
             print(f"加载聊天历史失败，忽略: {type(error).__name__}: {error}")
 
+    # 跨会话语义召回历史偏好（时间加权），当前会话已持久化的偏好不重复召回。
+    recalled_preferences: list[str] = []
+    recall_query = " ".join(part for part in (request.city, request.message) if part).strip()
+    if recall_query:
+        try:
+            recalled_preferences = await asyncio.to_thread(
+                _recall_preferences_sync,
+                user_id,
+                recall_query,
+                request.conversation_id,
+            )
+        except Exception as error:
+            print(f"偏好召回失败，忽略: {type(error).__name__}: {error}")
+
     context_messages = (
         [TalkMessage(role=m.role, content=m.content) for m in history]
         if history
@@ -123,6 +172,7 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         city=request.city,
         plan_context=request.plan_context,
         preference=remembered_preference,
+        recalled_preferences=recalled_preferences,
         messages=context_messages,
         message=request.message,
     )
@@ -195,6 +245,19 @@ async def talk(request: TalkRequest, http_request: Request) -> TalkResponse:
         except Exception as error:
             print(f"偏好持久化失败，忽略: {type(error).__name__}: {error}")
 
+    # 同步写入偏好向量库（独立于 Postgres，写入失败只打日志），供跨会话语义召回。
+    if request.conversation_id and preference and preference.prompt:
+        try:
+            await asyncio.to_thread(
+                _upsert_preference_sync,
+                preference.prompt,
+                user_id,
+                request.conversation_id,
+                request.city or "",
+            )
+        except Exception as error:
+            print(f"偏好向量写入失败，忽略: {type(error).__name__}: {error}")
+
     return TalkResponse(
         success=True,
         reply=reply,
@@ -239,6 +302,18 @@ async def get_suggestions(
     try:
         history = await _load_history(request.conversation_id, user_id)
         preference = await _load_conversation_preference(request.conversation_id, user_id)
+        recalled_preferences: list[str] = []
+        recall_query = (request.city or "").strip()
+        if recall_query:
+            try:
+                recalled_preferences = await asyncio.to_thread(
+                    _recall_preferences_sync,
+                    user_id,
+                    recall_query,
+                    request.conversation_id,
+                )
+            except Exception as error:
+                print(f"偏好召回失败，忽略: {type(error).__name__}: {error}")
         agent = await asyncio.wait_for(
             asyncio.to_thread(get_plan_agent),
             timeout=settings.planner_init_timeout_seconds,
@@ -251,6 +326,7 @@ async def get_suggestions(
                     city=request.city,
                     plan_context=request.plan_context,
                     preference=preference,
+                    recalled_preferences=recalled_preferences,
                     messages=[TalkMessage(role=item.role, content=item.content) for item in history],
                     message="",
                 ),
