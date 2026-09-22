@@ -8,6 +8,10 @@ from hello_agents.core.exceptions import HelloAgentsException
 from openai import OpenAI
 from ..config import get_settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # 全局LLM实例
 _llm_instance = None
@@ -81,9 +85,9 @@ def get_llm() -> HelloAgentsLLM:
         # 保持同一次模型调用并允许每个增量刷新读取超时。
         _llm_instance.invoke = MethodType(_streaming_invoke, _llm_instance)
         
-        print("LLM服务初始化成功")
-        print(f"   提供商: {_llm_instance.provider}")
-        print(f"   模型: {_llm_instance.model}")
+        logger.info("LLM服务初始化成功")
+        logger.info(f"   提供商: {_llm_instance.provider}")
+        logger.info(f"   模型: {_llm_instance.model}")
     
     return _llm_instance
 

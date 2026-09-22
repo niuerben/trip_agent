@@ -14,6 +14,10 @@ from typing import Any, Callable
 from ..config import get_settings
 from ..models.schemas import TalkMessage, TalkRequest
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # 摘要生成提示词：只提取对后续行程对话有用的事实，丢弃寒暄和重复。
 SUMMARY_SYSTEM_PROMPT = (
     "你是旅行对话摘要器。把多轮旅行偏好对话压缩成要点摘要，保留：目的地、"
@@ -116,7 +120,7 @@ class ContextCompactor:
         try:
             summary = self._summarize(prompt)
         except Exception as error:
-            print(f"⚠️ 历史摘要生成失败，降级为硬截断: {type(error).__name__}: {error}")
+            logger.warning(f"⚠️ 历史摘要生成失败，降级为硬截断: {type(error).__name__}: {error}")
             return None
         if not summary:
             return None

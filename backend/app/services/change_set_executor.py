@@ -1,11 +1,102 @@
-"""Atomic, synchronous execution of structured plan changes."""
-from dataclasses import replace
+"""Atomic, synchronous execution of structured plan changes.
+
+同文件包含定向修改域的三块内容：
+- 稳定领域异常（原 domain_errors.py）
+- 规划组件共享的内部契约（原 planning_context.py）
+- ChangeSetExecutor 原子执行器
+"""
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from ..models.schemas import Attraction, ChangeOperation, ChangeSet, Location, Meal, TripPlan, TripRequest
-from .domain_errors import ChangeExecutionError
-from .planning_context import DateUpdate, PlanningContext, POIRecord
+
+class PlanningDomainError(RuntimeError):
+    code = "planning_domain_error"
+
+    def __init__(self, message: str, *, cause: Optional[BaseException] = None):
+        super().__init__(message)
+        self.message = message
+        self.cause = cause
+
+
+class ChangeExecutionError(PlanningDomainError):
+    code = "change_execution_error"
+
+    def __init__(self, message: str, *, code: Optional[str] = None, cause: Optional[BaseException] = None):
+        super().__init__(message, cause=cause)
+        if code:
+            self.code = code
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class TargetedReplanUnsatisfiable(PlanningDomainError):
+    """定向 replan 无法在约束内满足时抛出；调用方据此保留原计划并如实告知用户。"""
+
+    code = "targeted_replan_unsatisfiable"
+
+
+@dataclass(frozen=True)
+class PlanningContext:
+    """Immutable request facts used during one planning run."""
+
+    city: str
+    amap_city: str = ""
+    city_center: Optional[Location] = None
+    radius_km: float = 0.0
+    target_adcode: Optional[str] = None
+    request: Optional[TripRequest] = None
+    # 定向替换餐饮/景点时，被改那天的就近锚点（酒店或已定位景点/餐点）。
+    anchor: Optional[Location] = None
+
+
+@dataclass
+class PlanningState:
+    """Mutable state accumulated during one planning run."""
+
+    cached_pois: list[dict[str, Any]] = field(default_factory=list)
+    validated_plan: Any = None
+    evidence_ids: dict[str, set[str]] = field(default_factory=dict)
+    evidence_records: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    search_history: set[str] = field(default_factory=set)
+    searched_purposes: set[str] = field(default_factory=set)
+    refresh_count: dict[str, int] = field(default_factory=dict)
+    invalid_response_count: int = 0
+    validation_attempts: int = 0
+    evidence_preloaded: bool = False
+    preloaded_evidence: str = ""
+
+
+@dataclass(frozen=True)
+class POIRecord:
+    """Minimal immutable POI value returned by an attraction resolver."""
+
+    name: str
+    address: str = ""
+    location: Optional[Location] = None
+    longitude: Optional[float] = None
+    latitude: Optional[float] = None
+    poi_id: str = ""
+    type: str = ""
+    category: Optional[str] = None
+    description: str = ""
+    rating: Optional[float] = None
+    photos: tuple[str, ...] = ()
+    image_url: Optional[str] = None
+    ticket_price: int = 0
+
+
+@dataclass(frozen=True)
+class DateUpdate:
+    start_date: str
+    end_date: str
+
+    @classmethod
+    def from_fields(cls, fields: Mapping[str, Any]) -> "DateUpdate":
+        return cls(start_date=str(fields["start_date"]), end_date=str(fields["end_date"]))
+
 
 
 @runtime_checkable

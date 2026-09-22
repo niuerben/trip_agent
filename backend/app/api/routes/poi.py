@@ -8,8 +8,8 @@ from pydantic import BaseModel
 from typing import Optional
 
 from ...services.amap_service import get_amap_service
-from ...services.amap_photo_service import get_amap_photo_service
-from ...services.poi_vector_store import get_poi_vector_store
+from ...services.amap_service import get_amap_photo_service
+from ...services.vector_store import get_poi_vector_store
 from ...config import get_settings
 
 router = APIRouter(prefix="/poi", tags=["POI"])

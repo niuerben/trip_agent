@@ -8,17 +8,18 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from hello_agents import ReActAgent
 from hello_agents.core.message import Message
+from hello_agents.tools.base import Tool
 
 from ..config import get_settings
 from ..models.schemas import Location, TripPlan, TripRequest
-from .agent_loop_logging import _summary, log_agent_loop
-from .amap_photo_service import get_amap_photo_service
-from .poi_vector_store import classify_poi_group, get_poi_vector_store
+from .agent_logging import _summary, log_agent_loop
+from .amap_service import get_amap_photo_service
+from .vector_store import classify_poi_group, get_poi_vector_store
 from .trip_plan_validator import (
     ValidationIssue,
     collect_trip_plan_issues,
@@ -194,7 +195,9 @@ class PlanningSession:
     target_adcode: Optional[str]
     amap_city: str
     cached_pois: list[dict] = field(default_factory=list)
-    validated_plan: Optional[TripPlan] = None
+    # 当前流转中的计划实例；是否可交付由 plan.status 表达（draft/validated），
+    # 不再使用 Optional[TripPlan] 的"有没有值"来隐式表达校验状态。
+    plan: Optional[TripPlan] = None
     evidence_ids: dict[str, set[str]] = field(default_factory=dict)
     evidence_records: dict[str, dict[str, dict]] = field(default_factory=dict)
     search_history: set[str] = field(default_factory=set)
@@ -204,6 +207,17 @@ class PlanningSession:
     validation_attempts: int = 0
     evidence_preloaded: bool = False
     preloaded_evidence: str = ""
+
+    @property
+    def validated_plan(self) -> Optional[TripPlan]:
+        """仅当当前计划通过 Validator（status == "validated"）时返回它。
+
+        ReAct Finish 门禁与规划入口的交付读取都走这里；
+        draft 状态的计划从这里看等同于"还没有可交付的计划"。
+        """
+        if self.plan is not None and self.plan.status == "validated":
+            return self.plan
+        return None
 
 
 class PlanningToolset:
@@ -654,7 +668,7 @@ class PlanningToolset:
                 _normalise_request_facts(payload, self.session.request)
             )
         except Exception as error:
-            self.session.validated_plan = None
+            self.session.plan = None
             return json.dumps({
                 "passed": False,
                 "issues": [{"code": "DRAFT_SCHEMA_INVALID", "message": str(error)}],
@@ -688,7 +702,9 @@ class PlanningToolset:
                         entity_type="meal",
                         entity_name=meal.name,
                     ))
-        self.session.validated_plan = plan if not issues else None
+        # 状态机唯一写入点：Validator 通过 → validated；未通过保持 draft。
+        self.session.plan = plan
+        plan.status = "draft" if issues else "validated"
         return json.dumps({
             "passed": not issues,
             "issues": [issue.model_dump() for issue in issues],
@@ -715,6 +731,50 @@ class PlanningToolset:
         )
 
 
+class SearchPOITool(Tool):
+    """按大类搜索 POI：Chroma 候选优先，refresh=true 时调高德补充。
+
+    Tool 类封装（与 agents/tool_lib.py 同风格）；领域逻辑仍全部在
+    PlanningToolset，这里只做注册外壳和 {"input": ...} 参数解包。
+    description 必须与提示词约定逐字节一致，改动会使模型输出格式漂移。
+    """
+
+    def __init__(self, toolset: "PlanningToolset"):
+        super().__init__(
+            name="search_poi",
+            description=(
+                "先搜索对应大类的 Chroma 候选；结果不足时设置 refresh=true 调高德。"
+                "输入单行 JSON: purpose, query, category, refresh(可选)"
+            ),
+        )
+        self._toolset = toolset
+
+    def run(self, parameters: dict[str, Any]) -> str:
+        return self._toolset.search_poi(parameters["input"])
+
+    def get_parameters(self):
+        # 输入协议是整段单行 JSON 字符串，无需结构化参数定义。
+        return []
+
+
+class ValidateDraftTool(Tool):
+    """校验完整 TripPlan Draft；通过后由 Validator 将计划状态置为 validated。"""
+
+    def __init__(self, toolset: "PlanningToolset"):
+        super().__init__(
+            name="validate_draft",
+            description="校验完整 TripPlan Draft；输入单行 TripPlan JSON",
+        )
+        self._toolset = toolset
+
+    def run(self, parameters: dict[str, Any]) -> str:
+        return self._toolset.validate_draft(parameters["input"])
+
+    def get_parameters(self):
+        # 输入协议是整段单行 TripPlan JSON 字符串，无需结构化参数定义。
+        return []
+
+
 class ValidatedPlanningReActAgent(ReActAgent):
     """仅允许在最新 Draft 通过 Validator 后 Finish。"""
 
@@ -734,16 +794,8 @@ class ValidatedPlanningReActAgent(ReActAgent):
         self.max_stalled_steps = settings.planner_max_stalled_steps
         domain_tools = PlanningToolset(session)
         if not session.evidence_preloaded:
-            self.tool_registry.register_function(
-                "search_poi",
-                "先搜索对应大类的 Chroma 候选；结果不足时设置 refresh=true 调高德。输入单行 JSON: purpose, query, category, refresh(可选)",
-                domain_tools.search_poi,
-            )
-        self.tool_registry.register_function(
-            "validate_draft",
-            "校验完整 TripPlan Draft；输入单行 TripPlan JSON",
-            domain_tools.validate_draft,
-        )
+            self.tool_registry.register_tool(SearchPOITool(domain_tools))
+        self.tool_registry.register_tool(ValidateDraftTool(domain_tools))
 
     def run(self, input_text: str, **kwargs) -> str:
         self.current_history = (

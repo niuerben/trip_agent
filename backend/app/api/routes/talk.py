@@ -22,7 +22,7 @@ from ...models.schemas import (
     TalkSuggestionsRequest,
     TalkSuggestionsResponse,
 )
-from ...services.preference_vector_store import get_preference_vector_store
+from ...services.vector_store import get_preference_vector_store
 from .conversations import as_beijing, ensure_user, user_id_from_request
 
 router = APIRouter(prefix="/talk", tags=["偏好对话"])

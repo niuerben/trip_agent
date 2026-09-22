@@ -60,6 +60,9 @@ def setup_file_logging(log_dir: Path | str | None = None) -> Path:
     handle.write(f"\n{'=' * 60}\n启动日志会话: {datetime.now():%Y-%m-%d %H:%M:%S}\n{'=' * 60}\n")
     handle.flush()
 
+    # 保存原始流：logging 的控制台 handler 必须写原始 stdout。
+    # 若写 Tee 包装后的 sys.stdout，每条日志会经 Tee 再次落盘造成重复。
+    original_stdout = sys.stdout
     sys.stdout = _Tee(sys.stdout, handle)  # type: ignore[assignment]
     sys.stderr = _Tee(sys.stderr, handle)  # type: ignore[assignment]
 
@@ -73,6 +76,25 @@ def setup_file_logging(log_dir: Path | str | None = None) -> Path:
         if not any(getattr(h, "_trip_planner_file", False) for h in logger.handlers):
             file_handler._trip_planner_file = True  # type: ignore[attr-defined]
             logger.addHandler(file_handler)
+
+    # 应用代码（app.services.* 等）已从 print 迁移到 logging；给 root logger 挂
+    # 控制台 + 共享文件双 handler，保证 INFO 及以上日志既可见又落盘。
+    root = logging.getLogger()
+    if not any(getattr(h, "_trip_planner_root", False) for h in root.handlers):
+        console_handler = logging.StreamHandler(original_stdout)
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        console_handler.setLevel(logging.INFO)
+        console_handler._trip_planner_root = True  # type: ignore[attr-defined]
+        root.addHandler(console_handler)
+
+        root_file_handler = logging.StreamHandler(handle)
+        root_file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root_file_handler.setLevel(logging.INFO)
+        root_file_handler._trip_planner_root = True  # type: ignore[attr-defined]
+        root.addHandler(root_file_handler)
+        root.setLevel(logging.INFO)
 
     _installed_path = log_path
     return log_path

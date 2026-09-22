@@ -16,7 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.services.amap_photo_service import get_amap_photo_service
+from app.services.amap_service import get_amap_photo_service
 
 
 def main() -> None:

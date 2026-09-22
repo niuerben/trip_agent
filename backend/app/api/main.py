@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
 from ..database import database_health, init_database
-from ..services.poi_vector_store import get_poi_vector_store
+from ..services.vector_store import get_poi_vector_store
 from .routes import trip, poi, map as map_routes, auth, conversations, talk
 
 # 获取配置

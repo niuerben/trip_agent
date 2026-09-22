@@ -16,8 +16,8 @@ from ...services.trip_planning_service import (
     _is_district_request,
     get_trip_planning_service,
 )
-from ...services.domain_errors import TargetedReplanUnsatisfiable
-from ...services.preference_vector_store import get_preference_vector_store
+from ...services.change_set_executor import TargetedReplanUnsatisfiable
+from ...services.vector_store import get_preference_vector_store
 from ...config import get_settings
 from ...database import engine
 from ...models.schemas import Preference, TripPlan, TripPlanResponse, TripRequest

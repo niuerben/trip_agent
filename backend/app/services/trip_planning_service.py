@@ -22,21 +22,29 @@ from ..models.schemas import (
     WeatherInfo,
 )
 from ..config import get_settings
-from .amap_photo_service import AmapPhotoService, get_amap_photo_service
+from .amap_service import AmapPhotoService, get_amap_photo_service
 from .trip_plan_validator import (
     TripPlanValidationError,
     is_within_city,
     validate_trip_plan,
 )
-from .poi_vector_store import DINING_ROOT_TYPECODE, classify_poi_group
+from .vector_store import DINING_ROOT_TYPECODE, classify_poi_group
 from .planning_service import (
     PlanningSession,
     PlanningToolset,
     ValidatedPlanningReActAgent,
 )
-from .change_set_executor import ChangeSetExecutor
-from .domain_errors import ChangeExecutionError, TargetedReplanUnsatisfiable
-from .planning_context import PlanningContext, POIRecord
+from .change_set_executor import (
+    ChangeExecutionError,
+    ChangeSetExecutor,
+    PlanningContext,
+    POIRecord,
+    TargetedReplanUnsatisfiable,
+)
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 def _normalize_city_for_amap(city: str) -> str:
     """标准化城市名给高德 API，避免区县名导致 citylimit 失效搜出外地结果。
@@ -120,17 +128,17 @@ class TripPlanningService:
 
     def __init__(self):
         """初始化薄规划入口；领域工具由每次 ReAct 会话按请求创建。"""
-        print("🔄 开始初始化 ReAct 旅行规划系统...")
+        logger.info("🔄 开始初始化 ReAct 旅行规划系统...")
 
         try:
             self.llm = get_llm()
             self.agent_name = "旅行规划 ReAct Agent"
             self.tools_count = 2
-            print("✅ ReAct 旅行规划系统初始化成功")
-            print("   领域工具数量: 2")
+            logger.info("✅ ReAct 旅行规划系统初始化成功")
+            logger.info("   领域工具数量: 2")
 
         except Exception as e:
-            print(f"❌ 旅行规划 Agent 初始化失败: {str(e)}")
+            logger.error(f"❌ 旅行规划 Agent 初始化失败: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
@@ -139,15 +147,16 @@ class TripPlanningService:
         """使用一个支持原生工具调用的 Agent 完成旅行规划。"""
         preference = preference or Preference()
         try:
-            print(f"\n{'=' * 60}")
-            print("开始单 Agent 旅行规划...")
-            print(f"目的地: {request.city}")
-            print(f"日期: {request.start_date} 至 {request.end_date}")
-            print(f"天数: {request.travel_days}天")
-            print(f"偏好: {', '.join(request.preferences) if request.preferences else '无'}")
+            logger.info(
+                "planning_start city=%s travel_days=%s date=%s..%s preferences=%s",
+                request.city,
+                request.travel_days,
+                request.start_date,
+                request.end_date,
+                ",".join(request.preferences) if request.preferences else "无",
+            )
             if preference.prompt:
-                print(f"偏好提示词: {preference.prompt[:100]}")
-            print(f"{'=' * 60}\n")
+                logger.info("planning_preference prompt=%s", preference.prompt[:100])
 
             # 行政区中心和 adcode 只查询一次，后续 Chroma/坐标校验共用。
             settings = get_settings()
@@ -164,7 +173,7 @@ class TripPlanningService:
                 if callable(get_search_city):
                     amap_city = get_search_city(request.city) or amap_city
             except Exception as error:
-                print(f"⚠️ 目标行政区解析失败: {type(error).__name__}: {error}")
+                logger.warning(f"⚠️ 目标行政区解析失败: {type(error).__name__}: {error}")
 
             district_scope = (
                 _is_district_request(request.city)
@@ -184,7 +193,11 @@ class TripPlanningService:
                 # 市级缓存跨越整个行政区，语义相似不等于路线相近；并且首次
                 # Chroma query 会初始化嵌入模型。五大城市完整规划直接围绕
                 # 核心景点预取高德 POI，既快又能形成紧凑片区。
-                print("市级完整规划跳过全城 Chroma 召回，使用核心景点附近高德 POI。")
+                logger.info(
+                    "市级完整规划跳过全城 Chroma 召回，使用核心景点附近高德 POI。 "
+                    "poi_source=amap_prefetch fallback_reason=city_level_skip city=%s",
+                    request.city,
+                )
             else:
                 vector_executor = ThreadPoolExecutor(max_workers=1)
                 vector_future = vector_executor.submit(
@@ -199,7 +212,12 @@ class TripPlanningService:
                         settings, "planner_vector_retrieval_timeout_seconds", 3
                     ))
                 except FuturesTimeoutError:
-                    print("Chroma 召回超过 3 秒预算，直接预取高德 POI。")
+                    logger.info(
+                        "Chroma 召回超过 %s 秒预算，直接预取高德 POI。 "
+                        "poi_source=amap_prefetch fallback_reason=chroma_timeout city=%s",
+                        getattr(settings, "planner_vector_retrieval_timeout_seconds", 3),
+                        request.city,
+                    )
                     vector_executor.shutdown(wait=False, cancel_futures=True)
                 else:
                     vector_executor.shutdown(wait=True)
@@ -209,7 +227,7 @@ class TripPlanningService:
                 and any(operation.operation == "full_replan" for operation in change_set.operations)
             )
             if change_set:
-                print(
+                logger.info(
                     "Replan ChangeSet: "
                     + json.dumps(change_set.model_dump(mode="json"), ensure_ascii=False)
                 )
@@ -231,7 +249,7 @@ class TripPlanningService:
                         require_enriched_locations=True,
                     )
                     self._log_replan_result(trip_plan, changes, "deterministic-changeset")
-                    print("未重新检索酒店、餐厅、天气或路线。")
+                    logger.info("未重新检索酒店、餐厅、天气或路线。")
                     return trip_plan
                 except TripPlanValidationError as validation_error:
                     # 定向修改能执行但通不过校验（如替换餐超出步行范围/缺人均）时，
@@ -262,14 +280,22 @@ class TripPlanningService:
                 and planning_tools.prepare_required_evidence()
             )
             if preloaded:
-                print("已预取餐饮、景点和酒店 POI 证据；优先用确定性近邻排程。")
+                logger.info(
+                    "已预取餐饮、景点和酒店 POI 证据；优先用确定性近邻排程。 "
+                    "planning_mode=preloaded_deterministic city=%s",
+                    request.city,
+                )
                 for purpose in ("attraction", "meal", "hotel"):
                     records = planning_session.evidence_records.get(purpose) or {}
-                    print(f"POI 证据明细[{purpose}]: 共{len(records)}条")
+                    logger.info(f"POI 证据明细[{purpose}]: 共{len(records)}条")
                     for poi in records.values():
-                        print(f"  - {_format_poi_detail(poi)}")
+                        logger.info(f"  - {_format_poi_detail(poi)}")
             else:
-                print("POI 预取不完整，回退到按需 ReAct 检索。")
+                logger.info(
+                    "POI 预取不完整，回退到按需 ReAct 检索。 "
+                    "planning_mode=react fallback_reason=evidence_incomplete city=%s",
+                    request.city,
+                )
             trip_plan = None
             if preloaded and settings.planner_preloaded_deterministic_plan:
                 draft = self._build_evidence_plan(request, planning_session)
@@ -312,27 +338,39 @@ class TripPlanningService:
                                 if retry_validation.get("passed"):
                                     draft = retry_draft
                                     validation = retry_validation
-                                    print("已扩充高德餐馆/景点证据，重新排程通过 Validator。")
+                                    logger.info("已扩充高德餐馆/景点证据，重新排程通过 Validator。")
                     if validation.get("passed"):
                         trip_plan = planning_session.validated_plan
-                        print("POI 证据近邻排程已通过 Validator；跳过长 JSON 模型调用。")
+                        logger.info(
+                            "POI 证据近邻排程已通过 Validator；跳过长 JSON 模型调用。 "
+                            "planning_mode=preloaded_deterministic result=validated city=%s",
+                            request.city,
+                        )
                     else:
                         issues = validation.get("issues") or []
                         issue_text = "；".join(
                             str(issue.get("message") or issue.get("code") or issue)
                             for issue in issues
                         )
-                        print(
+                        logger.info(
                             "定向重规划校验未通过，转入 ReAct: "
                             f"issues={len(issues)}; "
                             + (f"原因={issue_text}" if issue_text else "")
+                            + " planning_mode=react fallback_reason=validation_failed city=%s",
+                            request.city,
                         )
             if trip_plan is None:
                 planner_response = ValidatedPlanningReActAgent(
                     llm=self.llm,
                     session=planning_session,
                 ).run(planner_query)
-                print(f"规划 Agent 已返回最终答案（{len(planner_response)} 字符）。")
+                logger.info(
+                    "规划 Agent 已返回最终答案（%s 字符）。 planning_mode=react result=validated city=%s",
+                    len(planner_response),
+                    request.city,
+                )
+                # 交付门禁走状态机：validated_plan 属性只在 plan.status == "validated"
+                # 时返回计划；draft 状态或无计划一律视为没有可交付的计划。
                 trip_plan = planning_session.validated_plan
                 if trip_plan is None:
                     raise RuntimeError("ReAct 已结束，但没有通过 Validator 的旅行计划")
@@ -351,7 +389,7 @@ class TripPlanningService:
                         amap_city
                     )
                 except Exception as weather_error:
-                    print(f"高德短期天气查询失败，改为按缺失日期补查: {weather_error}")
+                    logger.info(f"高德短期天气查询失败，改为按缺失日期补查: {weather_error}")
             trip_plan.weather_info = self._complete_weather_for_travel_dates(
                 weather_facts,
                 request,
@@ -374,7 +412,7 @@ class TripPlanningService:
 
             if skip_image_enrichment:
                 skip_reason = "定向修改" if is_targeted_modification else "预加载证据"
-                print(f"跳过图片补齐（{skip_reason}模式）：转为前端异步加载，仅验证坐标有效性")
+                logger.info(f"跳过图片补齐（{skip_reason}模式）：转为前端异步加载，仅验证坐标有效性")
                 TripPlanningService._enrich_meal_pois(
                     trip_plan,
                     city_center=city_center,
@@ -402,7 +440,7 @@ class TripPlanningService:
             # 不打印“Agent 失败”和堆栈，避免把正常结果写成错误噪声。
             raise
         except Exception as error:
-            print(f"旅行规划 Agent 失败: {type(error).__name__}: {error}")
+            logger.info(f"旅行规划 Agent 失败: {type(error).__name__}: {error}")
             import traceback
             traceback.print_exc()
             # 未通过 ReAct + Validator 的计划禁止用占位数据伪装成功。
@@ -682,7 +720,7 @@ class TripPlanningService:
         try:
             start = date.fromisoformat(request.start_date)
         except ValueError:
-            print(f"天气日期筛选跳过: 无法解析旅行开始日期 {request.start_date!r}")
+            logger.info(f"天气日期筛选跳过: 无法解析旅行开始日期 {request.start_date!r}")
             return []
 
         travel_dates = {
@@ -699,12 +737,12 @@ class TripPlanningService:
 
         ignored_dates = [item.date for item in weather_info if item.date not in travel_dates]
         if ignored_dates:
-            print(
+            logger.info(
                 "天气已按旅行日期筛选: "
                 f"旅行日={sorted(travel_dates)}; 忽略非旅行日预报={ignored_dates}"
             )
         if not selected and weather_info:
-            print(
+            logger.info(
                 "高德预报未覆盖旅行日期，天气区块将不展示；"
                 f"旅行日={sorted(travel_dates)}"
             )
@@ -733,14 +771,14 @@ class TripPlanningService:
         service = get_amap_service()
         for missing_date in missing_dates:
             try:
-                print(f"天气缺失日期精确补查: 城市={request.city}; 日期={missing_date}")
+                logger.info(f"天气缺失日期精确补查: 城市={request.city}; 日期={missing_date}")
                 weather_by_date[missing_date] = service.get_weather_for_date(
                     request.city,
                     missing_date,
                     location=city_center,
                 )
             except Exception as error:
-                print(
+                logger.info(
                     f"天气缺失日期补查失败: 日期={missing_date}; "
                     f"{type(error).__name__}: {error}"
                 )
@@ -797,7 +835,7 @@ class TripPlanningService:
                 offset=min(20, max(10, len(attractions) * 3)),
             )
         except Exception as error:
-            print(f"⚠️ 高德泛搜索跳过: {type(error).__name__}: {error}")
+            logger.warning(f"⚠️ 高德泛搜索跳过: {type(error).__name__}: {error}")
             pois = []
 
         def normalize(value: str) -> str:
@@ -842,7 +880,7 @@ class TripPlanningService:
                             offset=20,
                         )
                     except Exception as error:
-                        print(
+                        logger.warning(
                             f"⚠️ 高德景点精确查询跳过({name}, {city}): "
                             f"{type(error).__name__}: {error}"
                         )
@@ -871,7 +909,7 @@ class TripPlanningService:
                 try:
                     exact_matches[name] = future.result()
                 except Exception as error:
-                    print(
+                    logger.warning(
                         f"⚠️ 高德景点精确查询失败({name}): "
                         f"{type(error).__name__}: {error}"
                     )
@@ -936,7 +974,7 @@ class TripPlanningService:
                     offset=min(20, max(10, len(targets) * 3)),
                 )
             except Exception as error:
-                print(f"⚠️ 高德{keywords}坐标补齐跳过: {type(error).__name__}: {error}")
+                logger.warning(f"⚠️ 高德{keywords}坐标补齐跳过: {type(error).__name__}: {error}")
                 continue
             normalized_pois = [
                 (normalize(poi.get("name", "")), poi)
@@ -981,7 +1019,7 @@ class TripPlanningService:
         if all(meal.poi_id and meal.location and meal.address for meal in meals):
             return plan
         try:
-            from .poi_vector_store import get_poi_vector_store
+            from .vector_store import get_poi_vector_store
 
             store = get_poi_vector_store()
             if not store:
@@ -994,7 +1032,7 @@ class TripPlanningService:
                 poi_group="meal",
             )
         except Exception as error:
-            print(f"Chroma 餐馆回填跳过: {type(error).__name__}: {error}")
+            logger.info(f"Chroma 餐馆回填跳过: {type(error).__name__}: {error}")
             return plan
 
         def normalise(value: object) -> str:
@@ -1057,7 +1095,7 @@ class TripPlanningService:
                 match = re.search(r"\d+(?:\.\d+)?", str(candidate.get("cost") or ""))
                 if match:
                     meal.estimated_cost = int(float(match.group()))
-            print(
+            logger.info(
                 f"Chroma 餐馆回填: {meal.type}={meal.name} | "
                 f"{meal.address} | {location.longitude},{location.latitude}"
             )
@@ -1111,11 +1149,11 @@ class TripPlanningService:
                     continue
                 replacement = next(pool_iter, None)
                 if replacement is None:
-                    print(
+                    logger.warning(
                         f"⚠️ 第{index}天景点“{attraction.name}”坐标越界且无城内候选，已丢弃"
                     )
                     continue
-                print(
+                logger.warning(
                     f"⚠️ 第{index}天景点“{attraction.name}”坐标越界，"
                     f"替换为“{replacement.get('name')}”"
                 )
@@ -1323,11 +1361,11 @@ class TripPlanningService:
 
     @classmethod
     def _log_replan_result(cls, plan: TripPlan, changes: list[str], stage: str) -> None:
-        print(
+        logger.info(
             f"Replan 完成: stage={stage}; changes="
             + json.dumps(changes, ensure_ascii=False)
         )
-        print(
+        logger.info(
             "Replan 餐饮结果: "
             + json.dumps(cls._replan_meals(plan), ensure_ascii=False)
         )
@@ -1618,12 +1656,12 @@ class TripPlanningService:
                 )
                 candidates = collect(pois)
         except Exception as error:
-            print(f"⚠️ 定向餐厅查询失败: {type(error).__name__}: {error}")
+            logger.warning(f"⚠️ 定向餐厅查询失败: {type(error).__name__}: {error}")
             return None
 
         if not candidates:
             raw_names = "; ".join(str(poi.get("name") or "") for poi in pois[:10])
-            print(
+            logger.info(
                 f"定向餐厅查询无候选: 目标={target_text}; 关键词={query}; "
                 f"高德原始返回={len(pois)}条; 全部被过滤"
                 + (f"; 原始候选: {raw_names}" if raw_names else "")
@@ -1633,14 +1671,14 @@ class TripPlanningService:
             key=lambda item: (-item[0], item[1], str(item[2].get("name") or ""))
         )
         chosen = candidates[0][2]
-        print(
+        logger.info(
             f"定向餐厅查询: 目标={target_text or '通用餐厅'}; 关键词={query}; "
             f"候选={len(candidates)}; 就近={'是' if anchor is not None else '否'}; "
             f"选中={chosen.get('name')}"
         )
         for index, (score, distance, poi) in enumerate(candidates, start=1):
             mark = "✅选中" if poi is chosen else f"候选{index}"
-            print(
+            logger.info(
                 f"  [{mark}] 评分={score}; 距离={distance:.6f}; "
                 f"{_format_poi_detail(poi)}"
             )
@@ -1680,20 +1718,20 @@ class TripPlanningService:
                     and self._poi_matches_target(poi, target)
                     and in_scope(poi)
                 ]
-                print(
+                logger.info(
                     f"定向替换 POI 查询: 目标={target}; 城市={request.city}; "
                     f"候选={len(candidates)}"
                 )
             except Exception as error:
-                print(f"⚠️ 定向替换 POI 查询失败: {type(error).__name__}: {error}")
+                logger.warning(f"⚠️ 定向替换 POI 查询失败: {type(error).__name__}: {error}")
 
         if not candidates:
             return None
         chosen = max(candidates, key=lambda poi: self._rank_replacement_poi(poi, target))
-        print(f"定向替换 POI 选定: 目标={target}; 候选={len(candidates)}; 选中={chosen.get('name')}")
+        logger.info(f"定向替换 POI 选定: 目标={target}; 候选={len(candidates)}; 选中={chosen.get('name')}")
         for index, poi in enumerate(candidates, start=1):
             mark = "✅选中" if poi is chosen else f"候选{index}"
-            print(f"  [{mark}] {_format_poi_detail(poi)}")
+            logger.info(f"  [{mark}] {_format_poi_detail(poi)}")
         return chosen
 
     @staticmethod
@@ -1705,7 +1743,7 @@ class TripPlanningService:
     ) -> list[dict]:
         """先按景点、酒店、餐馆三大类从 Chroma 召回，天气和路线仍实时查询。"""
         try:
-            from .poi_vector_store import get_poi_vector_store
+            from .vector_store import get_poi_vector_store
 
             store = get_poi_vector_store()
             if not store:
@@ -1742,7 +1780,7 @@ class TripPlanningService:
                 (poi.get("poi_id") or poi.get("name"), poi.get("poi_group")): poi
                 for poi in results
             }.values())
-            print(
+            logger.info(
                 f"Chroma POI 分大类召回: 城市={request.city}; "
                 f"景点={sum(p.get('poi_group') == 'attraction' for p in deduplicated)}; "
                 f"酒店={sum(p.get('poi_group') == 'hotel' for p in deduplicated)}; "
@@ -1750,7 +1788,7 @@ class TripPlanningService:
             )
             return deduplicated
         except Exception as error:
-            print(f"⚠️ Chroma POI 检索跳过: {type(error).__name__}: {error}")
+            logger.warning(f"⚠️ Chroma POI 检索跳过: {type(error).__name__}: {error}")
             return []
 
 # 全局单 Agent 实例

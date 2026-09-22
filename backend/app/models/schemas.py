@@ -265,6 +265,12 @@ class TripPlan(BaseModel):
     weather_info: List[WeatherInfo] = Field(default=[], description="天气信息")
     overall_suggestions: str = Field(..., description="总体建议")
     budget: Optional[Budget] = Field(default=None, description="预算信息")
+    # 计划状态机：draft →（Validator 通过）→ validated。
+    # "validated" 的唯一写入者是 PlanningToolset.validate_draft；
+    # exclude=True 保证该状态不进入 API JSON 与日志 dump，前端契约不变。
+    status: Literal["draft", "validated"] = Field(
+        default="draft", description="计划校验状态", exclude=True
+    )
 
 
 class TripPlanResponse(BaseModel):

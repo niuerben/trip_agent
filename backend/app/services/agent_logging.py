@@ -1,4 +1,4 @@
-"""带统一可观测日志的 MCPTool。"""
+"""Agent 与工具调用的统一审计日志：模型决策循环 JSONL + MCP 调用记录。"""
 
 from __future__ import annotations
 
@@ -17,6 +17,10 @@ from zoneinfo import ZoneInfo
 from hello_agents.tools import MCPTool
 
 from ..config import get_settings
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 _CALL_SEQUENCE = itertools.count(1)
@@ -41,6 +45,46 @@ _TOOL_PURPOSES = {
     "maps_regeocode": "将高德坐标反查行政区和地址",
     "maps_search_detail": "按 POI ID 查询地点详情",
 }
+
+
+# ---------------------------------------------------------------------------
+# Agent 循环日志（原 agent_loop_logging.py）
+# ---------------------------------------------------------------------------
+
+
+def _loop_log_path() -> Path:
+    path = Path(get_settings().agent_loop_log_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    return path
+
+
+def _summary(value: str, limit: int = 300) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def log_agent_loop(event: str, run_id: str, **fields: Any) -> None:
+    """以 JSONL 写入一次规划 Agent 运行中的循环事件。"""
+    payload = {
+        "timestamp": datetime.now(_BEIJING_TZ).isoformat(timespec="seconds"),
+        "event": event,
+        "agent_run_id": run_id,
+        **fields,
+    }
+    path = _loop_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_LOCK:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception as error:
+        logger.info(f"Agent 循环日志写入失败: {type(error).__name__}: {error}")
+
+
+# ---------------------------------------------------------------------------
+# MCP 调用日志（原 mcp_logging.py）
+# ---------------------------------------------------------------------------
 
 
 def _redact(value: Any) -> Any:
@@ -84,7 +128,7 @@ def _append_file_log(payload: dict[str, Any]) -> None:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
     except Exception as error:
-        print(f"[MCP][LOG_ERROR] 无法写入日志: {type(error).__name__}: {error}")
+        logger.info(f"[MCP][LOG_ERROR] 无法写入日志: {type(error).__name__}: {error}")
 
 
 @contextmanager
